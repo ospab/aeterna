@@ -9,6 +9,77 @@ const ARP_PROTO_IPV4: u16  = 0x0800;
 const ARP_OP_REQUEST: u16  = 1;
 const ARP_OP_REPLY: u16    = 2;
 
+// ─── ARP Cache (16 entries) ─────────────────────────────────────────────
+const CACHE_SIZE: usize = 16;
+
+// (valid, ip, mac)
+static mut ARP_CACHE: [(bool, [u8; 4], [u8; 6]); CACHE_SIZE] =
+    [(false, [0; 4], [0; 6]); CACHE_SIZE];
+static mut CACHE_NEXT: usize = 0;
+
+/// Look up a MAC from the ARP cache. Returns Some(mac) if found.
+pub fn cache_lookup(ip: [u8; 4]) -> Option<[u8; 6]> {
+    unsafe {
+        for i in 0..CACHE_SIZE {
+            if ARP_CACHE[i].0 && ARP_CACHE[i].1 == ip {
+                return Some(ARP_CACHE[i].2);
+            }
+        }
+    }
+    None
+}
+
+/// Insert or update a cache entry.
+pub fn cache_update(ip: [u8; 4], mac: [u8; 6]) {
+    unsafe {
+        // Update existing entry if present
+        for i in 0..CACHE_SIZE {
+            if ARP_CACHE[i].0 && ARP_CACHE[i].1 == ip {
+                ARP_CACHE[i].2 = mac;
+                return;
+            }
+        }
+        // Insert into next free slot (circular)
+        let slot = CACHE_NEXT % CACHE_SIZE;
+        ARP_CACHE[slot] = (true, ip, mac);
+        CACHE_NEXT += 1;
+    }
+}
+
+/// Dump ARP cache to serial for diagnostics
+pub fn cache_dump() {
+    let s = crate::arch::x86_64::serial::write_str;
+    s("[ARP] Cache:\r\n");
+    unsafe {
+        let mut any = false;
+        for i in 0..CACHE_SIZE {
+            if ARP_CACHE[i].0 {
+                s("  ");
+                serial_ip(ARP_CACHE[i].1);
+                s(" -> ");
+                serial_mac(ARP_CACHE[i].2);
+                s("\r\n");
+                any = true;
+            }
+        }
+        if !any { s("  (empty)\r\n"); }
+    }
+}
+
+/// Expose cache entries for netstat display (returns count)
+pub fn cache_entries(out: &mut [([u8;4],[u8;6]); 16]) -> usize {
+    let mut n = 0;
+    unsafe {
+        for i in 0..CACHE_SIZE {
+            if ARP_CACHE[i].0 && n < 16 {
+                out[n] = (ARP_CACHE[i].1, ARP_CACHE[i].2);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Handle an incoming ARP packet (Ethernet payload)
 pub fn handle_arp(data: &[u8]) {
     if data.len() < 28 { return; }
@@ -43,6 +114,8 @@ pub fn handle_arp(data: &[u8]) {
             crate::arch::x86_64::serial::write_str(" MAC ");
             serial_mac(sender_mac);
             crate::arch::x86_64::serial::write_str("\r\n");
+            // Store in cache (for any IP)
+            cache_update(sender_ip, sender_mac);
             // Check if this is the gateway
             let gw_ip = unsafe { super::GATEWAY_IP };
             if sender_ip == gw_ip {

@@ -7,7 +7,7 @@ DOOM bare-metal port for AETERNA.
 Implementation:
   - rust_malloc/realloc/free: bridge to the kernel global allocator
   - rust_serial_print: bridge to arch serial output
-  - rust_get_ticks_ms / rust_doom_sleep_ms: PIT timer (55 ms/tick at 18.2 Hz)
+  - rust_get_ticks_ms / rust_doom_sleep_ms: PIT timer (10 ms/tick at 100 Hz)
   - rust_doom_get_key: PS/2 scancode → DOOM key event queue
   - rust_doom_blit: 640×400 ARGB pixel buffer → centered BGRA framebuffer blit
   - run(): entry point called by the `doom` terminal command
@@ -147,8 +147,8 @@ pub unsafe extern "C" fn rust_serial_print(s: *const u8, len: usize) {
 
 // ─── Timer (exported to DOOM C engine) ──────────────────────────────────────
 
-/// PIT fires at 18.2 Hz → ~54.9 ms per tick. We round to 55 ms for simplicity.
-const MS_PER_TICK: u64 = 55;
+/// PIT fires at 100 Hz → 10 ms per tick.
+const MS_PER_TICK: u64 = 10;
 
 /// Return milliseconds since kernel boot (using PIT tick counter)
 #[no_mangle]
@@ -443,21 +443,136 @@ pub extern "C" fn rust_doom_exit(code: i32) {
 // C functions: rust_vfs_open, rust_vfs_read, rust_vfs_write, rust_vfs_close
 // Returns fd (≥0) or -1 on error.
 
-/// Open a file in the VFS.  flags: 0=read, 1=write, 2=read+write
+/// Check whether a VFS path exists.  Returns 0 on success, -1 if not found.
+/// Exposed as rust_vfs_access() — DOOM uses this to test for save-file presence.
+#[no_mangle]
+pub extern "C" fn rust_vfs_access(path_ptr: *const u8, path_len: usize) -> i32 {
+    if path_ptr.is_null() || path_len == 0 { return -1; }
+    let path = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(path_ptr, path_len)) };
+    let found = crate::fs::exists(path);
+    // Debug: log every .dsg probe so we can see what DOOM is checking
+    if path.ends_with(".dsg") || path.contains("doom") {
+        crate::arch::x86_64::serial::write_str("[VFS] Access: ");
+        crate::arch::x86_64::serial::write_str(path);
+        crate::arch::x86_64::serial::write_str(if found { " -> FOUND\r\n" } else { " -> NOT FOUND\r\n" });
+    }
+    if found { 0 } else { -1 }
+}
+
+// ─── Directory listing state for rust_vfs_opendir / readdir_next / closedir ──
+// DOOM opens /doom once per Load-Game menu open; we cache the listing in RAM.
+
+struct DirListing {
+    entries: alloc::vec::Vec<alloc::string::String>,
+    pos: usize,
+}
+
+/// Single-slot directory iterator (DOOM never opens two dirs at once)
+static mut DIR_LISTING: Option<DirListing> = None;
+/// Unique handle token returned to C callers
+const DIR_HANDLE_TOKEN: i64 = 0x4449_5200; // "DIR\0"
+
+/// Open a directory for iteration.  Returns DIR_HANDLE_TOKEN on success or -1.
+#[no_mangle]
+pub extern "C" fn rust_vfs_opendir(path_ptr: *const u8, path_len: usize) -> i64 {
+    if path_ptr.is_null() || path_len == 0 { return -1; }
+    let path = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(path_ptr, path_len)) };
+    crate::arch::x86_64::serial::write_str("[VFS] Opendir: ");
+    crate::arch::x86_64::serial::write_str(path);
+    crate::arch::x86_64::serial::write_str("\r\n");
+    match crate::fs::readdir(path) {
+        Some(entries) => {
+            let names: alloc::vec::Vec<alloc::string::String> = entries.into_iter().map(|e| e.name).collect();
+            crate::arch::x86_64::serial::write_str("[VFS] Opendir: found ");
+            // log count
+            let count = names.len();
+            let mut nbuf = [0u8; 8];
+            let s = crate::format_u64(&mut nbuf, count as u64);
+            crate::arch::x86_64::serial::write_str(s);
+            crate::arch::x86_64::serial::write_str(" entries\r\n");
+            unsafe { DIR_LISTING = Some(DirListing { entries: names, pos: 0 }); }
+            DIR_HANDLE_TOKEN
+        }
+        None => {
+            crate::arch::x86_64::serial::write_str("[VFS] Opendir: NOT FOUND\r\n");
+            -1
+        }
+    }
+}
+
+/// Read the next directory entry name into out_buf (null-terminated).
+/// Returns 1 if an entry was written, 0 if end-of-directory, -1 on error.
+#[no_mangle]
+pub extern "C" fn rust_vfs_readdir_next(
+    handle: i64,
+    out_buf: *mut u8,
+    out_max: usize,
+) -> i32 {
+    if handle != DIR_HANDLE_TOKEN || out_buf.is_null() || out_max == 0 { return -1; }
+    unsafe {
+        let listing = match DIR_LISTING.as_mut() {
+            Some(l) => l,
+            None => return -1,
+        };
+        if listing.pos >= listing.entries.len() {
+            return 0; // end of directory
+        }
+        let name = &listing.entries[listing.pos];
+        listing.pos += 1;
+        let bytes = name.as_bytes();
+        let copy_len = bytes.len().min(out_max - 1);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, copy_len);
+        *out_buf.add(copy_len) = 0; // null terminator
+        1
+    }
+}
+
+/// Close a directory handle opened with rust_vfs_opendir.
+#[no_mangle]
+pub extern "C" fn rust_vfs_closedir(handle: i64) -> i64 {
+    if handle != DIR_HANDLE_TOKEN { return -1; }
+    unsafe { DIR_LISTING = None; }
+    0
+}
+
+/// Open a file in the VFS.  flags: 0=read, 1=write (truncate), 2=read+write
 #[no_mangle]
 pub extern "C" fn rust_vfs_open(path_ptr: *const u8, path_len: usize, flags: u64) -> i64 {
     if path_ptr.is_null() || path_len == 0 { return -1; }
     let path = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(path_ptr, path_len)) };
 
-    // Ensure parent directory and file exist for write mode
-    if flags & 1 != 0 {
-        // Create file if it doesn't exist (write with empty data to register it)
+    // Debug logging for save files
+    if path.ends_with(".dsg") || path.contains("doom") {
+        crate::arch::x86_64::serial::write_str(if flags == 1 { "[VFS] Create: " } else { "[VFS] Open: " });
+        crate::arch::x86_64::serial::write_str(path);
+        crate::arch::x86_64::serial::write_str("\r\n");
+    }
+
+    if flags == 1 {
+        // Write-only (e.g. "wb"): always truncate so stale bytes from a
+        // previous, larger save don't corrupt the new one.
+        crate::fs::write_file(path, &[]);
+    } else if flags & 1 != 0 {
+        // Read+write: create if absent, but don't truncate.
         if crate::fs::read_file(path).is_none() {
             crate::fs::write_file(path, &[]);
         }
     }
 
-    crate::fs::sys_open(path, flags)
+    let fd = crate::fs::sys_open(path, flags);
+    // Confirm open result for save files
+    if path.ends_with(".dsg") || path.contains("doom") {
+        if fd >= 0 {
+            crate::arch::x86_64::serial::write_str("[VFS] Open OK, fd=");
+            let mut nbuf = [0u8; 8];
+            let s = crate::format_u64(&mut nbuf, fd as u64);
+            crate::arch::x86_64::serial::write_str(s);
+            crate::arch::x86_64::serial::write_str("\r\n");
+        } else {
+            crate::arch::x86_64::serial::write_str("[VFS] Open FAILED\r\n");
+        }
+    }
+    fd
 }
 
 /// Read up to `len` bytes from fd into buf. Returns bytes read or -1.
@@ -499,6 +614,42 @@ pub extern "C" fn rust_vfs_file_size(path_ptr: *const u8, path_len: usize) -> i6
     }
 }
 
+/// Rename (move) a file in the VFS.  Returns 0 on success, -1 on error.
+/// Implemented as read-old → write-new → remove-old (RamFS has no native rename).
+#[no_mangle]
+pub extern "C" fn rust_vfs_rename(
+    old_ptr: *const u8, old_len: usize,
+    new_ptr: *const u8, new_len: usize,
+) -> i32 {
+    if old_ptr.is_null() || new_ptr.is_null() || old_len == 0 || new_len == 0 { return -1; }
+    let old = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(old_ptr, old_len)) };
+    let new = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(new_ptr, new_len)) };
+
+    // Debug log
+    crate::arch::x86_64::serial::write_str("[VFS] Rename: ");
+    crate::arch::x86_64::serial::write_str(old);
+    crate::arch::x86_64::serial::write_str(" -> ");
+    crate::arch::x86_64::serial::write_str(new);
+    crate::arch::x86_64::serial::write_str("\r\n");
+
+    // Read source file
+    let data = match crate::fs::read_file(old) {
+        Some(d) => d,
+        None => {
+            crate::arch::x86_64::serial::write_str("[VFS] Rename FAILED: src not found\r\n");
+            return -1;
+        }
+    };
+    // Write to destination
+    if !crate::fs::write_file(new, &data) {
+        crate::arch::x86_64::serial::write_str("[VFS] Rename FAILED: write dst\r\n");
+        return -1;
+    }
+    // Remove source
+    crate::fs::remove(old);
+    0
+}
+
 // ─── DOOM C engine declarations ─────────────────────────────────────────────
 
 #[cfg(doom_supported)]
@@ -537,6 +688,12 @@ pub fn run() {
     {
         serial::write_str("[DOOM] WAD present, calling doom_create_safe\r\n");
 
+        // Close any zombie FDs left open by a previous DOOM session that
+        // exited via longjmp (bypassing fclose).  Without this the FD table
+        // fills up after a few restarts and fopen() starts returning NULL,
+        // making saves appear to vanish.
+        crate::fs::close_all_vfs_fds();
+
         // Ensure /doom/ directory exists for save files
         crate::fs::mkdir("/doom");
 
@@ -568,6 +725,18 @@ pub fn run() {
         }
 
         serial::write_str("[DOOM] Engine exited\r\n");
+
+        // Force a final disk sync so the last-written save state survives
+        // an OS reboot. Deferred tick fires ~10 s after the last write, but
+        // we do one unconditional flush here to guarantee consistency at exit.
+        if crate::fs::disk_sync::is_dirty() {
+            serial::write_str("[DOOM] Final disk sync...\r\n");
+            crate::fs::disk_sync::sync_filesystem();
+            serial::write_str("[DOOM] Sync done\r\n");
+        } else {
+            serial::write_str("[DOOM] FS clean — no sync needed\r\n");
+        }
+
         // Restore framebuffer text mode cursor position
         framebuffer::clear(0x00000000);
         framebuffer::set_cursor_pos(0, 0);

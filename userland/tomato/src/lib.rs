@@ -50,6 +50,62 @@ struct Repo {
     url: String,
 }
 
+/// Early network transport holder for future HTTP package downloads.
+/// This keeps parsing and session state outside command handlers so it can
+/// later map to a real socket syscall API without changing tomato UX.
+#[allow(dead_code)]
+pub struct HttpSession {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub connected: bool,
+}
+
+#[allow(dead_code)]
+impl HttpSession {
+    pub fn new(url: &str) -> Option<Self> {
+        // Very small parser: expects http://host[:port]/path
+        let trimmed = url.trim();
+        let no_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
+            rest
+        } else {
+            return None;
+        };
+
+        let mut parts = no_scheme.splitn(2, '/');
+        let host_port = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if host_port.is_empty() {
+            return None;
+        }
+
+        let mut hp = host_port.splitn(2, ':');
+        let host = hp.next().unwrap_or("");
+        let port = hp.next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(80);
+
+        Some(Self {
+            host: String::from(host),
+            port,
+            path: alloc::format!("/{}", path),
+            connected: false,
+        })
+    }
+
+    pub fn connect(&mut self) -> bool {
+        // Socket syscalls are not wired yet; keep deterministic state machine.
+        self.connected = true;
+        true
+    }
+
+    pub fn build_get_request(&self) -> String {
+        alloc::format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: tomato/0.1\r\nConnection: close\r\n\r\n",
+            self.path,
+            self.host
+        )
+    }
+}
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 #[allow(dead_code)] const DB_PATH: &str = "/var/lib/tomato/db";

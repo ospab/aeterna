@@ -26,10 +26,12 @@ pub mod core;
 // Kernel event log — used by panic handler and terminal
 pub mod klog;
 
-// Network stack
+// Network stack (lives at repo root net/)
+#[path = "../net/mod.rs"]
 pub mod net;
 
-// Storage drivers (ATA PIO, AHCI SATA)
+// Storage drivers (ATA PIO, AHCI SATA — lives at repo root drivers/)
+#[path = "../drivers/mod.rs"]
 pub mod drivers;
 
 // ACPI tables, PCI config, and XHCI USB
@@ -37,7 +39,8 @@ pub mod acpi;
 pub mod pci;
 pub mod xhci;
 
-// Virtual filesystem layer + RamFS
+// Virtual filesystem layer + RamFS (lives at repo root vfs/)
+#[path = "../vfs/mod.rs"]
 pub mod fs;
 
 // Userland tools (integrated as kernel modules until userspace is ready)
@@ -60,3 +63,23 @@ pub use userspace::plum;
 pub mod seed;
 // DOOM engine (bare-metal port)
 pub mod doom;
+
+// ─── Tiny formatting helpers (no_std, no alloc) ─────────────────────────────
+
+/// Format a u64 as decimal ASCII into `buf` (must be ≥ 8 bytes).
+/// Returns the filled sub-slice as `&str`.
+pub fn format_u64<'a>(buf: &'a mut [u8; 8], val: u64) -> &'a str {
+    if val == 0 {
+        buf[0] = b'0';
+        return ::core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut n = val;
+    let mut end = 0usize;
+    while n > 0 && end < buf.len() {
+        buf[end] = b'0' + (n % 10) as u8;
+        n /= 10;
+        end += 1;
+    }
+    buf[..end].reverse();
+    ::core::str::from_utf8(&buf[..end]).unwrap_or("?")
+}

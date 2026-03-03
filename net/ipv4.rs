@@ -91,10 +91,15 @@ pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
     super::ethernet::send_frame(dst_mac, super::ethernet::ETHERTYPE_IPV4, &pkt[..total_len]);
 }
 
-/// Resolve MAC for IP (gateway or local)
+/// Resolve MAC for IP: check ARP cache first, then fall back to gateway/broadcast
 fn resolve_mac(dst_ip: [u8; 4]) -> [u8; 6] {
     let our_ip = unsafe { super::OUR_IP };
     let mask   = unsafe { super::SUBNET_MASK };
+
+    // Direct cache look-up — covers both local and remote (via gateway ARP)
+    if let Some(mac) = super::arp::cache_lookup(dst_ip) {
+        return mac;
+    }
 
     // Check if destination is on our subnet
     let same_subnet = (dst_ip[0] & mask[0]) == (our_ip[0] & mask[0])
@@ -103,10 +108,22 @@ fn resolve_mac(dst_ip: [u8; 4]) -> [u8; 6] {
         && (dst_ip[3] & mask[3]) == (our_ip[3] & mask[3]);
 
     if same_subnet {
-        // For now just use broadcast for local — proper ARP table would be better
-        [0xFF; 6]
+        // Send ARP request and wait briefly for reply
+        super::arp::send_request(dst_ip);
+        for _ in 0..100 {
+            super::poll_rx();
+            if let Some(mac) = super::arp::cache_lookup(dst_ip) {
+                return mac;
+            }
+            for _ in 0..50_000u32 { unsafe { core::arch::asm!("pause"); } }
+        }
+        [0xFF; 6] // fallback: broadcast
     } else {
-        // Route via gateway
+        // Route via gateway — use cached gateway MAC or broadcast
+        let gw_ip = unsafe { super::GATEWAY_IP };
+        if let Some(mac) = super::arp::cache_lookup(gw_ip) {
+            return mac;
+        }
         unsafe { super::GATEWAY_MAC }
     }
 }

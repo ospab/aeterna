@@ -103,6 +103,24 @@ pub fn init() {
 
         let mut services = Vec::with_capacity(MAX_SERVICES);
 
+        let seed_pid = crate::core::scheduler::spawn_named(
+            "seed",
+            crate::core::scheduler::Priority::System,
+            0,
+            0,
+            64 * 1024,
+        ).unwrap_or(1);
+
+        services.push(Service {
+            name: String::from("seed"),
+            command: String::from("/sbin/seed"),
+            policy: RestartPolicy::Always,
+            status: ServiceStatus::Running,
+            pid: seed_pid,
+            restarts: 0,
+            description: String::from("Init system (PID 1)"),
+        });
+
         // Core system services — registered by default
         services.push(Service {
             name: String::from("kernel"),
@@ -118,8 +136,8 @@ pub fn init() {
             name: String::from("vfs"),
             command: String::from("vfs-mount"),
             policy: RestartPolicy::Once,
-            status: ServiceStatus::Running,
-            pid: 1,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("Virtual filesystem (RamFS at /)"),
         });
@@ -128,8 +146,8 @@ pub fn init() {
             name: String::from("scheduler"),
             command: String::from("sched"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running,
-            pid: 2,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("Compute-First task scheduler"),
         });
@@ -138,8 +156,8 @@ pub fn init() {
             name: String::from("console"),
             command: String::from("fbconsole"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running,
-            pid: 3,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("Framebuffer console driver"),
         });
@@ -148,8 +166,8 @@ pub fn init() {
             name: String::from("serial"),
             command: String::from("serial-log"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running,
-            pid: 4,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("Serial port logger (COM1)"),
         });
@@ -158,8 +176,8 @@ pub fn init() {
             name: String::from("keyboard"),
             command: String::from("kbd-driver"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running,
-            pid: 5,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("PS/2 keyboard driver"),
         });
@@ -168,8 +186,8 @@ pub fn init() {
             name: String::from("network"),
             command: String::from("net-stack"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running, // set by init() after net::init()
-            pid: 6,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("Network stack (RTL8139, IPv4)"),
         });
@@ -178,8 +196,8 @@ pub fn init() {
             name: String::from("storage"),
             command: String::from("storage-drv"),
             policy: RestartPolicy::Once,
-            status: ServiceStatus::Running,
-            pid: 7,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("ATA/AHCI storage driver"),
         });
@@ -188,8 +206,8 @@ pub fn init() {
             name: String::from("plum"),
             command: String::from("/bin/plum"),
             policy: RestartPolicy::Always,
-            status: ServiceStatus::Running,
-            pid: 8,
+            status: ServiceStatus::Stopped,
+            pid: 0,
             restarts: 0,
             description: String::from("plum command shell"),
         });
@@ -217,6 +235,36 @@ pub fn init() {
             "service:plum:/bin/plum:always\n",
         );
         crate::fs::write_file("/etc/seed/init.conf", default_conf.as_bytes());
+    }
+
+    // Dynamically spawn all non-manual services after registration.
+    unsafe {
+        if let Some(services) = SERVICES.as_mut() {
+            for svc in services.iter_mut() {
+                if svc.name.as_str() == "kernel" {
+                    continue;
+                }
+                if svc.policy != RestartPolicy::Manual {
+                    let prio = if svc.name.as_str() == "plum" {
+                        crate::core::scheduler::Priority::Normal
+                    } else {
+                        crate::core::scheduler::Priority::System
+                    };
+                    if let Some(pid) = crate::core::scheduler::spawn_named(
+                        svc.name.as_str(),
+                        prio,
+                        0,
+                        0,
+                        64 * 1024,
+                    ) {
+                        svc.pid = pid;
+                        svc.status = ServiceStatus::Running;
+                    } else {
+                        svc.status = ServiceStatus::Failed;
+                    }
+                }
+            }
+        }
     }
 
     serial::write_str("[seed] Init system ready (");
@@ -253,9 +301,24 @@ pub fn start_service(name: &str) -> bool {
         if let Some(services) = SERVICES.as_mut() {
             if let Some(svc) = services.iter_mut().find(|s| s.name.as_str() == name) {
                 if svc.status == ServiceStatus::Stopped || svc.status == ServiceStatus::Failed {
-                    svc.status = ServiceStatus::Running;
-                    svc.restarts += 1;
-                    return true;
+                    let prio = if svc.name.as_str() == "plum" {
+                        crate::core::scheduler::Priority::Normal
+                    } else {
+                        crate::core::scheduler::Priority::System
+                    };
+                    if let Some(pid) = crate::core::scheduler::spawn_named(
+                        svc.name.as_str(),
+                        prio,
+                        0,
+                        0,
+                        64 * 1024,
+                    ) {
+                        svc.pid = pid;
+                        svc.status = ServiceStatus::Running;
+                        svc.restarts += 1;
+                        return true;
+                    }
+                    svc.status = ServiceStatus::Failed;
                 }
             }
         }
@@ -269,6 +332,9 @@ pub fn stop_service(name: &str) -> bool {
         if let Some(services) = SERVICES.as_mut() {
             if let Some(svc) = services.iter_mut().find(|s| s.name.as_str() == name) {
                 if svc.status == ServiceStatus::Running {
+                    if svc.pid > 1 {
+                        let _ = crate::core::scheduler::exit_pid(svc.pid);
+                    }
                     svc.status = ServiceStatus::Stopped;
                     return true;
                 }

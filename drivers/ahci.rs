@@ -386,7 +386,7 @@ fn start_port(port: u32) {
 }
 
 fn wait_ci_clear(port: u32, mask: u32, label: &str) -> bool {
-    // 18.2 Hz → ~55 ms per tick; 1000 ms ≈ 19 ticks
+    // 100 Hz → 10 ms per tick; 1000 ms = 100 ticks
     let start_ms = crate::arch::x86_64::idt::timer_ticks();
 
     loop {
@@ -401,7 +401,7 @@ fn wait_ci_clear(port: u32, mask: u32, label: &str) -> bool {
             return false;
         }
 
-        if crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start_ms) >= 19 {
+        if crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start_ms) >= 100 {
             let serr = port_read(port, PORT_SERR);
             crate::arch::x86_64::serial::write_str("[AHCI] CI stuck after 1000ms (" );
             crate::arch::x86_64::serial::write_str(label);

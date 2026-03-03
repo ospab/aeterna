@@ -30,6 +30,12 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 /// HHDM offset — set once from Limine at init()
 static HHDM: AtomicU64 = AtomicU64::new(0);
 
+/// Physical address of the boot-time kernel PML4 (set once in init()).
+/// Used as the authoritative source for upper-half (256..511) entries when
+/// creating new address spaces and before every CR3 switch, so that any
+/// dynamic kernel mappings added after a task was spawned are always visible.
+static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
+
 /// VMM initialized flag
 static VMM_INIT: AtomicBool = AtomicBool::new(false);
 
@@ -227,7 +233,10 @@ pub fn init() {
     HHDM.store(hhdm, Ordering::Relaxed);
     VMM_INIT.store(true, Ordering::Relaxed);
 
+    // Save the Limine boot PML4 as the canonical kernel address space.
+    // All future per-process PML4s copy their upper-half entries from here.
     let cr3 = read_cr3();
+    KERNEL_PML4_PHYS.store(cr3, Ordering::Relaxed);
     crate::arch::x86_64::serial::write_str("[VMM] Initialized. CR3=0x");
     crate::arch::x86_64::init::serial_hex(cr3);
     crate::arch::x86_64::serial::write_str(" HHDM=0x");
@@ -447,26 +456,60 @@ pub fn map_range_current(virt_start: u64, phys_start: u64, page_count: u64, flag
 
 // ─── New address space creation (for future processes) ──────────────────────
 
-/// Create a new, empty PML4 page table.
-/// Copies kernel-space entries (upper half: indices 256..511) from the current
-/// CR3 so that kernel code/data/stack/HHDM remain accessible.
+/// Create a new, isolated PML4 for a process.
+///
+/// Upper-half entries (256..511) are copied from `KERNEL_PML4_PHYS` — the
+/// Limine boot PML4 — so kernel code, HHDM, heap, stack, and framebuffer are
+/// always reachable regardless of which CR3 is active.
+///
+/// Lower-half (0..255) is zeroed: clean user address space.
 /// Returns the physical address of the new PML4, or None on OOM.
 pub fn create_address_space() -> Option<u64> {
     let new_pml4_phys = alloc_table_frame()?;
-    let current_pml4_phys = read_cr3();
+
+    // Always source from the saved boot kernel PML4, not from whatever
+    // CR3 happens to be active now (which might itself be a task PML4).
+    let kernel_pml4_phys = KERNEL_PML4_PHYS.load(Ordering::Relaxed);
+    let src_phys = if kernel_pml4_phys != 0 { kernel_pml4_phys } else { read_cr3() };
 
     unsafe {
-        let current = table_at_phys(current_pml4_phys);
+        let src = table_at_phys(src_phys);
         let new = table_at_phys(new_pml4_phys);
 
-        // Copy kernel-half entries (indices 256..511)
+        // Mirror the entire kernel upper half (entries 256..511).
+        // These are shallow copies pointing at the same PDPT frames, so any
+        // modifications to lower-level tables (PDPT/PD/PT) propagate
+        // automatically.  Only new top-level entries need re-syncing, which
+        // sync_kernel_mappings() handles before every CR3 switch.
         for i in 256..512 {
-            new.entries[i] = current.entries[i];
+            new.entries[i] = src.entries[i];
         }
         // User-half (0..255) is already zeroed from alloc_table_frame
     }
 
     Some(new_pml4_phys)
+}
+
+/// Re-copy kernel upper-half PML4 entries (256..511) from the boot kernel PML4
+/// into `task_pml4`.  Call this *before* writing `task_pml4` into CR3 so that
+/// any kernel mappings added after the task was created are visible.
+///
+/// This is a no-op if `task_pml4` == KERNEL_PML4_PHYS (kernel's own CR3).
+///
+/// # Safety
+/// `task_pml4` must be a valid physical address of a 4K-aligned PML4 table.
+pub fn sync_kernel_mappings(task_pml4: u64) {
+    let kernel_pml4_phys = KERNEL_PML4_PHYS.load(Ordering::Relaxed);
+    if kernel_pml4_phys == 0 || task_pml4 == kernel_pml4_phys {
+        return; // nothing to do
+    }
+    unsafe {
+        let src = table_at_phys(kernel_pml4_phys);
+        let dst = table_at_phys(task_pml4);
+        for i in 256..512 {
+            dst.entries[i] = src.entries[i];
+        }
+    }
 }
 
 /// Switch to a different address space by writing CR3.

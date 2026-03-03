@@ -238,6 +238,12 @@ pub fn setenv(name: &str, value: &str) {
     sh.env.insert(String::from(name), String::from(value));
 }
 
+/// Get all environment variables as a Vec of (name, value) pairs
+pub fn get_env() -> Vec<(String, String)> {
+    let sh = shell();
+    sh.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 /// Set the last exit code
 pub fn set_exit_code(code: i32) {
     let sh = shell();
@@ -462,6 +468,11 @@ fn cmd_write(args: &str) {
 
 /// save — sync the entire RamFS to disk via disk_sync
 fn cmd_save() {
+    if !crate::fs::disk_sync::is_dirty() {
+        ok("[OK] ");
+        puts("Filesystem is already clean — nothing to save.\n");
+        return;
+    }
     puts("Syncing filesystem to disk...\n");
     crate::klog::record(crate::klog::EventSource::Boot, "save: sync requested");
 

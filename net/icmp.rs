@@ -91,8 +91,8 @@ pub fn poll_reply() -> Option<(u16, u64)> {
     if PING_RECEIVED.load(Ordering::Relaxed) {
         let seq = PING_SEQ.load(Ordering::Relaxed) as u16;
         let rtt_ticks = PING_RTT_TICKS.load(Ordering::Relaxed);
-        // 18.2 ticks/sec → 1 tick ≈ 55 ms
-        let rtt_ms = rtt_ticks * 55;
+        // 100 ticks/sec → 1 tick ≈ 10 ms
+        let rtt_ms = rtt_ticks * 10;
         return Some((seq, rtt_ms));
     }
     None
@@ -104,17 +104,21 @@ pub fn cancel_wait() {
     PING_RECEIVED.store(false, Ordering::Relaxed);
 }
 
-/// Wait for ping reply. Returns Some((seq, rtt_ms)) or None on timeout.
+/// Wait for ping reply. Returns Some((seq, rtt_ms)) or None on timeout/cancel.
 pub fn wait_reply(timeout_ticks: u64) -> Option<(u16, u64)> {
     let start = crate::arch::x86_64::idt::timer_ticks();
     loop {
+        // poll_reply() calls poll_rx() internally
         if let Some(r) = poll_reply() { return Some(r); }
+
         let now = crate::arch::x86_64::idt::timer_ticks();
         if now.saturating_sub(start) >= timeout_ticks {
             PING_WAITING.store(false, Ordering::Relaxed);
             return None;
         }
-        unsafe { core::arch::asm!("hlt"); }
+
+        // Yield: sleep until next interrupt (timer/NIC) so terminal stays responsive
+        crate::core::scheduler::sys_yield();
     }
 }
 

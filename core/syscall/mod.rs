@@ -41,6 +41,8 @@ pub enum SyscallNumber {
     Sleep = 21,
     /// Get current process ID
     GetPid = 22,
+    /// Spawn a new process/task (name_ptr, name_len, priority)
+    Spawn = 23,
     /// Fork current process -> child_pid
     Fork = 30,
     /// Execute a new program (path_ptr, argv_ptr)
@@ -55,6 +57,8 @@ pub enum SyscallNumber {
     SysInfo = 50,
     /// Get uptime in milliseconds
     Uptime = 51,
+    /// Get task list metadata
+    GetTasks = 52,
 }
 
 /// Syscall result codes
@@ -105,8 +109,11 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (4,  |a| syscall_close(a.arg1)),
     (20, |_| syscall_yield()),
     (22, |_| syscall_getpid()),
+    (23, |a| syscall_spawn(a.arg1, a.arg2, a.arg3)),
+    (32, |a| syscall_waitpid(a.arg1)),
     (50, |a| syscall_sysinfo(a.arg1, a.arg2, a.arg3)),
     (51, |_| syscall_uptime()),
+    (52, |_| syscall_get_tasks()),
 ];
 
 /// Dispatch a syscall by looking up the number in the dispatch table
@@ -209,7 +216,7 @@ fn syscall_exit(code: u64) -> i64 {
     crate::arch::x86_64::serial::write_str("[SYSCALL] exit(");
     serial_dec(code);
     crate::arch::x86_64::serial::write_str(")\r\n");
-    // Currently single-task: halt the CPU
+    crate::core::scheduler::exit_current(code);
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }
@@ -287,8 +294,38 @@ fn syscall_yield() -> i64 {
     SyscallError::Success as i64
 }
 
+/// sys_waitpid(pid) — block until the task with `pid` exits.
+/// Returns 0 on success, -1 if pid is invalid / never existed.
+fn syscall_waitpid(pid: u64) -> i64 {
+    crate::core::scheduler::wait_pid(pid as crate::core::scheduler::TaskId);
+    SyscallError::Success as i64
+}
+
 fn syscall_getpid() -> i64 {
     crate::core::scheduler::current_task_id() as i64
+}
+
+fn syscall_spawn(name_ptr: u64, name_len: u64, priority: u64) -> i64 {
+    let name = unsafe {
+        let bytes = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
+        match core::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return SyscallError::InvalidArgument as i64,
+        }
+    };
+
+    let prio = match priority {
+        0 => crate::core::scheduler::Priority::Idle,
+        1 => crate::core::scheduler::Priority::Normal,
+        2 => crate::core::scheduler::Priority::System,
+        3 => crate::core::scheduler::Priority::RealTime,
+        _ => crate::core::scheduler::Priority::Compute,
+    };
+
+    match crate::core::scheduler::spawn_named(name, prio, 0, 0, 0) {
+        Some(pid) => pid as i64,
+        None => SyscallError::Busy as i64,
+    }
 }
 
 fn syscall_sysinfo(info_type: u64, _buf_ptr: u64, _buf_len: u64) -> i64 {
@@ -302,6 +339,16 @@ fn syscall_sysinfo(info_type: u64, _buf_ptr: u64, _buf_len: u64) -> i64 {
 
 fn syscall_uptime() -> i64 {
     crate::arch::x86_64::idt::timer_ticks() as i64
+}
+
+fn syscall_get_tasks() -> i64 {
+    crate::core::scheduler::task_count() as i64
+}
+
+pub type TaskInfo = crate::core::scheduler::TaskSnapshot;
+
+pub fn sys_get_tasks(out: &mut [TaskInfo]) -> usize {
+    crate::core::scheduler::get_tasks(out)
 }
 
 // Helper

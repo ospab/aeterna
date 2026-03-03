@@ -63,6 +63,9 @@ pub fn init() {
     // Initialize PIC (remap IRQs to IDT 32-47)
     pic::init();
 
+    // Program PIT channel 0 to fire at 100 Hz (preemptive scheduling)
+    pic::init_pit_100hz();
+
     // Initialize framebuffer if available
     if let Some(fb) = boot::framebuffer() {
         unsafe {

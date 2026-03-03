@@ -7,22 +7,22 @@ After each build iteration, increment PATCH (0-99), then MINOR, etc.
 
 pub const MAJOR: u16 = 2;
 pub const MINOR: u16 = 1;
-pub const PATCH: u16 = 0;
+pub const PATCH: u16 = 1;
 
-/// "2.1.0"
-pub const VERSION_STR: &str = "2.1.0";
+/// "2.1.1"
+pub const VERSION_STR: &str = "2.1.1";
 
 /// "ospab.os v2.1.0"
-pub const OS_VERSION: &str = "ospab.os v2.1.0";
+pub const OS_VERSION: &str = "ospab.os v2.1.1";
 
 /// "AETERNA 2.1.0"
-pub const KERNEL_VERSION: &str = "AETERNA 2.1.0";
+pub const KERNEL_VERSION: &str = "AETERNA 2.1.1";
 
 /// Full uname-style string
-pub const UNAME_FULL: &str = "AETERNA 2.1.0 ospab.os x86_64 AETERNA/Microkernel";
+pub const UNAME_FULL: &str = "AETERNA 2.1.1 ospab.os x86_64 AETERNA/Microkernel";
 
 /// Build date
-pub const BUILD_DATE: &str = "2026-03-01";
+pub const BUILD_DATE: &str = "2026-03-03";
 
 /// Architecture
 pub const ARCH: &str = "x86_64";

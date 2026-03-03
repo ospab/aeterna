@@ -26,6 +26,7 @@ const BUILTINS: &[&str] = &[
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
     "tutor", "grape", "tomato", "seed", "bash", "doom", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",
+    "ps", "top",
 ];
 
 extern crate alloc;
@@ -534,6 +535,10 @@ fn read_line() -> &'static str {
                 }
 
                 draw_input_cursor();
+            } else {
+                // No key — yield CPU, then check if a deferred write-back is due.
+                unsafe { core::arch::asm!("hlt"); }
+                ospab_os::fs::disk_sync::deferred_tick();
             }
         }
     }
@@ -612,20 +617,22 @@ fn execute_command(cmd: &str) {
             if axon::dispatch(command, args) {
                 return;
             }
-            // Try plum shell preprocessing (alias/variable expansion)
+            // Try plum shell preprocessing (alias/variable expansion).
+            // preprocess() returns None if it handled the command itself
+            // (plum builtin, alias expanding to a plum builtin, etc.).
+            // It returns Some(expanded) if nobody recognised the command.
             let full_cmd = if args.is_empty() {
                 alloc::string::String::from(command)
             } else {
                 alloc::format!("{} {}", command, args)
             };
-            if let Some(_expanded) = ospab_os::plum::preprocess(&full_cmd) {
-                // If plum returned an expanded command that's different,
-                // it was already handled by a builtin
-            } else {
-                puts(command);
+            if ospab_os::plum::preprocess(&full_cmd).is_some() {
+                // Nothing handled it — show "command not found"
+                err_print(command);
                 err_print(": command not found\n");
-                dim_print("Type 'help' for available commands.\n");
+                dim_print("  Type 'help' for available commands.\n");
             }
+            // else: plum handled it internally (alias, builtin, etc.)
         }
     }
 }
@@ -1007,7 +1014,7 @@ fn cmd_date() {
 
     // Fallback: uptime-based
     let ticks = ospab_os::arch::x86_64::idt::timer_ticks();
-    let total_secs = ticks / 18;
+    let total_secs = ticks / 100;
     let hours = total_secs / 3600;
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
@@ -1068,7 +1075,7 @@ fn cmd_meminfo() {
 
 fn cmd_uptime() {
     let ticks = ospab_os::arch::x86_64::idt::timer_ticks();
-    let seconds = ticks / 18;
+    let seconds = ticks / 100;
     let minutes = seconds / 60;
     let hours = minutes / 60;
 
@@ -1328,9 +1335,12 @@ fn print_pci_class(class: u8, subclass: u8) {
 }
 
 fn cmd_sync() {
+    if !ospab_os::fs::disk_sync::is_dirty() {
+        dim_print("Nothing to sync — filesystem is already clean.\n");
+        return;
+    }
     puts("Syncing filesystem...\n");
     klog::record(klog::EventSource::Boot, "Sync requested");
-    
     if ospab_os::fs::disk_sync::sync_filesystem() {
         dim_print("Filesystem synchronized to disk.\n");
     } else {
@@ -1375,9 +1385,11 @@ fn cmd_dump_disk(_args: &str) {
 
 fn cmd_reboot() {
     puts("Syncing and rebooting...\n");
-    
-    // Sync filesystem to disk before reboot
-    ospab_os::fs::disk_sync::sync_filesystem();
+
+    // Only flush if there are pending writes — no-op otherwise.
+    if ospab_os::fs::disk_sync::is_dirty() {
+        ospab_os::fs::disk_sync::sync_filesystem();
+    }
 
     puts("Rebooting...\n");
     klog::record(klog::EventSource::Boot, "Reboot requested");
@@ -1507,8 +1519,8 @@ fn cmd_ping(args: &str) {
         ospab_os::net::icmp::send_ping(ip, seq as u16);
         sent += 1;
 
-        // ─── Wait up to ~2 s for reply, polling keyboard each tick ───
-        let deadline = ospab_os::arch::x86_64::idt::timer_ticks() + 36;
+        // ─── Wait up to ~2 s for reply (200 ticks @ 100 Hz) ───
+        let deadline = ospab_os::arch::x86_64::idt::timer_ticks() + 200;
         let mut reply: Option<(u16, u64)> = None;
         loop {
             if check_ctrl_c() { interrupted = true; break; }
@@ -1543,9 +1555,9 @@ fn cmd_ping(args: &str) {
             }
         }
 
-        // ─── 1-second inter-ping delay, interruptible ───
+        // ─── 1-second inter-ping delay (100 ticks @ 100 Hz) ───
         if seq + 1 < count {
-            let wait_until = ospab_os::arch::x86_64::idt::timer_ticks() + 18;
+            let wait_until = ospab_os::arch::x86_64::idt::timer_ticks() + 100;
             loop {
                 if check_ctrl_c() { interrupted = true; break; }
                 if ospab_os::arch::x86_64::idt::timer_ticks() >= wait_until { break; }
@@ -1739,22 +1751,23 @@ fn cmd_tutor(args: &str) {
     let topic = if args.is_empty() { "intro" } else { args };
 
     match topic {
-        "intro" => tutor_intro(),
-        "fs"    => tutor_fs(),
-        "net"   => tutor_net(),
-        "mem"   => tutor_mem(),
-        "kernel" => tutor_kernel(),
+        "intro"       => tutor_intro(),
+        "fs"          => tutor_fs(),
+        "net"         => tutor_net(),
+        "mem"         => tutor_mem(),
+        "kernel"      => tutor_kernel(),
         "commands" | "cmd" => tutor_commands(),
+        "disk"        => tutor_disk(),
+        "persistence" => tutor_persistence(),
+        "axon"        => tutor_axon(),
+        "shell"       => tutor_shell(),
+        "topics" | "help" | "?" => tutor_topics(),
         _ => {
             puts("Unknown topic: ");
             puts(topic);
-            puts("\n\nAvailable topics:\n");
-            dim_print("  intro     — Welcome and system overview\n");
-            dim_print("  fs        — Virtual filesystem guide\n");
-            dim_print("  net       — Networking tutorial\n");
-            dim_print("  mem       — Memory subsystem\n");
-            dim_print("  kernel    — AETERNA kernel architecture\n");
-            dim_print("  commands  — All commands explained\n");
+            puts("\n\nType '");
+            framebuffer::draw_string("tutor topics", FG_OK, BG);
+            puts("' for a list of all topics.\n");
         }
     }
 }
@@ -1949,6 +1962,188 @@ fn tutor_commands() {
     dim_print("  install           Launch OS installer TUI\n");
     dim_print("  reboot            Reboot the machine\n");
     dim_print("  shutdown          Power off the system\n\n");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Output helpers
+// ══════════════════════════════════════════════════════════════
+
+fn tutor_topics() {
+    puts("\n");
+    framebuffer::draw_string("  AETERNA Interactive Tutorial\n", FG_OK, BG);
+    puts("  ═══════════════════════════════\n\n");
+    framebuffer::draw_string("  Usage: ", FG_WARN, BG);
+    puts("tutor <topic>\n\n");
+    framebuffer::draw_string("  Topics:\n\n", FG_WARN, BG);
+    dim_print("  intro       — Welcome & system overview\n");
+    dim_print("  fs          — Virtual filesystem (VFS + RamFS)\n");
+    dim_print("  disk        — Disk I/O, AHCI/ATA, LBA layout\n");
+    dim_print("  persistence — How files survive reboots\n");
+    dim_print("  net         — Networking (IP, ICMP, UDP)\n");
+    dim_print("  mem         — Physical + heap memory\n");
+    dim_print("  kernel      — AETERNA architecture\n");
+    dim_print("  axon        — AXON userland coreutils\n");
+    dim_print("  shell       — Shell features (plum)\n");
+    dim_print("  commands    — Full command reference\n\n");
+    framebuffer::draw_string("  Quick examples:\n", FG_WARN, BG);
+    dim_print("  tutor fs          — filesystem walkthrough\n");
+    dim_print("  tutor persistence — see how sync/recovery works\n");
+    dim_print("  tutor axon        — learn new coreutils commands\n\n");
+}
+
+fn tutor_disk() {
+    puts("\n");
+    framebuffer::draw_string("  Disk I/O Tutorial\n", FG_OK, BG);
+    puts("  ══════════════════\n\n");
+
+    puts("  AETERNA supports two storage backends:\n\n");
+
+    framebuffer::draw_string("  1. ATA PIO (IDE)\n", FG_WARN, BG);
+    puts("     Port I/O based. Sector read/write via ports 0x1F0–0x3F6.\n");
+    puts("     Max 128 sectors per request (u8 count field).\n\n");
+
+    framebuffer::draw_string("  2. AHCI SATA (DMA)\n", FG_WARN, BG);
+    puts("     Memory-mapped ABAR. Zero-copy DMA write via PRD tables.\n");
+    puts("     Supports 48-bit LBA. AHCI preferred over ATA.\n\n");
+
+    framebuffer::draw_string("  Disk Layout:\n", FG_WARN, BG);
+    puts("     LBA 0–2047   — Boot area (MBR, GPT, ISO)\n");
+    puts("     LBA 2048+    — AETERNA_FS persistence data\n\n");
+
+    framebuffer::draw_string("  Commands:\n\n", FG_WARN, BG);
+    dim_print("  dump_disk         — Hex dump of LBA 2048 superblock\n");
+    dim_print("  sync              — Force flush RamFS to disk\n");
+    dim_print("  df                — Show disk/filesystem usage\n\n");
+
+    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
+    puts("  1. Create a file:   ");
+    dim_print("touch /tmp/test.txt\n");
+    puts("  2. Write to it:     ");
+    dim_print("echo hello > /tmp/test.txt\n");
+    puts("  3. Force sync:      ");
+    dim_print("sync\n");
+    puts("  4. Check superblock: ");
+    dim_print("dump_disk\n\n");
+}
+
+fn tutor_persistence() {
+    puts("\n");
+    framebuffer::draw_string("  Filesystem Persistence Tutorial\n", FG_OK, BG);
+    puts("  ═════════════════════════════════\n\n");
+
+    puts("  AETERNA persists the entire RamFS to disk using\n");
+    puts("  the AETERNA_FS binary format.\n\n");
+
+    framebuffer::draw_string("  Binary Format:\n", FG_WARN, BG);
+    puts("  Offset  Size  Field\n");
+    dim_print("  0       8     SUPER_MAGIC  = 0x41455445524E41\n");
+    dim_print("  8       4     sector_count (u32 LE)\n");
+    dim_print("  12      10    \"AETERNA_FS\" marker\n");
+    dim_print("  22      4     VERSION = 1\n");
+    dim_print("  26      4     COUNT (number of entries)\n");
+    dim_print("  30+     var   path_len(2) + path + type(1) + data...\n\n");
+
+    framebuffer::draw_string("  Auto-sync:\n", FG_WARN, BG);
+    puts("  Every write/mkdir/touch/rm automatically syncs\n");
+    puts("  to disk when storage is available.\n\n");
+
+    framebuffer::draw_string("  Boot Recovery:\n", FG_WARN, BG);
+    puts("  On boot:\n");
+    puts("  1. Read 1 sector at LBA 2048\n");
+    puts("  2. Validate SUPER_MAGIC\n");
+    puts("  3. Extract sector_count from bytes 8-11\n");
+    puts("  4. Read sector_count sectors in 128-sector batches\n");
+    puts("  5. Deserialize → restore RamFS tree\n\n");
+
+    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
+    puts("  Write a file and reboot:\n");
+    dim_print("  echo 'hello world' > /home/root/note.txt\n");
+    dim_print("  reboot\n");
+    puts("  After reboot:\n");
+    dim_print("  cat /home/root/note.txt   (should show 'hello world')\n\n");
+}
+
+fn tutor_axon() {
+    puts("\n");
+    framebuffer::draw_string("  AXON Coreutils Tutorial\n", FG_OK, BG);
+    puts("  ════════════════════════\n\n");
+
+    puts("  AXON is the AETERNA coreutils — a complete set of\n");
+    puts("  POSIX-inspired file and text utilities.\n\n");
+
+    framebuffer::draw_string("  Text Processing:\n", FG_WARN, BG);
+    dim_print("  wc <file>          — count lines/words/bytes\n");
+    dim_print("  head [-n N] <file> — show first N lines\n");
+    dim_print("  tail [-n N] <file> — show last N lines\n");
+    dim_print("  grep <pat> <file>  — search for pattern\n");
+    dim_print("  sort <file>        — sort lines\n");
+    dim_print("  uniq <file>        — remove duplicate lines\n");
+    dim_print("  cut -f1 -d: <file> — extract field N\n");
+    dim_print("  awk '{print $2}' <file>  — field-based processing\n");
+    dim_print("  diff <file1> <file2>    — compare files\n\n");
+
+    framebuffer::draw_string("  File Utilities:\n", FG_WARN, BG);
+    dim_print("  cp <src> <dst>     — copy file\n");
+    dim_print("  mv <src> <dst>     — move/rename file\n");
+    dim_print("  find <dir> <name>  — search for files\n");
+    dim_print("  du <dir>           — disk usage by file\n");
+    dim_print("  tree <dir>         — visual directory tree\n");
+    dim_print("  stat <path>        — file info\n");
+    dim_print("  xxd <file>         — hex dump\n");
+    dim_print("  nl <file>          — number lines\n\n");
+
+    framebuffer::draw_string("  System Utils:\n", FG_WARN, BG);
+    dim_print("  ps                 — show processes\n");
+    dim_print("  df                 — disk/fs usage\n");
+    dim_print("  kill [-N] <pid>    — send signal to process\n");
+    dim_print("  which <cmd>        — find where a command lives\n");
+    dim_print("  env                — show environment variables\n");
+    dim_print("  printf <fmt> ...   — formatted output\n");
+    dim_print("  xargs <cmd> items  — build and run commands\n\n");
+
+    framebuffer::draw_string("  Try this pipeline:\n", FG_WARN, BG);
+    dim_print("  cat /etc/os-release\n");
+    dim_print("  wc /etc/os-release\n");
+    dim_print("  grep VERSION /etc/os-release\n");
+    dim_print("  awk '{print $1}' /etc/os-release\n\n");
+}
+
+fn tutor_shell() {
+    puts("\n");
+    framebuffer::draw_string("  Shell (plum) Tutorial\n", FG_OK, BG);
+    puts("  ══════════════════════\n\n");
+
+    puts("  ospab.os uses 'plum' as its interactive shell.\n");
+    puts("  It supports environment variables, aliases, and\n");
+    puts("  command chaining with ';'.\n\n");
+
+    framebuffer::draw_string("  Key Bindings:\n", FG_WARN, BG);
+    puts("  Up/Down      Browse command history\n");
+    puts("  Ctrl+L       Clear screen\n");
+    puts("  Ctrl+C       Cancel current input\n");
+    puts("  Tab          Insert 4 spaces\n");
+    puts("  Backspace    Delete last character\n\n");
+
+    framebuffer::draw_string("  Environment Variables:\n", FG_WARN, BG);
+    dim_print("  export KEY=VALUE   — set a variable\n");
+    dim_print("  echo $KEY          — expand a variable\n");
+    dim_print("  env                — show all variables\n\n");
+
+    framebuffer::draw_string("  Aliases:\n", FG_WARN, BG);
+    dim_print("  alias ll='ls -la'  — create an alias\n");
+    dim_print("  unalias ll         — remove an alias\n\n");
+
+    framebuffer::draw_string("  Command Chaining:\n", FG_WARN, BG);
+    dim_print("  mkdir /tmp/t ; touch /tmp/t/f.txt ; ls /tmp/t\n\n");
+
+    framebuffer::draw_string("  Redirection:\n", FG_WARN, BG);
+    dim_print("  echo hello > /tmp/out.txt  — write to file\n");
+    dim_print("  echo more >> /tmp/out.txt  — append to file\n\n");
+
+    framebuffer::draw_string("  Startup script:\n", FG_WARN, BG);
+    puts("  /etc/plum/plumrc is sourced at shell start.\n");
+    puts("  Write your aliases and ENV there with:\n");
+    dim_print("  echo 'export PS1=\"\\$> \"' >> /etc/plum/plumrc\n\n");
 }
 
 // ══════════════════════════════════════════════════════════════

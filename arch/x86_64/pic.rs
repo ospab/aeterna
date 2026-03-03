@@ -166,3 +166,18 @@ pub fn read_isr() -> u16 {
         (hi << 8) | lo
     }
 }
+
+/// Program PIT channel 0 for 100 Hz preemptive timer interrupts.
+/// Call this after pic::init() and before enable_interrupts().
+///
+/// Divisor = 1_193_182 / 100 = 11_931 (0x2E9B)
+/// Command byte 0x36 = channel 0, lobyte/hibyte access, mode 3 (square wave), binary.
+pub fn init_pit_100hz() {
+    const DIVISOR: u16 = 11931; // 1_193_182 / 100
+    unsafe {
+        outb(0x43, 0x36);                            // channel 0, lobyte/hibyte, mode 3
+        outb(0x40, (DIVISOR & 0xFF) as u8);          // divisor low byte
+        outb(0x40, ((DIVISOR >> 8) & 0xFF) as u8);   // divisor high byte
+    }
+    crate::arch::x86_64::serial::write_str("[PIT] Channel 0 → 100 Hz (divisor=11931)\r\n");
+}

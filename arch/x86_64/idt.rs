@@ -377,58 +377,90 @@ static EXCEPTION_NAMES: [&str; 32] = [
     "Reserved",
 ];
 
-/// Main exception dispatcher - triggers panic which will handle display
+/// Main exception dispatcher - handles ring-3 faults gracefully, panics on ring-0.
 /// Stack layout at entry: [r15..rax] [error_code] [rip] [cs] [rflags] [rsp] [ss]
-/// Offsets from saved_state: r15=0, r14=8, ..., rax=112, error=120, rip=128, cs=136
-extern "C" fn exception_dispatch(saved_state: *const u8, vector: u64) {
+/// Offsets (u64): r15=0..rax=14, error_code=15, RIP=16, CS=17, RFLAGS=18, RSP=19, SS=20
+extern "C" fn exception_dispatch(saved_state: *mut u8, vector: u64) {
     let name = if (vector as usize) < EXCEPTION_NAMES.len() {
         EXCEPTION_NAMES[vector as usize]
     } else {
         "Unknown Exception"
     };
-    
-    // Extract error code and faulting RIP from saved stack frame
+
+    // Extract fault context from saved stack frame
     let error_code: u64;
     let fault_rip: u64;
     let fault_rsp: u64;
+    let fault_cs: u64;
     unsafe {
         let base = saved_state as *const u64;
-        // 15 registers pushed (r15..rax), then error code, then CPU frame
-        error_code = *base.add(15); // error code at offset 15*8
-        fault_rip = *base.add(16);  // RIP at offset 16*8
-        fault_rsp = *base.add(19);  // RSP at offset 19*8
+        error_code = *base.add(15); // error code at offset 15
+        fault_rip  = *base.add(16); // RIP at offset 16
+        fault_cs   = *base.add(17); // CS  at offset 17
+        fault_rsp  = *base.add(19); // RSP at offset 19
     }
-    
-    // Write detailed diagnostic to serial (no format! to avoid recursion)
+
+    // ── Ring-3 process fault: kill process, yield to next ready task ──
+    if fault_cs & 3 != 0 {
+        let pid = crate::core::scheduler::current_task_id();
+
+        // Page fault (#PF, vector 14): CR2 holds the faulting virtual address.
+        // All other exceptions: use the faulting RIP as the address.
+        let fault_addr = if vector == 14 {
+            let cr2: u64;
+            unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); }
+            cr2
+        } else {
+            fault_rip
+        };
+
+        crate::arch::x86_64::serial::write_str("[CRITICAL] Process ");
+        serial_dec(pid as u64);
+        crate::arch::x86_64::serial::write_str(" ");
+        crate::arch::x86_64::serial::write_str(name);
+        crate::arch::x86_64::serial::write_str(" at 0x");
+        serial_hex(fault_addr);
+        crate::arch::x86_64::serial::write_str(". Terminating.\r\n");
+
+        crate::core::scheduler::exit_pid(pid);
+
+        // Patch saved_state so iretq resumes the next ready task instead of
+        // returning into the now-dead process's faulting instruction.
+        crate::core::scheduler::on_timer_irq(saved_state);
+        return;
+    }
+
+    // ── Ring-0 exception: fatal kernel panic ──
     crate::arch::x86_64::serial::write_str("\r\n[FATAL] CPU Exception: ");
     crate::arch::x86_64::serial::write_str(name);
     crate::arch::x86_64::serial::write_str(" (vector ");
     serial_dec(vector);
     crate::arch::x86_64::serial::write_str(")\r\n");
-    
+
     crate::arch::x86_64::serial::write_str("  Error code: 0x");
     serial_hex(error_code);
     crate::arch::x86_64::serial::write_str("\r\n");
-    
+
     crate::arch::x86_64::serial::write_str("  Fault RIP:  0x");
     serial_hex(fault_rip);
     crate::arch::x86_64::serial::write_str("\r\n");
-    
+
     crate::arch::x86_64::serial::write_str("  Fault RSP:  0x");
     serial_hex(fault_rsp);
     crate::arch::x86_64::serial::write_str("\r\n");
-    
+
     panic!("CPU Exception");
 }
 
 /// IRQ dispatcher - handles hardware interrupts, sends EOI
-extern "C" fn irq_dispatch(_saved_state: *const u8, irq: u64) {
+extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64) {
     match irq {
         0 => {
             // Timer interrupt - tick counter
             unsafe {
                 TIMER_TICKS += 1;
             }
+            crate::core::scheduler::on_timer_irq(saved_state as *mut u8);
         }
         1 => {
             // Keyboard interrupt - read scancode and buffer it

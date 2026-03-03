@@ -416,6 +416,85 @@ pub fn rsdp_address() -> Option<*const u8> {
     }
 }
 
+// ─── Kernel file request (gives access to kernel cmdline) ────────────────────
+
+#[repr(C)]
+pub struct KernelFileResponse {
+    pub revision: u64,
+    pub kernel_file: *mut LimineFile,
+}
+
+#[repr(C)]
+pub struct KernelFileRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut KernelFileResponse,
+}
+
+unsafe impl Sync for KernelFileRequest {}
+
+#[used]
+#[link_section = ".limine_requests"]
+static mut KERNEL_FILE_REQUEST: KernelFileRequest = KernelFileRequest {
+    id: [
+        LIMINE_COMMON_MAGIC[0],
+        LIMINE_COMMON_MAGIC[1],
+        0xad97e90e83f1ed67,
+        0x31eb5d1c5ff23b69,
+    ],
+    revision: 0,
+    response: ptr::null_mut(),
+};
+
+/// Read the kernel command line provided by Limine (from the boot entry `cmdline:` field).
+/// Returns a `&'static str` slice. Empty string if not available.
+pub fn kernel_cmdline() -> &'static str {
+    unsafe {
+        if KERNEL_FILE_REQUEST.response.is_null() { return ""; }
+        let resp = &*KERNEL_FILE_REQUEST.response;
+        if resp.kernel_file.is_null() { return ""; }
+        let file = &*resp.kernel_file;
+        if file.cmdline.is_null() { return ""; }
+        // Convert C string to Rust str
+        let mut len = 0usize;
+        let ptr = file.cmdline as *const u8;
+        while *ptr.add(len) != 0 { len += 1; }
+        match core::str::from_utf8(core::slice::from_raw_parts(ptr, len)) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
+    }
+}
+
+/// Check if "key=VALUE" or bare "key" is present in the kernel cmdline.
+pub fn cmdline_has(key: &str) -> bool {
+    for tok in kernel_cmdline().split_whitespace() {
+        if tok == key { return true; }
+        // Check tok starts with "key="
+        let kb = key.as_bytes();
+        let tb = tok.as_bytes();
+        if tb.len() > kb.len() && &tb[..kb.len()] == kb && tb[kb.len()] == b'=' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Get value for key= in the kernel cmdline. Returns "" if not found.
+pub fn cmdline_get<'a>(key: &str) -> &'a str {
+    let cmdline = kernel_cmdline();
+    for tok in cmdline.split_whitespace() {
+        if tok.starts_with(key) && tok.as_bytes().get(key.len()) == Some(&b'=') {
+            return unsafe {
+                // Safety: cmdline is 'static, so the slice is too
+                let s = &tok[key.len() + 1..];
+                core::mem::transmute::<&str, &'a str>(s)
+            };
+        }
+    }
+    ""
+}
+
 pub fn get_module(index: usize) -> Option<&'static LimineFile> {
     unsafe {
         if MODULE_REQUEST.response.is_null() {

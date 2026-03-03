@@ -40,6 +40,14 @@ pub enum RamNode {
 /// Simple spin lock for single-core (no contention, just prevents reentrance)
 static LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Set to true in main.rs to indicate the storage layer is ready.
+/// Actual sync scheduling now uses IS_DIRTY + deferred_tick().
+pub static AUTOSYNC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// True when RamFS has unflushed changes.
+/// Set by every mutation; cleared by sync_filesystem() after a successful flush.
+pub static IS_DIRTY: AtomicBool = AtomicBool::new(false);
+
 fn lock() {
     while LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
@@ -89,6 +97,7 @@ pub fn init() {
         tree.insert(String::from("/sys/kernel"), RamNode::Dir);
         tree.insert(String::from("/sys/devices"), RamNode::Dir);
         tree.insert(String::from("/info"), RamNode::Dir);
+        tree.insert(String::from("/doom"), RamNode::Dir);     // DOOM save dir — persists on disk
 
         // /etc/hostname
         tree.insert(
@@ -249,6 +258,7 @@ impl FileSystem for RamFsInstance {
             }
         };
         unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
 
@@ -278,6 +288,7 @@ impl FileSystem for RamFsInstance {
             }
         };
         unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
 
@@ -348,6 +359,7 @@ impl FileSystem for RamFsInstance {
             }
         };
         unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
 
@@ -372,6 +384,7 @@ impl FileSystem for RamFsInstance {
             }
         };
         unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
 
@@ -439,6 +452,7 @@ impl FileSystem for RamFsInstance {
             }
         };
         unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
 }
@@ -514,7 +528,7 @@ pub fn refresh_proc_files() {
             // /proc/uptime
             {
                 let ticks = crate::arch::x86_64::idt::timer_ticks();
-                let secs = ticks / 18;
+                let secs = ticks / 100;
                 let mut buf = Vec::with_capacity(32);
                 push_dec(&mut buf, secs);
                 buf.extend_from_slice(b".00 ");

@@ -393,7 +393,8 @@ fn init_device(bus: u8, dev: u8, func: u8, vendor: u16, device: u16) -> bool {
     write_reg(REG_RAH0, rah);
 
     // --- Enable RX/TX interrupts ---
-    write_reg(REG_IMS, 0x04 | 0x80); // RXDMT0 + RXT0
+    // 0x01=TXDW  0x02=TXQE  0x04=LSC  0x10=RXDMT0  0x80=RXT0
+    write_reg(REG_IMS, 0x01 | 0x02 | 0x04 | 0x10 | 0x80);
 
     // Enable IRQ in PIC
     if irq < 16 {
@@ -418,6 +419,34 @@ pub fn is_initialized() -> bool {
 /// Transmit a packet
 pub fn send_packet(data: &[u8], len: usize) {
     if !is_initialized() || len == 0 || len > 1514 { return; }
+
+    // ─── TX Trace ───────────────────────────────────────────────────────────
+    {
+        let s = crate::arch::x86_64::serial::write_str;
+        s("[NET] Sending packet: size=");
+        serial_dec(len as u64);
+        if len >= 14 {
+            let et = u16::from_be_bytes([data[12], data[13]]);
+            if et == 0x0800 && len >= 34 {
+                let proto = data[23]; // IP protocol at byte 23
+                let dst   = [data[30], data[31], data[32], data[33]];
+                s(", proto=");
+                match proto {
+                    1  => s("ICMP"),
+                    6  => s("TCP"),
+                    17 => s("UDP"),
+                    _  => { s("0x"); serial_hex_byte(proto); }
+                }
+                s(", dest=");
+                serial_ip(dst);
+            } else if et == 0x0806 {
+                s(", proto=ARP");
+            } else {
+                s(", et=0x"); serial_hex16(et);
+            }
+        }
+        s("\r\n");
+    }
 
     unsafe {
         let idx = TX_TAIL;
@@ -474,6 +503,26 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
         let copy_len = len.min(2048);
         PACKET_OUT[..copy_len].copy_from_slice(&RX_BUFS[idx][..copy_len]);
 
+        // ─── RX Trace ─────────────────────────────────────────────────────
+        {
+            let s = crate::arch::x86_64::serial::write_str;
+            s("[NET] Packet received! Type: 0x");
+            let et = if copy_len >= 14 {
+                u16::from_be_bytes([PACKET_OUT[12], PACKET_OUT[13]])
+            } else { 0 };
+            serial_hex16(et);
+            s(", len=");
+            serial_dec(copy_len as u64);
+            // Decode common EtherTypes
+            match et {
+                0x0800 => s(" (IPv4)"),
+                0x0806 => s(" (ARP)"),
+                0x86DD => s(" (IPv6)"),
+                _      => {}
+            }
+            s("\r\n");
+        }
+
         // Reset descriptor for reuse
         desc.addr   = virt_to_phys(RX_BUFS[idx].as_ptr() as usize);
         desc.status = 0;
@@ -488,10 +537,24 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
     }
 }
 
-/// Handle IRQ — clear interrupt cause
+/// Handle IRQ — clear interrupt cause and log it
 pub fn handle_irq() {
     if is_initialized() {
-        let _ = read_reg(REG_ICR); // reading clears interrupts
+        let icr = read_reg(REG_ICR); // reading clears interrupts
+        let s = crate::arch::x86_64::serial::write_str;
+        s("[e1000] IRQ! ICR=0x");
+        serial_hex32(icr);
+        if icr == 0 {
+            s(" (spurious)");
+        } else {
+            if icr & 0x01 != 0 { s(" TXDW"); }
+            if icr & 0x02 != 0 { s(" TXQE"); }
+            if icr & 0x04 != 0 { s(" LSC"); }
+            if icr & 0x10 != 0 { s(" RXDMT0"); }
+            if icr & 0x40 != 0 { s(" RXO"); }
+            if icr & 0x80 != 0 { s(" RXT0"); }
+        }
+        s("\r\n");
     }
 }
 
@@ -517,4 +580,14 @@ fn serial_dec(mut v: u64) {
     let mut i = 0;
     while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
     for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
+}
+fn serial_ip(ip: [u8; 4]) {
+    for i in 0..4 {
+        let mut v = ip[i];
+        if v >= 100 { crate::arch::x86_64::serial::write_byte(b'0' + v/100); v %= 100;
+                      crate::arch::x86_64::serial::write_byte(b'0' + v/10);  v %= 10; }
+        else if v >= 10 { crate::arch::x86_64::serial::write_byte(b'0' + v/10); v %= 10; }
+        crate::arch::x86_64::serial::write_byte(b'0' + v);
+        if i < 3 { crate::arch::x86_64::serial::write_byte(b'.'); }
+    }
 }

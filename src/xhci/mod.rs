@@ -18,6 +18,9 @@
  * existing keyboard::poll_key()/try_read_key() API works transparently.
  */
 
+// WIP driver — many constants and structs are reserved for future endpoint types.
+#![allow(dead_code, unused_assignments, unused_parens)]
+
 use core::arch::asm;
 use core::ptr;
 use crate::arch::x86_64::serial;

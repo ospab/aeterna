@@ -21,7 +21,7 @@ pub fn unix_time() -> u64 {
     unsafe {
         if !TIME_SYNCED { return 0; }
         let now = crate::arch::x86_64::idt::timer_ticks();
-        let elapsed_secs = (now - SYNCED_AT_TICK) / 18;
+        let elapsed_secs = (now - SYNCED_AT_TICK) / 100;
         SYNCED_UNIX_TIME + elapsed_secs
     }
 }

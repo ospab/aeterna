@@ -1,33 +1,33 @@
-/*
+﻿/*
 Boost Software License - Version 1.1
 Copyright (c) 2026 ospab
 
-axon — Coreutils for ospab.os (AETERNA)
+axon вЂ” Coreutils for ospab.os (AETERNA)
 
 A collection of POSIX-compatible essential utilities, all operating
 exclusively through the VFS syscall layer (crate::fs::*).
 
 Utilities:
-  wc       — Count lines/words/bytes
-  head     — Display first N lines
-  tail     — Display last N lines
-  grep     — Pattern search in files
-  find     — Search for files in directory tree
-  cp       — Copy files
-  mv       — Move / rename files
-  tee      — Write stdin to file + stdout (echo variant)
-  stat     — Show file/directory info
-  du       — Estimate file space usage (sizes of files)
-  tree     — Directory tree display
-  basename — Strip directory prefix from path
-  dirname  — Strip last component from path
-  yes      — Repeatedly output a string (limited)
-  true/false — Exit code utilities
-  seq      — Print number sequences
-  sort     — Sort lines in a file
-  uniq     — Remove duplicate adjacent lines
-  cut      — Extract fields/columns from text
-  rev      — Reverse lines
+  wc       вЂ” Count lines/words/bytes
+  head     вЂ” Display first N lines
+  tail     вЂ” Display last N lines
+  grep     вЂ” Pattern search in files
+  find     вЂ” Search for files in directory tree
+  cp       вЂ” Copy files
+  mv       вЂ” Move / rename files
+  tee      вЂ” Write stdin to file + stdout (echo variant)
+  stat     вЂ” Show file/directory info
+  du       вЂ” Estimate file space usage (sizes of files)
+  tree     вЂ” Directory tree display
+  basename вЂ” Strip directory prefix from path
+  dirname  вЂ” Strip last component from path
+  yes      вЂ” Repeatedly output a string (limited)
+  true/false вЂ” Exit code utilities
+  seq      вЂ” Print number sequences
+  sort     вЂ” Sort lines in a file
+  uniq     вЂ” Remove duplicate adjacent lines
+  cut      вЂ” Extract fields/columns from text
+  rev      вЂ” Reverse lines
 */
 
 extern crate alloc;
@@ -39,6 +39,12 @@ use alloc::format;
 use crate::arch::x86_64::framebuffer;
 use crate::fs;
 use crate::userspace::plum;
+
+pub mod proc_tools;
+pub mod net_tools;
+pub mod ping;
+pub mod ps;
+pub mod netstat;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
@@ -89,13 +95,29 @@ pub fn dispatch(command: &str, args: &str) -> bool {
         "rev"      => { cmd_rev(args); true }
         "xxd"      => { cmd_xxd(args); true }
         "nl"       => { cmd_nl(args); true }
+        "diff"     => { cmd_diff(args); true }
+        "awk"      => { cmd_awk(args); true }
+        "ps"           => { ps::run(args); true }
+        "top"          => { proc_tools::cmd_top(args); true }
+        "kill"         => { proc_tools::cmd_kill(args); true }
+        "netstat"      => { netstat::run(args); true }
+        "df"           => { net_tools::cmd_df(args); true }
+        "ping"         => { ping::run(args); true }
+        "verify_mem"   => { crate::userspace::ivs::dispatch("verify_mem", args); true }
+        "verify_sched" => { crate::userspace::ivs::dispatch("verify_sched", args); true }
+        "verify_net"   => { crate::userspace::ivs::dispatch("verify_net", args); true }
+        "verify_audio" => { crate::userspace::ivs::dispatch("verify_audio", args); true }
+        "printf"   => { cmd_printf(args); true }
+        "env"      => { cmd_env(args); true }
+        "which"    => { cmd_which(args); true }
+        "xargs"    => { cmd_xargs(args); true }
         _          => false,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// wc — Count lines/words/bytes
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// wc вЂ” Count lines/words/bytes
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_wc(args: &str) {
     if args.is_empty() {
@@ -123,9 +145,9 @@ fn cmd_wc(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// head — Display first N lines (default 10)
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// head вЂ” Display first N lines (default 10)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_head(args: &str) {
     let (n, file) = parse_n_flag(args, 10);
@@ -150,9 +172,9 @@ fn cmd_head(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// tail — Display last N lines (default 10)
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// tail вЂ” Display last N lines (default 10)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_tail(args: &str) {
     let (n, file) = parse_n_flag(args, 10);
@@ -178,9 +200,9 @@ fn cmd_tail(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// grep — Pattern search (exact substring match)
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// grep вЂ” Pattern search (exact substring match)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_grep(args: &str) {
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
@@ -266,9 +288,9 @@ fn cmd_grep(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// find — Search for files in directory tree
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// find вЂ” Search for files in directory tree
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_find(args: &str) {
     let (start_dir, name_pattern) = if args.contains("-name") {
@@ -315,9 +337,9 @@ fn find_recursive(path: &str, pattern: &str, depth: usize) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// cp — Copy file
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// cp вЂ” Copy file
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_cp(args: &str) {
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -343,9 +365,9 @@ fn cmd_cp(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// mv — Move/rename file
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// mv вЂ” Move/rename file
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_mv(args: &str) {
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -375,9 +397,9 @@ fn cmd_mv(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// tee — Write text to file + display
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// tee вЂ” Write text to file + display
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_tee(args: &str) {
     // Usage: tee <file> <text...>
@@ -398,9 +420,9 @@ fn cmd_tee(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// stat — Show file/directory info
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// stat вЂ” Show file/directory info
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_stat(args: &str) {
     if args.is_empty() {
@@ -427,9 +449,9 @@ fn cmd_stat(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// du — Estimate file space usage
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// du вЂ” Estimate file space usage
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_du(args: &str) {
     let path = if args.is_empty() { "." } else { args.trim() };
@@ -463,9 +485,9 @@ fn du_recursive(path: &str) -> usize {
     total
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// tree — Directory tree display
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// tree вЂ” Directory tree display
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_tree(args: &str) {
     let path = if args.is_empty() { "." } else { args.trim() };
@@ -520,39 +542,55 @@ fn tree_recursive(path: &str, prefix: &str, depth: usize) -> (usize, usize) {
     (dirs, files)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// basename / dirname — Path manipulation
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// basename / dirname вЂ” Path manipulation
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_basename(args: &str) {
-    if args.is_empty() {
+    let path = args.trim();
+    if path.is_empty() {
         err("basename: missing operand\n");
         return;
     }
-    let path = args.trim().trim_end_matches('/');
-    if let Some(pos) = path.rfind('/') {
-        puts(&path[pos + 1..]); puts("\n");
-    } else {
-        puts(path); puts("\n");
+    let p = path.trim_end_matches('/');
+    if p.is_empty() || p == "/" {
+        puts("/\n");
+        return;
     }
+    if let Some(pos) = p.rfind('/') {
+        puts(&p[pos + 1..]);
+    } else {
+        puts(p);
+    }
+    puts("\n");
 }
 
 fn cmd_dirname(args: &str) {
-    if args.is_empty() {
+    let path = args.trim();
+    if path.is_empty() {
         err("dirname: missing operand\n");
         return;
     }
-    let path = args.trim().trim_end_matches('/');
-    if let Some(pos) = path.rfind('/') {
-        if pos == 0 { puts("/\n"); } else { puts(&path[..pos]); puts("\n"); }
+    let p = path.trim_end_matches('/');
+    if p.is_empty() || p == "/" {
+        puts("/\n");
+        return;
+    }
+    if let Some(pos) = p.rfind('/') {
+        if pos == 0 {
+            puts("/\n");
+        } else {
+            puts(&p[..pos]);
+            puts("\n");
+        }
     } else {
         puts(".\n");
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// yes — Output string repeatedly (limited to 100 lines)
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// yes вЂ” Output string repeatedly (limited to 100 lines)
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_yes(args: &str) {
     let text = if args.is_empty() { "y" } else { args.trim() };
@@ -561,9 +599,9 @@ fn cmd_yes(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// seq — Print number sequence
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// seq вЂ” Print number sequence
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_seq(args: &str) {
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -588,9 +626,9 @@ fn cmd_seq(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// sort — Sort lines of a file
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// sort вЂ” Sort lines of a file
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_sort(args: &str) {
     if args.is_empty() {
@@ -621,9 +659,9 @@ fn cmd_sort(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// uniq — Remove duplicate adjacent lines
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// uniq вЂ” Remove duplicate adjacent lines
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_uniq(args: &str) {
     if args.is_empty() {
@@ -671,9 +709,9 @@ fn cmd_uniq(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// cut — Extract columns/fields
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// cut вЂ” Extract columns/fields
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_cut(args: &str) {
     // Usage: cut -d<delim> -f<field> <file>
@@ -726,9 +764,9 @@ fn cmd_cut(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// rev — Reverse each line
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// rev вЂ” Reverse each line
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_rev(args: &str) {
     if args.is_empty() {
@@ -751,9 +789,9 @@ fn cmd_rev(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// xxd — Hex dump of file
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// xxd вЂ” Hex dump of file
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_xxd(args: &str) {
     if args.is_empty() {
@@ -802,9 +840,9 @@ fn cmd_xxd(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// nl — Number lines of a file
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+// nl вЂ” Number lines of a file
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 fn cmd_nl(args: &str) {
     if args.is_empty() {
@@ -827,9 +865,9 @@ fn cmd_nl(args: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 // Helpers
-// ═══════════════════════════════════════════════════════════════════════════
+// в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 
 /// Parse "-n N" flag from args, returning (count, remaining_args)
 fn parse_n_flag(args: &str, default: usize) -> (usize, &str) {
@@ -860,11 +898,647 @@ fn parse_i64(s: &str) -> i64 {
     if neg { -val } else { val }
 }
 
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// diff \ Compare two files line-by-line
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_diff(args: &str) {
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    if parts.len() < 2 {
+        err("diff: requires two file arguments\n");
+        dim("Usage: diff <file1> <file2>\n");
+        return;
+    }
+    let path1 = plum::resolve_path(parts[0].trim());
+    let path2 = plum::resolve_path(parts[1].trim());
+
+    let data1 = match fs::read_file(&path1) { Some(d) => d, None => { err("diff: "); err(parts[0].trim()); err(": No such file\n"); return; } };
+    let data2 = match fs::read_file(&path2) { Some(d) => d, None => { err("diff: "); err(parts[1].trim()); err(": No such file\n"); return; } };
+
+    let text1 = core::str::from_utf8(&data1).unwrap_or("");
+    let text2 = core::str::from_utf8(&data2).unwrap_or("");
+
+    let lines1: Vec<&str> = text1.lines().collect();
+    let lines2: Vec<&str> = text2.lines().collect();
+
+    let max = lines1.len().max(lines2.len());
+    let mut diffs = 0usize;
+
+    for i in 0..max {
+        let l1 = if i < lines1.len() { lines1[i] } else { "" };
+        let l2 = if i < lines2.len() { lines2[i] } else { "" };
+        if l1 != l2 {
+            diffs += 1;
+            dim(&format!("{}c{}\n", i + 1, i + 1));
+            framebuffer::draw_string("< ", 0x00FF6666, BG);
+            puts(l1); puts("\n");
+            framebuffer::draw_string("---\n", FG_DIM, BG);
+            framebuffer::draw_string("> ", 0x0066FF66, BG);
+            puts(l2); puts("\n");
+        }
+    }
+    if diffs == 0 {
+        ok("Files are identical\n");
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// awk \ Field-based text processing (minimal: single-field print)
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_awk(args: &str) {
+    // Minimal awk: supports `awk '{print $N}' file`
+    // and `awk -F: '{print $N}' file`
+    let args = args.trim();
+    let mut delim = ' ';
+    let mut rest = args;
+
+    // -F delimiter
+    if rest.starts_with("-F") {
+        if rest.len() > 2 {
+            delim = rest.chars().nth(2).unwrap_or(' ');
+            rest = rest[3..].trim_start();
+        }
+    }
+
+    // Extract '{print $N}' pattern
+    let (field_n, file) = if let Some(start) = rest.find('{') {
+        if let Some(end) = rest.find('}') {
+            let prog = &rest[start + 1..end];
+            let file = rest[end + 1..].trim();
+            // Parse $N from `print $N`
+            let n = if let Some(dpos) = prog.find('$') {
+                prog[dpos + 1..].trim().parse::<usize>().unwrap_or(0)
+            } else { 0 };
+            (n, file)
+        } else { (0, rest) }
+    } else { (0, rest) };
+
+    if file.is_empty() {
+        err("awk: missing file operand\n");
+        dim("Usage: awk [-F:] '{print $N}' <file>\n");
+        return;
+    }
+
+    let path = plum::resolve_path(file);
+    match fs::read_file(&path) {
+        Some(data) => {
+            let text = core::str::from_utf8(&data).unwrap_or("");
+            for line in text.lines() {
+                let fields: Vec<&str> = if delim == ' ' {
+                    line.split_whitespace().collect()
+                } else {
+                    let ds = alloc::string::String::from(delim);
+                    line.split(&*ds).collect()
+                };
+                if field_n == 0 {
+                    // print whole line ($0)
+                    puts(line);
+                } else if field_n <= fields.len() {
+                    puts(fields[field_n - 1]);
+                }
+                puts("\n");
+            }
+        }
+        None => { err("awk: "); err(file); err(": No such file\n"); }
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// ps \ Show kernel threads / scheduler state
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_ps(_args: &str) {
+    use crate::core::scheduler::{get_tasks, TaskSnapshot, TaskState, name_from_snapshot};
+    let mut snap = [TaskSnapshot {
+        pid: 0,
+        priority: crate::core::scheduler::Priority::Idle,
+        state: TaskState::Dead,
+        cr3: 0,
+        cpu_ticks: 0,
+        memory_bytes: 0,
+        name: [0; 24],
+        name_len: 0,
+    }; 64];
+    let count = get_tasks(&mut snap);
+
+    hl("  PID   STAT   MEM(KiB)   COMMAND\n");
+    dim("  -------------------------------------\n");
+    for i in 0..count {
+        let t = &snap[i];
+        puts("  ");
+        let pid_s = format!("{}", t.pid);
+        puts(&pid_s);
+        for _ in 0..(6usize.saturating_sub(pid_s.len())) { puts(" "); }
+        let st = match t.state {
+            TaskState::Running => "R",
+            TaskState::Ready   => "S",
+            TaskState::Waiting => "W",
+            TaskState::Dead    => "Z",
+        };
+        match t.state {
+            TaskState::Running => ok(st),
+            TaskState::Dead    => err(st),
+            _                  => dim(st),
+        }
+        puts("      ");
+        let mem_s = format!("{}", t.memory_bytes / 1024);
+        puts(&mem_s);
+        for _ in 0..(11usize.saturating_sub(mem_s.len())) { puts(" "); }
+        hl(name_from_snapshot(t));
+        puts("\n");
+    }
+    if count == 0 { dim("  (no tasks)\n"); }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// top \ Show system load and task info
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_top(_args: &str) {
+    use crate::core::scheduler::{get_tasks, TaskSnapshot, TaskState, name_from_snapshot};
+    let mut snap = [TaskSnapshot {
+        pid: 0,
+        priority: crate::core::scheduler::Priority::Idle,
+        state: TaskState::Dead,
+        cr3: 0,
+        cpu_ticks: 0,
+        memory_bytes: 0,
+        name: [0; 24],
+        name_len: 0,
+    }; 64];
+    let count = get_tasks(&mut snap);
+
+    let total_ticks: u64 = snap[..count].iter().map(|t| t.cpu_ticks).sum();
+
+    hl("  top \u{2014} task snapshot\n");
+    dim("  PID   CPU%   MEM(KiB)   TICKS      STATE    COMMAND\n");
+    dim("  ---------------------------------------------------\n");
+    for i in 0..count {
+        let t = &snap[i];
+        puts("  ");
+        let pid_s = format!("{}", t.pid);
+        puts(&pid_s);
+        for _ in 0..(6usize.saturating_sub(pid_s.len())) { puts(" "); }
+        let cpu_pct = if total_ticks > 0 { t.cpu_ticks * 100 / total_ticks } else { 0 };
+        let cpu_s = format!("{}%", cpu_pct);
+        puts(&cpu_s);
+        for _ in 0..(7usize.saturating_sub(cpu_s.len())) { puts(" "); }
+        let mem_s = format!("{}", t.memory_bytes / 1024);
+        puts(&mem_s);
+        for _ in 0..(11usize.saturating_sub(mem_s.len())) { puts(" "); }
+        let tick_s = format!("{}", t.cpu_ticks);
+        puts(&tick_s);
+        for _ in 0..(11usize.saturating_sub(tick_s.len())) { puts(" "); }
+        let st = match t.state {
+            TaskState::Running => "Running",
+            TaskState::Ready   => "Ready  ",
+            TaskState::Waiting => "Waiting",
+            TaskState::Dead    => "Dead   ",
+        };
+        match t.state {
+            TaskState::Running => ok(st),
+            TaskState::Dead    => err(st),
+            _                  => dim(st),
+        }
+        puts("  ");
+        hl(name_from_snapshot(t));
+        puts("\n");
+    }
+    if count == 0 { dim("  (no tasks)\n"); }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// netstat — network interface and ARP cache status
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_netstat(_args: &str) {
+    use crate::net;
+
+    if !net::is_up() {
+        err("netstat: no network interface is up\n");
+        return;
+    }
+
+    // ── Interface table ──────────────────────────────────────────────────
+    hl("  Interface    MAC                  IP              Status    RX        TX\n");
+    dim("  -------------------------------------------------------------------------\n");
+
+    let mac = unsafe { net::OUR_MAC };
+    let ip  = unsafe { net::OUR_IP };
+    let rx  = net::rx_packets();
+    let tx  = net::tx_packets();
+    let nic = net::nic_name();
+
+    puts("  ");
+    puts(nic);
+    let nic_len = nic.len();
+    for _ in 0..(13usize.saturating_sub(nic_len)) { puts(" "); }
+
+    // MAC
+    let hex = b"0123456789abcdef";
+    for i in 0..6 {
+        framebuffer::draw_char(hex[(mac[i]>>4) as usize] as char, FG, BG);
+        framebuffer::draw_char(hex[(mac[i]&0xF) as usize] as char, FG, BG);
+        if i < 5 { puts(":"); }
+    }
+    puts("  ");
+
+    // IP
+    let ip_s = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    puts(&ip_s);
+    for _ in 0..(16usize.saturating_sub(ip_s.len())) { puts(" "); }
+
+    ok("Up");
+    puts("      ");
+    let rx_s = format!("{}", rx);
+    puts(&rx_s);
+    for _ in 0..(10usize.saturating_sub(rx_s.len())) { puts(" "); }
+    puts(&format!("{}", tx));
+    puts("\n");
+
+    // ── Gateway / ARP cache ──────────────────────────────────────────────
+    let gw = unsafe { net::GATEWAY_IP };
+    let gw_mac = unsafe { net::GATEWAY_MAC };
+    puts("\n");
+    hl("  ARP Cache:\n");
+    dim("  IP              MAC\n");
+    dim("  -------------------------------------\n");
+
+    let mut cache = [([0u8;4],[0u8;6]); 16];
+    let n = net::arp::cache_entries(&mut cache);
+    for i in 0..n {
+        let (cip, cmac) = cache[i];
+        let ip_s = format!("  {}.{}.{}.{}", cip[0], cip[1], cip[2], cip[3]);
+        puts(&ip_s);
+        for _ in 0..(18usize.saturating_sub(ip_s.len())) { puts(" "); }
+        for j in 0..6 {
+            framebuffer::draw_char(hex[(cmac[j]>>4) as usize] as char, FG_DIM, BG);
+            framebuffer::draw_char(hex[(cmac[j]&0xF) as usize] as char, FG_DIM, BG);
+            if j < 5 { puts(":"); }
+        }
+        puts("\n");
+    }
+    if n == 0 {
+        puts("  Gateway ");
+        puts(&format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]));
+        puts("  ");
+        for j in 0..6 {
+            framebuffer::draw_char(hex[(gw_mac[j]>>4) as usize] as char, FG_DIM, BG);
+            framebuffer::draw_char(hex[(gw_mac[j]&0xF) as usize] as char, FG_DIM, BG);
+            if j < 5 { puts(":"); }
+        }
+        puts("\n");
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// axon-ping \ Send ICMP echo request 
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_axon_ping(args: &str) {
+    let args = args.trim();
+    let (target, count) = {
+        // parse optional -c N
+        let mut words = args.splitn(3, ' ');
+        let first = words.next().unwrap_or("");
+        if first == "-c" {
+            let n = words.next().unwrap_or("4").parse::<usize>().unwrap_or(4);
+            let host = words.next().unwrap_or("8.8.8.8").trim();
+            (host, n)
+        } else if first.is_empty() {
+            ("8.8.8.8", 4usize)
+        } else {
+            (first, 4usize)
+        }
+    };
+
+    // Parse dotted-decimal IP
+    let parts: Vec<&str> = target.split('.').collect();
+    if parts.len() != 4 {
+        err("ping: invalid IP format\n");
+        dim("Usage: ping [-c N] <ip>\n");
+        return;
+    }
+    let mut ip = [0u8; 4];
+    for (i, part) in parts.iter().enumerate() {
+        match part.trim().parse::<u8>() {
+            Ok(b) => ip[i] = b,
+            Err(_) => { err("ping: bad IP octet\n"); return; }
+        }
+    }
+
+    if !crate::net::is_up() {
+        err("ping: network is down\n");
+        dim("  (start network stack first)\n");
+        return;
+    }
+
+    ok("PING "); puts(target); ok(" 56(84) bytes of data.\n");
+
+    let mut received = 0usize;
+    for seq in 1..=count {
+        crate::net::icmp::send_ping(ip, seq as u16);
+
+        // Poll for reply with ~3s timeout (100 Hz → 300 ticks)
+        let mut reply: Option<(u16, u64)> = None;
+        let deadline = crate::arch::x86_64::idt::timer_ticks() + 300;
+        while crate::arch::x86_64::idt::timer_ticks() < deadline {
+            reply = crate::net::icmp::poll_reply();
+            if reply.is_some() { break; }
+            unsafe { core::arch::asm!("hlt"); }
+        }
+
+        match reply {
+            Some((_s, ms)) => {
+                received += 1;
+                // Clamp readout: 1 tick = ~10ms, sub-tick shows as <10ms
+                let display_ms = if ms == 0 { 1 } else { ms };
+                ok("64 bytes from "); puts(target);
+                puts(&format!(": icmp_seq={} ttl=64 time={}ms\n", seq, display_ms));
+            }
+            None => {
+                err("Request timeout for icmp_seq=");
+                err(&format!("{}", seq));
+                err("\n");
+            }
+        }
+    }
+
+    // Summary
+    puts("\n");
+    dim(&format!("--- {} ping statistics ---\n", target));
+    let lost = count - received;
+    let loss_pct = if count > 0 { lost * 100 / count } else { 0 };
+    dim(&format!("{} packets transmitted, {} received, {}% packet loss\n",
+        count, received, loss_pct));
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// df \ Disk/filesystem usage
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_df(_args: &str) {
+    hl("  Filesystem      1K-blocks   Used  Available  Use%  Mounted on\n");
+    dim("  \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\n");
+
+    // RamFS usage
+    let node_count = crate::fs::ramfs::node_count();
+    // Each node is ~avg 256 bytes overhead; estimate
+    let ramfs_used_kb = (node_count * 256) / 1024;
+    let heap_total_kb = if crate::mm::heap::is_initialized() {
+        let (used, free) = crate::mm::heap::stats();
+        (used + free) / 1024
+    } else { 131072 }; // 128 MiB
+
+    puts("  ramfs           ");
+    put_usize(heap_total_kb); puts("  ");
+    put_usize(ramfs_used_kb); puts("  ");
+    put_usize(heap_total_kb.saturating_sub(ramfs_used_kb));
+    puts("  ");
+    if heap_total_kb > 0 {
+        put_usize(ramfs_used_kb * 100 / heap_total_kb);
+    } else { puts("0"); }
+    puts("%  /\n");
+
+    // Physical disk(s)
+    let disk_count = crate::drivers::disk_count();
+    for i in 0..disk_count {
+        if let Some(info) = crate::drivers::disk_info(i) {
+            let disk_kb = info.size_mb as usize * 1024;
+            // Persistence uses LBA 2048 + up to 16384 sectors -> 8 MiB
+            let used_kb = 8 * 1024;
+            puts("  disk");
+            put_usize(i);
+            puts("          ");
+            put_usize(disk_kb); puts("  ");
+            put_usize(used_kb); puts("  ");
+            put_usize(disk_kb.saturating_sub(used_kb));
+            puts("  ");
+            if disk_kb > 0 {
+                put_usize(used_kb * 100 / disk_kb);
+            } else { puts("0"); }
+            puts("%  /dev/disk");
+            put_usize(i);
+            puts("\n");
+        }
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// kill \ Send (simulated) signal to a PID
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#[allow(dead_code)]
+fn cmd_kill(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        err("kill: missing PID\n");
+        dim("Usage: kill [-SIGNAL] <pid>\n");
+        dim("       kill -l    (list signals)\n");
+        return;
+    }
+    if args == "-l" {
+        hl("  Signals available:\n");
+        puts("   1) SIGHUP    2) SIGINT    3) SIGQUIT   4) SIGILL\n");
+        puts("   9) SIGKILL  15) SIGTERM  17) SIGCHLD  18) SIGCONT\n");
+        puts("  19) SIGSTOP  20) SIGTSTP\n");
+        return;
+    }
+    // Parse optional signal and PID
+    let (sig, pid_str) = if args.starts_with('-') {
+        let rest = &args[1..];
+        if let Some(pos) = rest.find(' ') {
+            (&rest[..pos], rest[pos + 1..].trim())
+        } else {
+            (rest, "")
+        }
+    } else { ("15", args) };
+
+    let pid: usize = pid_str.parse().unwrap_or(usize::MAX);
+
+    if pid == usize::MAX {
+        err("kill: invalid PID\n");
+        return;
+    }
+    // PID 0 and 1 are non-killable kernel threads
+    if pid <= 1 {
+        err("kill: cannot kill kernel thread\n");
+        return;
+    }
+    if crate::core::scheduler::signal_pid(pid as u32, sig.parse().unwrap_or(15)) {
+        ok("kill: sent SIG"); ok(sig); ok(" to PID "); ok(pid_str); ok("\n");
+    } else {
+        err("kill: ("); err(pid_str); err(") No such process\n");
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// printf \ Formatted output (subset: %s, %d, %i, %x, \\n, \\t)
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_printf(args: &str) {
+    if args.is_empty() {
+        err("printf: missing format string\n");
+        dim("Usage: printf <format> [args...]\n");
+        return;
+    }
+
+    // Split into format and args
+    let (fmt, rest) = if args.starts_with('"') {
+        if let Some(end) = args[1..].find('"') {
+            (&args[1..end + 1], args[end + 2..].trim())
+        } else { (args, "") }
+    } else {
+        if let Some(pos) = args.find(' ') {
+            (&args[..pos], args[pos + 1..].trim())
+        } else { (args, "") }
+    };
+
+    let arg_list: Vec<&str> = rest.split_whitespace().collect();
+    let mut arg_idx = 0usize;
+
+    let mut i = 0usize;
+    let bytes = fmt.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => puts("\n"),
+                b't' => puts("\t"),
+                b'r' => puts("\r"),
+                b'\\' => puts("\\"),
+                _ => { puts("\\"); framebuffer::draw_char(bytes[i + 1] as char, FG, BG); }
+            }
+            i += 2;
+        } else if bytes[i] == b'%' && i + 1 < bytes.len() {
+            let spec = bytes[i + 1];
+            let val = if arg_idx < arg_list.len() { arg_list[arg_idx] } else { "" };
+            arg_idx += 1;
+            match spec {
+                b's' => puts(val),
+                b'd' | b'i' => {
+                    let n: i64 = val.trim().parse().unwrap_or(0);
+                    puts(&format!("{}", n));
+                }
+                b'x' => {
+                    let n: u64 = val.trim().parse().unwrap_or(0);
+                    puts(&format!("{:x}", n));
+                }
+                b'X' => {
+                    let n: u64 = val.trim().parse().unwrap_or(0);
+                    puts(&format!("{:X}", n));
+                }
+                b'%' => { puts("%"); arg_idx -= 1; }
+                _ => { puts("%"); framebuffer::draw_char(spec as char, FG, BG); arg_idx -= 1; }
+            }
+            i += 2;
+        } else {
+            framebuffer::draw_char(bytes[i] as char, FG, BG);
+            i += 1;
+        }
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// env \ Print or run with modified environment variables
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_env(args: &str) {
+    if !args.is_empty() {
+        // Try to run command with env vars (just dispatch the rest)
+        dim("env: command exec not yet supported вЂ” showing environment\n\n");
+    }
+    // Print current shell environment from plum
+    let env = plum::get_env();
+    if env.is_empty() {
+        dim("(no environment variables set)\n");
+    } else {
+        for (k, v) in &env {
+            puts(k); puts("="); puts(v); puts("\n");
+        }
+    }
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// which \ Show which subsystem provides a command
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_which(args: &str) {
+    let cmd = args.trim();
+    if cmd.is_empty() {
+        err("which: missing operand\n");
+        return;
+    }
+    // Check AXON
+    for axon_cmd in command_list() {
+        if *axon_cmd == cmd {
+            ok("/bin/"); ok(cmd); ok("  [axon built-in]\n");
+            return;
+        }
+    }
+    // Check terminal builtins (common names)
+    let builtins = ["ls", "cd", "pwd", "cat", "echo", "mkdir", "touch", "rm",
+                    "help", "version", "dmesg", "lspci", "free", "ping", "reboot",
+                    "shutdown", "clear", "history", "sync", "uname", "date",
+                    "install", "tutor", "grape", "tomato", "seed", "doom"];
+    for b in builtins.iter() {
+        if *b == cmd {
+            ok("/bin/"); ok(cmd); ok("  [kernel built-in]\n");
+            return;
+        }
+    }
+    err(cmd); err(": not found\n");
+}
+
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+// xargs \ Build and execute commands from stdin-like arguments
+// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+fn cmd_xargs(args: &str) {
+    // xargs <cmd> [fixed-args...] -- builds: cmd fixed-args item
+    // In a non-piped terminal this operates on whitespace-separated args
+    // as if they were lines from stdin.
+    let (cmd, items_str) = if let Some(pos) = args.find(' ') {
+        (&args[..pos], args[pos + 1..].trim())
+    } else { (args.trim(), "") };
+
+    if cmd.is_empty() {
+        err("xargs: missing command\n");
+        dim("Usage: xargs <cmd> [items...]\n");
+        return;
+    }
+
+    if items_str.is_empty() {
+        err("xargs: no input items provided\n");
+        return;
+    }
+
+    for item in items_str.split_whitespace() {
+        let full_args = format!("{} {}", cmd, item);
+        dim(&format!("+ {}\n", full_args));
+        // Try dispatching through AXON first, then terminal builtins
+        if !dispatch(cmd, &format!("{}", item)) {
+            // Not an axon command вЂ” let plum/terminal handle it
+            // We can call the full command via the shell's exec path
+            let _ = full_args; // command will be executed by plum on next prompt
+            err("xargs: '"); err(cmd); err("' is not an axon command (try running individually)\n");
+        }
+    }
+}
+
 /// Return list of all AXON command names (for Tab completion)
 pub fn command_list() -> &'static [&'static str] {
     &[
         "wc", "head", "tail", "grep", "find", "cp", "mv", "tee",
         "stat", "du", "tree", "basename", "dirname", "yes", "true",
         "false", "seq", "sort", "uniq", "cut", "rev", "xxd", "nl",
+        "diff", "awk", "ps", "top", "kill",
+        "netstat", "df", "ping", "printf", "env", "which", "xargs",
+        "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }

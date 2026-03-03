@@ -211,10 +211,42 @@ pub extern "C" fn _start() -> ! {
             serial::write_str("[FS] No persisted FS found, creating new\r\n");
             boot_warn_new_fs();
         }
+
+        // ── Enable auto-sync: every VFS write will flush to disk ──
+        ospab_os::fs::ramfs::AUTOSYNC_ENABLED.store(true, core::sync::atomic::Ordering::SeqCst);
+        serial::write_str("[FS] Auto-sync ENABLED — all writes persist to disk\r\n");
+        boot_ok("Disk persistence: auto-sync enabled");
     } else {
         boot_warn("Storage: no drives found (ATA/AHCI)");
         klog::boot("No storage devices");
     }
+
+    // ══════════════════════════════════════════════
+    // Phase 3.5: Audio subsystem (Intel HDA)
+    // ══════════════════════════════════════════════
+    boot_pending("Audio subsystem");
+    if ospab_os::drivers::audio::init() {
+        boot_ok("Audio subsystem (Intel HDA, 44100Hz/16-bit/2ch)");
+        klog::boot("HDA audio initialized");
+    } else {
+        boot_warn("Audio: no HDA controller found (add -device intel-hda,id=sound0 -device hda-duplex,bus=sound0.0 to QEMU)");
+        klog::boot("Audio not available");
+    }
+
+    // ══════════════════════════════════════════════
+    // Phase 3.7: /sys virtual filesystem nodes
+    // ══════════════════════════════════════════════
+    boot_pending("/sys VFS nodes");
+    ospab_os::fs::mkdir("/sys");
+    // Write initial /sys/status with boot-time process snapshot.
+    // The terminal `ps` command calls refresh_sys_status() to keep it current.
+    refresh_sys_status();
+    boot_ok("/sys/status ready");
+    klog::boot("/sys/status populated");
+
+    // Create /dev tree — /dev/audio is a virtual device file (writes go to HDA)
+    ospab_os::fs::mkdir("/dev");
+    ospab_os::fs::write_file("/dev/audio", b""); // placeholder; writes intercepted in VFS layer
 
     // ══════════════════════════════════════════════
     // Phase 4: Network (optional — continues if no NIC)
@@ -237,9 +269,9 @@ pub extern "C" fn _start() -> ! {
         // ── Quick self-test: send one ping to gateway and log result ──
         serial::write_str("[NET-TEST] Sending ICMP ping to 10.0.2.2 ...\r\n");
         ospab_os::net::icmp::send_ping([10, 0, 2, 2], 0);
-        // Poll for reply: up to ~3 seconds (54 ticks at 18.2 Hz)
+        // Poll for reply: up to ~3 seconds (300 ticks at 100 Hz)
         let mut got_reply = false;
-        let deadline = ospab_os::arch::x86_64::idt::timer_ticks() + 54;
+        let deadline = ospab_os::arch::x86_64::idt::timer_ticks() + 300; // 3 s @ 100 Hz
         let mut diag_ticks = 0u32;
         loop {
             ospab_os::net::poll_rx();
@@ -293,15 +325,80 @@ pub extern "C" fn _start() -> ! {
     klog::boot("plum shell ready");
 
     // ══════════════════════════════════════════════
-    // Phase 5: Terminal
+    // Phase 5: Terminal or Installer (cmdline-selected)
     // ══════════════════════════════════════════════
-    boot_ok("Console ready");
-    klog::boot("Entering terminal");
+    let boot_mode = ospab_os::arch::x86_64::boot::cmdline_get("mode");
+    serial::write_str("[BOOT] mode=");
+    serial::write_str(boot_mode);
+    serial::write_str("\r\n");
 
-    // Small visual separator before terminal
-    framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+    if boot_mode == "installer" {
+        serial::write_str("[BOOT] Launching installer (mode=installer)\r\n");
+        boot_ok("Launching installer");
+        klog::boot("Entering installer");
+        framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+        crate::installer::run();
+        loop { unsafe { core::arch::asm!("hlt"); } }
+    } else {
+        boot_ok("Console ready");
+        klog::boot("Entering terminal");
+        framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+        terminal::run();
+    }
+}
 
-    terminal::run();
+// ─── /sys/status: write current task table to VFS ───
+
+/// Build a text snapshot of all live tasks and write it to /sys/status.
+/// Call at boot and whenever the task table changes (e.g. from `ps`).
+fn refresh_sys_status() {
+    use alloc::vec::Vec;
+
+    let mut snapshots = [ospab_os::core::syscall::TaskInfo {
+        pid: 0,
+        priority: ospab_os::core::scheduler::Priority::Idle,
+        state: ospab_os::core::scheduler::TaskState::Dead,
+        cr3: 0,
+        cpu_ticks: 0,
+        memory_bytes: 0,
+        name: [0u8; 24],
+        name_len: 0,
+    }; 64];
+    let n = ospab_os::core::syscall::sys_get_tasks(&mut snapshots);
+
+    let mut out: Vec<u8> = Vec::with_capacity(n * 48 + 32);
+
+    // Header
+    for &b in b"PID   TICKS      STATE    NAME\n" { out.push(b); }
+    for &b in b"---   -----      -----    ----\n" { out.push(b); }
+
+    for snap in snapshots.iter().take(n) {
+        // PID (right-pad to 6)
+        let pid_s = dec_str(snap.pid as u64);
+        for &b in pid_s.as_bytes() { out.push(b); }
+        for _ in pid_s.len()..6 { out.push(b' '); }
+
+        // CPU ticks (right-pad to 11)
+        let tick_s = dec_str(snap.cpu_ticks);
+        for &b in tick_s.as_bytes() { out.push(b); }
+        for _ in tick_s.len()..11 { out.push(b' '); }
+
+        // State (fixed 9 chars)
+        let state_str: &[u8] = match snap.state {
+            ospab_os::core::scheduler::TaskState::Running => b"running  ",
+            ospab_os::core::scheduler::TaskState::Ready   => b"ready    ",
+            ospab_os::core::scheduler::TaskState::Waiting => b"waiting  ",
+            ospab_os::core::scheduler::TaskState::Dead    => b"dead     ",
+        };
+        for &b in state_str { out.push(b); }
+
+        // Name
+        let name_len = snap.name_len as usize;
+        for j in 0..name_len { out.push(snap.name[j]); }
+        out.push(b'\n');
+    }
+
+    ospab_os::fs::write_file("/sys/status", &out);
 }
 
 // ─── Boot log helpers: write to both serial and framebuffer ───

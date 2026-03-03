@@ -60,6 +60,13 @@ const LBA_BASE: u64 = 2048;
 /// Maximum bytes we write (limits how many sectors we use: 8 MiB)
 const MAX_FS_BYTES: usize = 8 * 1024 * 1024;
 
+/// PIT fires at 100 Hz. Deferred write-back triggers 10 s after the last mutation.
+const DEFERRED_SYNC_TICKS: u64 = 1000;
+
+/// Tick counter at the time of the most recent RamFS mutation (0 = none pending).
+static LAST_DIRTY_TICK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Choose the primary persistence disk: prefer AHCI, else first disk.
 fn select_disk() -> Option<(usize, crate::drivers::DiskKind, usize)> {
     let total = crate::drivers::disk_count();
@@ -330,7 +337,38 @@ fn serial_dec(mut v: u64) {
 
 // ─── High-level sync ──────────────────────────────────────────────────────────
 
-/// Deterministic Memory Fabric token for persistence buffer
+/// Mark the filesystem dirty and record the current tick.
+/// Called once per write mutation from ramfs — never blocks.
+#[inline]
+pub fn mark_dirty() {
+    super::ramfs::IS_DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
+    let t = crate::arch::x86_64::idt::timer_ticks();
+    LAST_DIRTY_TICK.store(t, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns true if the RamFS has unflushed changes.
+#[inline]
+pub fn is_dirty() -> bool {
+    super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Deferred write-back — call from the terminal idle loop (each HLT iteration).
+/// Flushes to disk only when IS_DIRTY and ≥10 s have elapsed since the last write.
+/// This makes saves instantaneous (RAM write) while the disk flush happens silently
+/// in the background without blocking gameplay or the terminal.
+pub fn deferred_tick() {
+    if !super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let now  = crate::arch::x86_64::idt::timer_ticks();
+    let last = LAST_DIRTY_TICK.load(core::sync::atomic::Ordering::Relaxed);
+    if last == 0 || now.wrapping_sub(last) < DEFERRED_SYNC_TICKS {
+        return; // too soon
+    }
+    sync_filesystem();
+}
+
+/// Scratch buffer token for lock-free serialization (Deterministic Memory Fabric).
 #[derive(Copy, Clone)]
 struct MedToken {
     phys: u64,
@@ -341,14 +379,17 @@ struct MedToken {
 /// Snapshot the current RamFS to disk.
 /// Returns true if written successfully.
 pub fn sync_filesystem() -> bool {
+    // Fast-path: nothing has changed since last flush.
+    if !super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+
     let tree = match super::get_tree_copy() {
         Some(t) => t,
         None => return false,
     };
 
     if tree.is_empty() { return false; }
-
-    crate::arch::x86_64::serial::write_str("[FS] sync begin\r\n");
 
     let required = required_size(&tree);
     let sector_size = 512usize;
@@ -393,7 +434,6 @@ pub fn sync_filesystem() -> bool {
         );
     }
 
-    crate::arch::x86_64::serial::write_str("[FS] writing to disk\r\n");
     if !write_to_disk(med.virt, total_bytes, sectors_needed as u32, med.phys) {
         crate::arch::x86_64::serial::write_str("[FS] write_to_disk failed\r\n");
         return false;
@@ -410,7 +450,8 @@ pub fn sync_filesystem() -> bool {
         panic!("DISK_WRITE_VERIFICATION_FAILED");
     }
 
-    crate::arch::x86_64::serial::write_str("[FS] sync ok\r\n");
+    // Mark filesystem clean — deferred_tick won't fire again until next mutation.
+    super::ramfs::IS_DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
 
     true
 }

@@ -335,12 +335,6 @@ pub fn write_sectors(drive_idx: usize, lba: u32, count: u8, data: &[u8]) -> bool
     let base = channel_base(d.channel);
     let ctrl = channel_ctrl(d.channel);
 
-    crate::arch::x86_64::serial::write_str("[ATA] write lba=");
-    serial_dec(lba as u64);
-    crate::arch::x86_64::serial::write_str(" count=");
-    serial_dec(count as u64);
-    crate::arch::x86_64::serial::write_str("\r\n");
-
     // Suppress IDE IRQs during PIO transfer (nIEN = bit 1 of device control)
     outb(ctrl, 0x02);
 
@@ -395,7 +389,6 @@ pub fn write_sectors(drive_idx: usize, lba: u32, count: u8, data: &[u8]) -> bool
     outb(ctrl, 0x00);
     let _ = inb(base + ATA_REG_STATUS);
 
-    crate::arch::x86_64::serial::write_str("[ATA] write ok\r\n");
     true
 }
 
