@@ -353,9 +353,210 @@ pub fn find_all_by_class(class: u8, subclass: u8, out: &mut [PciDevice]) -> usiz
     count
 }
 
+/// Find a device by vendor ID + device ID.
+pub fn find_by_vendor_device(vid: u16, did: u16) -> Option<&'static PciDevice> {
+    unsafe {
+        for i in 0..PCI_DEVICE_COUNT {
+            let d = &PCI_DEVICES[i];
+            if d.vendor_id == vid && d.device_id == did {
+                return Some(d);
+            }
+        }
+        None
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Name tables (Vendor / Device / Class)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Return human-readable vendor name for a Vendor ID.
+pub fn vendor_name(vid: u16) -> &'static str {
+    match vid {
+        0x8086 => "Intel",
+        0x1022 => "AMD",
+        0x10DE => "NVIDIA",
+        0x15AD => "VMware",
+        0x1234 => "QEMU/Bochs",
+        0x10EC => "Realtek",
+        0x1AF4 => "VirtIO",
+        0x1B36 => "QEMU",
+        0x1B21 => "ASMedia",
+        0x14E4 => "Broadcom",
+        0x104C => "Texas Instruments",
+        0x1002 => "ATI/AMD",
+        0x12D8 => "Pericom",
+        0x10B7 => "3Com",
+        0x9004 => "Adaptec",
+        _      => "Unknown",
+    }
+}
+
+/// Return human-readable device name, or "" if not known.
+pub fn device_name(vid: u16, did: u16) -> &'static str {
+    match (vid, did) {
+        // Intel
+        (0x8086, 0x1237) => "440FX Host Bridge",
+        (0x8086, 0x7000) => "82371SB PIIX3 ISA Bridge",
+        (0x8086, 0x7010) => "82371SB PIIX3 IDE",
+        (0x8086, 0x7020) => "82371SB PIIX3 USB 1.1",
+        (0x8086, 0x7113) => "82371AB PIIX4 ACPI",
+        (0x8086, 0x100E) => "82545EM Gigabit Ethernet",
+        (0x8086, 0x100F) => "82545EM Gigabit Ethernet (server)",
+        (0x8086, 0x10D3) => "82574L Gigabit Ethernet",
+        (0x8086, 0x10EA) => "82577LM Gigabit Ethernet",
+        (0x8086, 0x1502) => "82579LM Gigabit Ethernet",
+        (0x8086, 0x1503) => "82579V Gigabit Ethernet",
+        (0x8086, 0x1533) => "I210 Gigabit Ethernet",
+        (0x8086, 0x2415) => "82801AA AC97 Audio",
+        (0x8086, 0x2668) => "ICH6 HD Audio Controller",
+        (0x8086, 0x293E) => "ICH9 HD Audio Controller",
+        (0x8086, 0x269A) => "ICH6 HD Audio (mobile)",
+        (0x8086, 0x29C0) => "82G33/G31 Host Bridge",
+        (0x8086, 0x2934) => "ICH9 USB UHCI #1",
+        (0x8086, 0x2935) => "ICH9 USB UHCI #2",
+        (0x8086, 0x293A) => "ICH9 USB EHCI",
+        // QEMU/Bochs
+        (0x1234, 0x1111) => "QEMU VGA Adapter",
+        (0x1B36, 0x000D) => "QEMU XHCI Host Controller",
+        (0x1B36, 0x0001) => "QEMU PCIe Host Bridge",
+        // VMware
+        (0x15AD, 0x0405) => "SVGA II Display Adapter",
+        (0x15AD, 0x0710) => "SVGA Display Adapter",
+        (0x15AD, 0x07B0) => "VMXNET3 Ethernet Adapter",
+        (0x15AD, 0x0790) => "PVSCSI Storage Adapter",
+        (0x15AD, 0x0801) => "VMware VMCI Bus Device",
+        (0x15AD, 0x0820) => "VMware Paravirtual RDMA",
+        // Realtek
+        (0x10EC, 0x8139) => "RTL8139 Fast Ethernet",
+        (0x10EC, 0x8169) => "RTL8169 Gigabit Ethernet",
+        (0x10EC, 0x8168) => "RTL8111/8168 Gigabit Ethernet",
+        // VirtIO
+        (0x1AF4, 0x1000) => "VirtIO Network Device",
+        (0x1AF4, 0x1001) => "VirtIO Block Device",
+        (0x1AF4, 0x1050) => "VirtIO GPU",
+        (0x1AF4, 0x1002) => "VirtIO Balloon",
+        (0x1AF4, 0x1003) => "VirtIO Console",
+        _                 => "",
+    }
+}
+
+/// Return a class+subclass description string.
+pub fn class_name(class: u8, subclass: u8) -> &'static str {
+    match (class, subclass) {
+        (0x00, 0x00) => "Non-VGA Unclassified Device",
+        (0x00, 0x01) => "VGA Compatible Unclassified Device",
+        (0x01, 0x00) => "SCSI Storage Controller",
+        (0x01, 0x01) => "IDE Interface",
+        (0x01, 0x02) => "Floppy Disk Controller",
+        (0x01, 0x06) => "SATA Controller",
+        (0x01, 0x07) => "Serial Attached SCSI Controller",
+        (0x01, 0x08) => "NVM Express Controller",
+        (0x01, 0x80) => "Mass Storage Controller",
+        (0x02, 0x00) => "Ethernet Controller",
+        (0x02, 0x01) => "Token Ring Controller",
+        (0x02, 0x02) => "FDDI Controller",
+        (0x02, 0x03) => "ATM Controller",
+        (0x02, 0x80) => "Network Controller",
+        (0x03, 0x00) => "VGA Compatible Controller",
+        (0x03, 0x01) => "XGA Compatible Controller",
+        (0x03, 0x02) => "3D Controller",
+        (0x03, 0x80) => "Display Controller",
+        (0x04, 0x00) => "Multimedia Video Controller",
+        (0x04, 0x01) => "Multimedia Audio Controller",
+        (0x04, 0x02) => "Computer Telephony Device",
+        (0x04, 0x03) => "Multimedia Audio Controller (HDA)",
+        (0x04, 0x80) => "Multimedia Controller",
+        (0x05, 0x00) => "RAM Memory Controller",
+        (0x05, 0x01) => "Flash Memory Controller",
+        (0x05, 0x80) => "Memory Controller",
+        (0x06, 0x00) => "Host Bridge",
+        (0x06, 0x01) => "ISA Bridge",
+        (0x06, 0x02) => "EISA Bridge",
+        (0x06, 0x04) => "PCI-PCI Bridge",
+        (0x06, 0x05) => "PCMCIA Bridge",
+        (0x06, 0x80) => "Bridge Device",
+        (0x07, 0x00) => "Serial Controller",
+        (0x07, 0x01) => "Parallel Controller",
+        (0x08, 0x00) => "PIC",
+        (0x08, 0x01) => "DMA Controller",
+        (0x08, 0x02) => "Timer",
+        (0x08, 0x03) => "RTC Controller",
+        (0x08, 0x05) => "SD Host Controller",
+        (0x08, 0x06) => "IOMMU",
+        (0x08, 0x80) => "System Peripheral",
+        (0x0A, 0x00) => "Non-Essential Instrumentation",
+        (0x0B, 0x00) => "386 Processor",
+        (0x0C, 0x00) => "FireWire (IEEE 1394) Controller",
+        (0x0C, 0x01) => "ACCESS Bus Controller",
+        (0x0C, 0x03) => "USB Controller",
+        (0x0C, 0x04) => "Fibre Channel",
+        (0x0C, 0x05) => "SMBus Controller",
+        (0x0C, 0x06) => "InfiniBand Controller",
+        (0x0D, 0x00) => "iRDA Controller",
+        (0x0D, 0x10) => "IR Controller",
+        (0x0D, 0x80) => "Wireless Controller",
+        (0x0E, 0x00) => "Intelligent Controller",
+        (0x0F, 0x01) => "TV Controller",
+        (0x0F, 0x02) => "Audio Controller",
+        (0x0F, 0x03) => "Voice Controller",
+        (0x0F, 0x04) => "Data Controller",
+        (0x10, 0x00) => "Network Encryption Controller",
+        (0x11, 0x00) => "DPIO Module",
+        (0x12, 0x00) => "Processing Accelerator",
+        _             => "Unknown Device",
+    }
+}
+
+/// Log all enumerated devices to serial output using verbose names.
+/// Format: [PCI] 00:00.0  Host Bridge: Intel 440FX Host Bridge [8086:1237]
+pub fn print_devices() {
+    let count = unsafe { PCI_DEVICE_COUNT };
+    if count == 0 {
+        crate::arch::x86_64::serial::write_str("[PCI] No devices enumerated.\r\n");
+        return;
+    }
+    for i in 0..count {
+        let d = unsafe { &PCI_DEVICES[i] };
+        crate::arch::x86_64::serial::write_str("[PCI] ");
+        serial_hex8(d.bus);
+        crate::arch::x86_64::serial::write_byte(b':');
+        serial_hex8(d.device);
+        crate::arch::x86_64::serial::write_byte(b'.');
+        crate::arch::x86_64::serial::write_byte(b'0' + d.function);
+        crate::arch::x86_64::serial::write_str("  ");
+        crate::arch::x86_64::serial::write_str(class_name(d.class, d.subclass));
+        crate::arch::x86_64::serial::write_str(": ");
+        crate::arch::x86_64::serial::write_str(vendor_name(d.vendor_id));
+        crate::arch::x86_64::serial::write_byte(b' ');
+        let dname = device_name(d.vendor_id, d.device_id);
+        if !dname.is_empty() {
+            crate::arch::x86_64::serial::write_str(dname);
+        } else {
+            crate::arch::x86_64::serial::write_str("[");
+            serial_hex16(d.vendor_id);
+            crate::arch::x86_64::serial::write_byte(b':');
+            serial_hex16(d.device_id);
+            crate::arch::x86_64::serial::write_str("]");
+        }
+        crate::arch::x86_64::serial::write_str("\r\n");
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════════════════════════════════════
+
+pub fn serial_hex8(v: u8) {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    crate::arch::x86_64::serial::write_byte(HEX[(v >> 4) as usize]);
+    crate::arch::x86_64::serial::write_byte(HEX[(v & 0xF) as usize]);
+}
+
+pub fn serial_hex16(v: u16) {
+    serial_hex8((v >> 8) as u8);
+    serial_hex8(v as u8);
+}
 
 fn serial_dec(mut val: u64) {
     if val == 0 {

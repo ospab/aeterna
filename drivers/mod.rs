@@ -15,6 +15,7 @@
 pub mod ata;
 pub mod ahci;
 pub mod audio;
+pub mod gpu;
 
 /// Unified disk info for terminal/installer
 #[derive(Copy, Clone)]

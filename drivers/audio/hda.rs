@@ -546,32 +546,36 @@ fn serial_u8(n: u8) {
 /// Scan PCI, initialize HDA controller, configure codec and output stream.
 /// Returns true if an HDA controller was found and initialized.
 pub fn init() -> bool {
-    // PCI scan: class=0x04, subclass=0x03 (HD Audio)
-    let mut found_bus = 0u8;
-    let mut found_dev = 0u8;
-    let mut found_func = 0u8;
-    let mut found = false;
-
-    'scan: for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                if crate::pci::vendor_id(bus, dev, func) == 0xFFFF { continue; }
-                let (class, subclass, _) = crate::pci::class_code(bus, dev, func);
-                if class == 0x04 && subclass == 0x03 {
-                    found_bus  = bus;
-                    found_dev  = dev;
-                    found_func = func;
-                    found = true;
-                    break 'scan;
+    // Fast path: use pre-enumerated PCI table (pci::enumerate() called at boot Phase 2.8)
+    let (found_bus, found_dev, found_func) =
+        if let Some(d) = crate::pci::find_by_class(0x04, 0x03, 0x00) {
+            serial::write_str("[HDA] Found via PCI table\r\n");
+            (d.bus, d.device, d.function)
+        } else {
+            // Fallback: raw PCI scan (enumerate not called yet or found nothing)
+            let mut fb = 0u8;
+            let mut fd = 0u8;
+            let mut ff = 0u8;
+            let mut found = false;
+            'scan: for bus in 0..=255u8 {
+                for dev in 0..32u8 {
+                    for func in 0..8u8 {
+                        if crate::pci::vendor_id(bus, dev, func) == 0xFFFF { continue; }
+                        let (class, subclass, _) = crate::pci::class_code(bus, dev, func);
+                        if class == 0x04 && subclass == 0x03 {
+                            fb = bus; fd = dev; ff = func;
+                            found = true;
+                            break 'scan;
+                        }
+                    }
                 }
             }
-        }
-    }
-
-    if !found {
-        serial::write_str("[HDA] No HD Audio controller found\r\n");
-        return false;
-    }
+            if !found {
+                serial::write_str("[HDA] No HD Audio controller found\r\n");
+                return false;
+            }
+            (fb, fd, ff)
+        };
 
     let vid = crate::pci::vendor_id(found_bus, found_dev, found_func);
     let did = crate::pci::device_id(found_bus, found_dev, found_func);

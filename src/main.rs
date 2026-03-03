@@ -108,6 +108,19 @@ pub extern "C" fn _start() -> ! {
     klog::memory("VMM initialized");
 
     // ══════════════════════════════════════════════
+    // Phase 2.8: PCI bus enumeration
+    // ══════════════════════════════════════════════
+    boot_pending("PCI bus enumeration");
+    let pci_count = ospab_os::pci::enumerate();
+    ospab_os::pci::print_devices();
+    if pci_count > 0 {
+        boot_ok("PCI bus enumeration");
+        klog::boot("PCI devices enumerated");
+    } else {
+        boot_warn("PCI: no devices found");
+    }
+
+    // ══════════════════════════════════════════════
     // Phase 3: Kernel services
     // ══════════════════════════════════════════════
     boot_pending("Scheduler");
@@ -219,6 +232,18 @@ pub extern "C" fn _start() -> ! {
     } else {
         boot_warn("Storage: no drives found (ATA/AHCI)");
         klog::boot("No storage devices");
+    }
+
+    // ══════════════════════════════════════════════
+    // Phase 3.4: GPU / Display acceleration
+    // ══════════════════════════════════════════════
+    boot_pending("GPU / Display acceleration");
+    if ospab_os::drivers::gpu::init() {
+        boot_ok("GPU: VMware SVGA II + VMMouse initialized");
+        klog::boot("GPU ready");
+    } else {
+        boot_warn("GPU: no accelerated display found (VMware SVGA II not present)");
+        klog::boot("GPU not available");
     }
 
     // ══════════════════════════════════════════════

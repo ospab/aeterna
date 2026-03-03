@@ -45,6 +45,7 @@ pub mod net_tools;
 pub mod ping;
 pub mod ps;
 pub mod netstat;
+pub mod lspci;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
@@ -103,6 +104,7 @@ pub fn dispatch(command: &str, args: &str) -> bool {
         "netstat"      => { netstat::run(args); true }
         "df"           => { net_tools::cmd_df(args); true }
         "ping"         => { ping::run(args); true }
+        "lspci"        => { lspci::run(args); true }
         "verify_mem"   => { crate::userspace::ivs::dispatch("verify_mem", args); true }
         "verify_sched" => { crate::userspace::ivs::dispatch("verify_sched", args); true }
         "verify_net"   => { crate::userspace::ivs::dispatch("verify_net", args); true }
