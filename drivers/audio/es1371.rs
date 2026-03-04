@@ -59,14 +59,6 @@ const REG_FC:       u16 = 0x34;   // frame count
 // MEMPAGE value for DAC2 DMA registers
 const PAGE_DAC2: u8 = 0x0C;
 
-// ─── SRCONV bits ─────────────────────────────────────────────────────────────
-//
-// Bit 22: SRC_DIS — set to disable the Sample Rate Converter and gate the
-// AC97 serial port directly from the crystal clock.  Must be set before any
-// codec register access, otherwise the serialiser clock stalls and
-// CODEC_WIP never clears (causes a boot hang on VMware / bare metal).
-const SRCONV_SRC_DIS: u32 = 1 << 22;
-
 // ─── CTRL bits ────────────────────────────────────────────────────────────────
 
 const CTRL_ADC_STOP:  u32 = 1 << 31; // disable ADC (leave off)
@@ -175,47 +167,38 @@ unsafe fn io_delay() {
 
 // ─── AC97 codec read / write (via ES1371 serialiser) ─────────────────────────
 
-/// Wait for AC97 serialiser to be idle (CODEC_WIP clear), 2 000-iteration cap.
+/// Wait for AC97 serialiser to be idle (CODEC_WIP=0).
+/// Uses io_delay() between reads so the hypervisor's emulation thread can
+/// process the in-flight AC97 transaction.  Cap: 1 000 × ~1 µs ≈ 1 ms.
 #[inline]
 unsafe fn codec_wait_idle() {
-    let mut i = 0u32;
-    while io_r32(REG_CODEC) & CODEC_WIP != 0 && i < 2_000 { i += 1; }
-}
-
-/// Write `val` to AC97 codec register `reg`.
-/// Polls WIP (Write In Progress) before and after.
-unsafe fn codec_write(reg: u8, val: u16) {
-    codec_wait_idle();
-    // Issue write: bit31=0(hw sets), bit23=0(write), bits22:16=addr, bits15:0=data
-    let cmd: u32 = ((reg as u32) << 16) | (val as u32);
-    io_w32(REG_CODEC, cmd);
-    codec_wait_idle();
-}
-
-/// Read from AC97 codec register `reg`. Returns 0xFFFF on timeout.
-unsafe fn codec_read(reg: u8) -> u16 {
-    codec_wait_idle();
-    // Issue read request
-    let cmd: u32 = CODEC_READ | ((reg as u32) << 16);
-    io_w32(REG_CODEC, cmd);
-    // Poll for WIP clear then grab returned data
-    let mut i = 0u32;
-    loop {
-        let v = io_r32(REG_CODEC);
-        if v & CODEC_WIP == 0 { return (v & 0xFFFF) as u16; }
-        i += 1;
-        if i >= 2_000 { return 0xFFFF; }
+    for _ in 0..1_000u32 {
+        if io_r32(REG_CODEC) & CODEC_WIP == 0 { return; }
+        io_delay();
     }
 }
 
-/// Enable or disable the SRC so the AC97 serialiser has a clock.
-/// Call src_set_dis(true) before any codec_read/codec_write,
-/// src_set_dis(false) after codec init is complete.
-unsafe fn src_set_dis(dis: bool) {
-    let v = io_r32(REG_SRCONV);
-    if dis { io_w32(REG_SRCONV, v |  SRCONV_SRC_DIS); }
-    else   { io_w32(REG_SRCONV, v & !SRCONV_SRC_DIS); }
-    for _ in 0..20u32 { io_delay(); }  // let clock settle
+/// Write `val` to AC97 codec register `reg`.
+unsafe fn codec_write(reg: u8, val: u16) {
+    codec_wait_idle();
+    // Issue write: bit23=0(write), bits22:16=addr, bits15:0=data
+    io_w32(REG_CODEC, ((reg as u32) << 16) | (val as u32));
+    codec_wait_idle();
+}
+
+/// Read from AC97 codec register `reg`.  Returns 0xFFFF on timeout.
+/// Each iteration calls io_delay() (~1 µs) so VMware emulation has time to
+/// complete the AC97 bus cycle.  Cap: 2 000 × ~1 µs ≈ 2 ms per call.
+unsafe fn codec_read(reg: u8) -> u16 {
+    codec_wait_idle();
+    // Issue read command (CODEC_READ sets bit 23)
+    io_w32(REG_CODEC, CODEC_READ | ((reg as u32) << 16));
+    for _ in 0..2_000u32 {
+        io_delay();
+        let v = io_r32(REG_CODEC);
+        if v & CODEC_WIP == 0 { return (v & 0xFFFF) as u16; }
+    }
+    0xFFFF
 }
 
 // ─── Public init ─────────────────────────────────────────────────────────────
@@ -291,29 +274,33 @@ pub fn init() -> bool {
 
         // Ensure power-on state: clear DAC1/ADC, keep DAC2 off for now
         io_w32(REG_CTRL, ctrl & !(CTRL_DAC2_EN | CTRL_ADC_EN | CTRL_DAC1_EN));
+        // Clear legacy mode (some BIOSes leave SB-compatibility bits set)
+        io_w32(REG_LEGACY, 0);
 
         // ── AC97 codec init ────────────────────────────────────────────────
         //
-        // Disable the SRC first so the AC97 serialiser runs from the crystal
-        // clock directly.  Without this, CODEC_WIP never clears on VMware and
-        // the polling loops below would take hundreds of seconds (boot hang).
-        src_set_dis(true);
+        // After SYNC_RES release the chip takes up to 1 ms to settle and
+        // clear the AC-Link bus.  Give it that time before touching CODEC.
+        for _ in 0..1_000u32 { io_delay(); }
 
-        // Reset codec (AC97 register 0x00 — write any value)
+        // AC97 cold reset: write register 0x00 (powerdown) to kick the codec
+        // out of reset state (value doesn't matter for a cold reset write).
         codec_write(0x00, 0xFFFF);
-        // Short delay for codec to come out of reset (~1 ms)
-        for _ in 0..500u32 { io_delay(); }
 
-        // Poll for codec ready — 200 attempts, each capped at 2 000 PCI reads
-        // → worst-case ~800 000 port reads total (well under 1 ms on any hypervisor)
+        // AC97 cold reset settling time ≥ 1 ms (AC97 spec); use 20 ms to be
+        // generous — covers slow VMware / bare-metal codec wake-up.
+        for _ in 0..20_000u32 { io_delay(); }
+
+        // Poll AC97 register 0x26 (Extended Audio Status/Control) until the
+        // codec responds with something other than 0xFFFF (our timeout flag).
+        // 10 attempts × 2 ms (codec_read cap) = 20 ms worst case.
         let mut ready = false;
-        for _ in 0..200u32 {
-            let r = codec_read(0x26); // AC97 Powerdown Control/Status
+        for _ in 0..10u32 {
+            let r = codec_read(0x26);
             if r != 0xFFFF { ready = true; break; }
-            for _ in 0..5 { io_delay(); }
+            for _ in 0..1_000u32 { io_delay(); }  // 1 ms between attempts
         }
         if !ready {
-            src_set_dis(false);
             serial::write_str("[ES1371] Codec not ready — aborting\r\n");
             return false;
         }
@@ -348,9 +335,6 @@ pub fn init() -> bool {
             SAMPLE_RATE_HZ.store(48000, Ordering::Relaxed);
             serial::write_str("[ES1371] VRA not supported, using default 48000 Hz\r\n");
         }
-
-        // Re-enable the SRC now that codec registers are fully programmed.
-        src_set_dis(false);
 
         // ── Allocate DMA buffer ────────────────────────────────────────────
         //
