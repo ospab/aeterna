@@ -14,6 +14,8 @@ LSTAR MSR setup is done in init_syscall_msr() — configures the SYSCALL
 instruction to jump to our handler entry point.
 */
 
+extern crate alloc;
+
 /// Syscall numbers for AETERNA microkernel
 /// Follows microkernel philosophy: minimal set, everything else via IPC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +113,10 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (22, |_| syscall_getpid()),
     (23, |a| syscall_spawn(a.arg1, a.arg2, a.arg3)),
     (32, |a| syscall_waitpid(a.arg1)),
+    // SyscallNumber::Mmap = 40: map size bytes, flags bit0 = HUGE_PAGE
+    (40, |a| syscall_mmap(a.arg1, a.arg2, a.arg3)),
+    // SyscallNumber::Munmap = 41: unmap mapped region
+    (41, |a| syscall_munmap(a.arg1, a.arg2)),
     (50, |a| syscall_sysinfo(a.arg1, a.arg2, a.arg3)),
     (51, |_| syscall_uptime()),
     (52, |_| syscall_get_tasks()),
@@ -351,6 +357,70 @@ pub fn sys_get_tasks(out: &mut [TaskInfo]) -> usize {
     crate::core::scheduler::get_tasks(out)
 }
 
+// ─── sys_mmap (SyscallNumber::Mmap = 40) ────────────────────────────────────
+//
+// ABI: RDI=addr_hint (0=kernel_picks), RSI=size, RDX=flags
+//   flags bit 0 = HUGE_PAGE (2MiB aligned allocation)
+//   flags bit 1 = EXEC      (mark executable, reserved)
+//
+// Returns: mapped virtual address (as i64), or negative SyscallError on fail.
+// Alignment: always 64-byte minimum; HUGE_PAGE requests 2MiB alignment (align=0x200000).
+//
+// SAFETY invariant: returned pointer is heap-allocated and must be freed via
+// sys_munmap with the same size.  The caller (aai) holds a CapabilityToken{} for
+// MemHuge before invoking this path (token checked at dispatch time in future).
+
+fn syscall_mmap(_addr_hint: u64, size: u64, flags: u64) -> i64 {
+    let size = size as usize;
+    if size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    let huge = (flags & 1) != 0;
+    // 2 MiB alignment for HUGE_PAGE; 64-byte otherwise (AVX-512 native).
+    let align: usize = if huge { 0x200_000 } else { 64 };
+    // Round size up to alignment boundary to avoid partial-page tails.
+    let alloc_size = (size + align - 1) & !(align - 1);
+
+    let layout = match core::alloc::Layout::from_size_align(alloc_size, align) {
+        Ok(l)  => l,
+        Err(_) => return SyscallError::InvalidArgument as i64,
+    };
+
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        crate::arch::x86_64::serial::write_str("[SYSCALL] Mmap: OOM\r\n");
+        return SyscallError::OutOfMemory as i64;
+    }
+
+    crate::arch::x86_64::serial::write_str("[SYSCALL] Mmap: ");
+    serial_dec(alloc_size as u64);
+    crate::arch::x86_64::serial::write_str(" bytes @ 0x");
+    serial_hex(ptr as u64);
+    crate::arch::x86_64::serial::write_str("\r\n");
+
+    ptr as i64
+}
+
+/// sys_munmap(addr, size) — free a mapping previously created by sys_mmap.
+/// The size must match exactly what was passed to Mmap.
+fn syscall_munmap(addr: u64, size: u64) -> i64 {
+    if addr == 0 || size == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    let size = size as usize;
+    // We can only know the alignment from size; use 64-byte minimum.
+    let align: usize = if size % 0x200_000 == 0 { 0x200_000 } else { 64 };
+    let alloc_size = (size + align - 1) & !(align - 1);
+
+    let layout = match core::alloc::Layout::from_size_align(alloc_size, align) {
+        Ok(l)  => l,
+        Err(_) => return SyscallError::InvalidArgument as i64,
+    };
+    // SAFETY: addr points to memory allocated by syscall_mmap with the same layout.
+    unsafe { alloc::alloc::dealloc(addr as *mut u8, layout); }
+    SyscallError::Success as i64
+}
+
 // Helper
 fn serial_dec(mut val: u64) {
     if val == 0 {
@@ -362,6 +432,21 @@ fn serial_dec(mut val: u64) {
     while val > 0 {
         buf[i] = b'0' + (val % 10) as u8;
         val /= 10;
+        i += 1;
+    }
+    for j in (0..i).rev() {
+        crate::arch::x86_64::serial::write_byte(buf[j]);
+    }
+}
+
+fn serial_hex(mut val: u64) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut i = 0;
+    if val == 0 { crate::arch::x86_64::serial::write_byte(b'0'); return; }
+    while val > 0 {
+        buf[i] = HEX[(val & 0xF) as usize];
+        val >>= 4;
         i += 1;
     }
     for j in (0..i).rev() {

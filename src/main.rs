@@ -20,6 +20,18 @@ use ospab_os::arch::x86_64::serial;
 use ospab_os::arch::x86_64::framebuffer;
 use ospab_os::klog;
 
+// ─── C stdlib stubs (LLVM may emit these via optimisation) ───────────────────
+// Only needed when building without the DOOM C library (which normally provides them).
+// When doom/libdoom.a is linked, its ospab_libc.c supplies these; this fallback
+// prevents link errors on clean/no-doom builds.
+#[cfg(not(doom_supported))]
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    let mut n = 0;
+    while *s.add(n) != 0 { n += 1; }
+    n
+}
+
 // ─── Colors for boot log output on framebuffer ───
 const COLOR_OK: u32     = 0x0000FF00;   // Green
 const COLOR_WARN: u32   = 0x0000FFFF;   // Yellow
@@ -65,6 +77,20 @@ pub extern "C" fn _start() -> ! {
 
     boot_ok("Serial (COM1)");
     boot_ok("Framebuffer");
+
+    // Log kernel load addresses (critical for DMA validation)
+    {
+        let phys = ospab_os::arch::x86_64::boot::kernel_phys_base();
+        let virt = ospab_os::arch::x86_64::boot::kernel_virt_base();
+        serial::write_str("[AETERNA] Kernel phys base: 0x");
+        serial_hex64(phys);
+        serial::write_str(", virt base: 0x");
+        serial_hex64(virt);
+        serial::write_str("\r\n");
+        if phys != 0x200000 {
+            serial::write_str("[AETERNA] *** Kernel RELOCATED by Limine (not at 0x200000) ***\r\n");
+        }
+    }
 
     // ══════════════════════════════════════════════
     // Phase 2: Memory subsystem
@@ -259,6 +285,56 @@ pub extern "C" fn _start() -> ! {
     }
 
     // ══════════════════════════════════════════════
+    // Phase 3.6: NVMe SSD + GPT + DevFS + AeternaFS
+    // ══════════════════════════════════════════════
+    boot_pending("NVMe storage");
+    if ospab_os::drivers::nvme::probe_and_init() {
+        // Build a NvmeDisk wrapper and try to parse GPT
+        let mut nvme_disk = ospab_os::drivers::block::NvmeDisk::new();
+        let gpt_parts = ospab_os::drivers::gpt::parse(&mut nvme_disk).unwrap_or(0);
+
+        // Register /dev/nvme0n1 and /dev/nvme0n1pN entries in VFS
+        ospab_os::drivers::block::register_devices();
+
+        if gpt_parts > 0 {
+            let mut msg = [0u8; 60];
+            let mut pos = 0;
+            for b in b"NVMe SSD + GPT (" { msg[pos] = *b; pos += 1; }
+            let mut p = gpt_parts;
+            if p >= 10 { msg[pos] = b'0' + (p / 10) as u8; pos += 1; }
+            msg[pos] = b'0' + (p % 10) as u8; pos += 1;
+            for b in b" partitions)" { if pos < 58 { msg[pos] = *b; pos += 1; } }
+            if let Ok(s) = core::str::from_utf8(&msg[..pos]) {
+                boot_ok(s);
+            } else {
+                boot_ok("NVMe SSD + GPT");
+            }
+            klog::boot("NVMe + GPT initialized");
+
+            // Try to auto-mount first AeternaFS partition at /mnt/target
+            for pi in 0..gpt_parts {
+                if let Some(part) = ospab_os::drivers::gpt::get_partition(pi) {
+                    let ss = ospab_os::drivers::nvme::sector_size();
+                    if ospab_os::fs::aeternafs::mount_nvme_partition(part.start_lba, ss) {
+                        ospab_os::fs::mount("/mnt/target",
+                            ospab_os::fs::aeternafs::instance());
+                        serial::write_str("  [AeternaFS] Auto-mounted partition ");
+                        serial::write_byte(b'0' + pi as u8);
+                        serial::write_str(" at /mnt/target\r\n");
+                        break;
+                    }
+                }
+            }
+        } else {
+            boot_ok("NVMe SSD (no GPT — run `fdisk -l` then `mkfs`)");
+            klog::boot("NVMe initialized, no GPT");
+        }
+    } else {
+        boot_warn("NVMe: no NVMe controller found");
+        klog::boot("NVMe not available");
+    }
+
+    // ══════════════════════════════════════════════
     // Phase 3.7: /sys virtual filesystem nodes
     // ══════════════════════════════════════════════
     boot_pending("/sys VFS nodes");
@@ -312,15 +388,21 @@ pub extern "C" fn _start() -> ! {
             // Print NIC register state every ~0.5s (9 ticks)
             diag_ticks += 1;
             if diag_ticks % 9 == 1 {
-                let (isr, cmd, cbr, capr) = ospab_os::net::diag();
-                serial::write_str("[NET-DIAG] ISR=0x");
-                serial_hex16(isr);
-                serial::write_str(" CMD=0x");
-                serial_hex8(cmd);
-                serial::write_str(" CBR=");
-                serial_u32(cbr as u32);
-                serial::write_str(" CAPR=");
-                serial_u32(capr as u32);
+                let (r0, r1, r2, r3) = ospab_os::net::diag();
+                let nic_name = ospab_os::net::nic_name();
+                serial::write_str("[NET-DIAG] ");
+                serial::write_str(nic_name);
+                if nic_name == "Intel e1000" {
+                    serial::write_str(" STATUS=0x"); serial_hex32(r0);
+                    serial::write_str(" ICR=0x"); serial_hex32(r1);
+                    serial::write_str(" RDH="); serial_u32(r2);
+                    serial::write_str(" RDT="); serial_u32(r3);
+                } else {
+                    serial::write_str(" ISR=0x"); serial_hex16(r0 as u16);
+                    serial::write_str(" CMD=0x"); serial_hex8(r1 as u8);
+                    serial::write_str(" CBR="); serial_u32(r2);
+                    serial::write_str(" CAPR="); serial_u32(r3);
+                }
                 serial::write_str("\r\n");
             }
             if ospab_os::arch::x86_64::idt::timer_ticks() >= deadline {
@@ -330,10 +412,18 @@ pub extern "C" fn _start() -> ! {
         }
         if !got_reply {
             serial::write_str("[NET-TEST] No reply (timeout)\r\n");
+            // Dump RTL8139 RX buffer for DMA debugging
+            if ospab_os::net::nic_name() == "RTL8139" {
+                ospab_os::net::rtl8139::rx_buffer_dump(64);
+            }
+            // Run full network diagnostic on failure
+            ospab_os::net::diag::run_full_diagnostic();
         }
     } else {
         boot_warn("Network: no supported NIC found");
         klog::boot("Network not available");
+        // Still run PCI scan diagnostic so we see what hardware exists
+        ospab_os::net::diag::dump_pci_nics();
     }
 
     // ══════════════════════════════════════════════
@@ -536,6 +626,13 @@ fn serial_u32(mut n: u32) {
 fn serial_hex16(v: u16) {
     let hex = b"0123456789ABCDEF";
     for i in (0..4).rev() {
+        serial::write_byte(hex[((v >> (i * 4)) & 0xF) as usize]);
+    }
+}
+
+fn serial_hex32(v: u32) {
+    let hex = b"0123456789ABCDEF";
+    for i in (0..8).rev() {
         serial::write_byte(hex[((v >> (i * 4)) & 0xF) as usize]);
     }
 }

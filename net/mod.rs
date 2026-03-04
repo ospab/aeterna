@@ -8,11 +8,13 @@ pub mod rtl8139;
 pub mod e1000;
 pub mod rtl8169;
 pub mod ethernet;
+pub mod diag;
 pub mod arp;
 pub mod ipv4;
 pub mod icmp;
 pub mod udp;
 pub mod sntp;
+pub mod resolver;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -90,19 +92,26 @@ pub fn init() -> bool {
     }
     crate::arch::x86_64::serial::write_str("\r\n");
 
-    // Step 2: ARP resolve gateway
+    // Step 2: ARP resolve gateway — send 3 requests over 2 seconds
     crate::arch::x86_64::serial::write_str("[NET] Sending ARP for gateway...\r\n");
     arp::send_request(unsafe { GATEWAY_IP });
 
-    // Wait briefly for ARP reply (poll-based, up to ~0.5 seconds)
-    for _ in 0..50 {
+    // Poll for ARP reply using PIT ticks (200 ticks = 2s at 100Hz)
+    let start = crate::arch::x86_64::idt::timer_ticks();
+    let mut arp_sends = 1u32;
+    loop {
         poll_rx();
         if unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF } {
             break;
         }
-        for _ in 0..100_000u32 {
-            unsafe { core::arch::asm!("pause"); }
+        let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
+        if elapsed >= 200 { break; } // 2 second timeout
+        // Re-send ARP every 0.5s (50 ticks)
+        if elapsed >= arp_sends as u64 * 50 {
+            arp::send_request(unsafe { GATEWAY_IP });
+            arp_sends += 1;
         }
+        unsafe { core::arch::asm!("hlt"); } // sleep until next IRQ (timer or NIC)
     }
 
     let gw_resolved = unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF };
@@ -170,11 +179,17 @@ pub fn handle_net_irq() {
     }
 }
 
-/// Diagnostic registers for the active NIC (ISR, CMD, CBR, CAPR)
-pub fn diag() -> (u16, u8, u16, u16) {
+/// Diagnostic registers for the active NIC
+/// For e1000: (STATUS, ICR, RDH, RDT)
+/// For RTL8139: (ISR as u32, CMD as u32, CBR as u32, CAPR as u32)
+pub fn diag() -> (u32, u32, u32, u32) {
     match unsafe { ACTIVE_NIC } {
-        0 => rtl8139::diag(),
-        _ => (0, 0, 0, 0),  // e1000/rtl8169 don't have these registers
+        0 => {
+            let (isr, cmd, cbr, capr) = rtl8139::diag();
+            (isr as u32, cmd as u32, cbr as u32, capr as u32)
+        }
+        1 => e1000::diag_regs(),
+        _ => (0, 0, 0, 0),
     }
 }
 

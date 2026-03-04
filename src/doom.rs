@@ -753,3 +753,21 @@ pub fn run() {
         serial::write_str("[DOOM] C engine not compiled (no libdoom.a)\r\n");
     }
 }
+
+// ─── HDA audio bridge (exported to DOOM C engine) ────────────────────────────
+
+/// Push raw PCM data into the HDA ring buffer.
+/// Called by the DOOM sound module on every game tick.
+/// `data` must point to interleaved stereo 16-bit LE @ 44100 Hz.
+#[no_mangle]
+pub unsafe extern "C" fn rust_hda_write_pcm(data: *const u8, len: u32) {
+    if data.is_null() || len == 0 { return; }
+    let slice = core::slice::from_raw_parts(data, len as usize);
+    crate::drivers::audio::write_pcm(slice);
+}
+
+/// Returns 1 if the HDA audio driver is initialized and streaming, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn rust_hda_is_ready() -> i32 {
+    if crate::drivers::audio::is_ready() { 1 } else { 0 }
+}

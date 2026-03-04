@@ -145,8 +145,9 @@ fn delay(n: u32) {
 }
 
 fn virt_to_phys(vaddr: usize) -> u64 {
-    // Kernel virtual offset = KERNEL_VIRT - KERNEL_PHYS = 0xffffffff80000000
-    (vaddr as u64).wrapping_sub(0xffff_ffff_8000_0000_u64)
+    // Uses actual kernel load address from Limine (handles KASLR/relocation)
+    let offset = crate::arch::x86_64::boot::kernel_virt_offset();
+    (vaddr as u64).wrapping_sub(offset)
 }
 
 // ─── PCI helpers ──────────────────────────────────────────────────────────

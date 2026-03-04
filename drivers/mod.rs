@@ -16,6 +16,9 @@ pub mod ata;
 pub mod ahci;
 pub mod audio;
 pub mod gpu;
+pub mod nvme;
+pub mod gpt;
+pub mod block;
 
 /// Unified disk info for terminal/installer
 #[derive(Copy, Clone)]
@@ -161,6 +164,19 @@ pub fn write(disk: usize, lba: u64, count: u32, data: &[u8]) -> bool {
             };
             ahci::write_sectors(ahci_idx, lba, count, data)
         }
+    }
+}
+
+/// Get friendly device name for a disk index (sda, sdb, hda...)
+pub fn dev_name_for_index(idx: usize) -> &'static str {
+    if let Some(d) = disk_info(idx) {
+        let before = disk_info_count_before(d.index, d.kind);
+        match d.kind {
+            DiskKind::Ahci => match before { 0 => "sda", 1 => "sdb", 2 => "sdc", _ => "sdX" },
+            DiskKind::Ata  => match before { 0 => "hda", 1 => "hdb", 2 => "hdc", _ => "hdX" },
+        }
+    } else {
+        "unknown"
     }
 }
 

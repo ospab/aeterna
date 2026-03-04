@@ -29,21 +29,21 @@
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│                      Terminal / Shell                  │
+│                      Terminal / Shell                 │
 ├─────────────┬─────────────┬──────────────┬────────────┤
 │    grape    │    tomato   │     plum     │    seed    │
 │  (editor)   │  (pkg mgr)  │   (shell)    │   (init)   │
 ├─────────────┴─────────────┴──────────────┴────────────┤
-│                 VFS + RamFS + Syscall Layer             │
+│                 VFS + RamFS + Syscall Layer           │
 ├──────────────────────┬────────────────────────────────┤
 │     Network Stack    │       Storage Drivers          │
 │  RTL8139 / ARP /     │    ATA PIO  /  AHCI SATA       │
 │  IPv4 / ICMP / SNTP  │                                │
 ├──────────────────────┴────────────────────────────────┤
-│             AETERNA Microkernel (Rust, no_std)         │
+│             AETERNA Microkernel (Rust, no_std)        │
 │    GDT · IDT · PIC · SSE · Heap · VMM · Scheduler     │
 ├───────────────────────────────────────────────────────┤
-│              x86_64 Hardware / QEMU / KVM              │
+│              x86_64 Hardware / QEMU / KVM             │
 └───────────────────────────────────────────────────────┘
 ```
 

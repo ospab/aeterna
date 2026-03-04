@@ -22,9 +22,9 @@ const BUILTINS: &[&str] = &[
     "help", "echo", "clear", "ver", "version", "uname", "ls", "pwd", "cd",
     "cat", "mkdir", "touch", "rm", "save", "write", "whoami", "hostname",
     "date", "about", "meminfo", "free", "uptime", "dmesg", "lsmem",
-    "lspci", "lsblk", "fdisk", "ping", "ifconfig", "ip", "ntpdate", "sync",
+    "lspci", "lsblk", "fdisk", "mkfs", "mount", "ping", "ifconfig", "ip", "ntpdate", "netdiag", "sync",
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
-    "tutor", "grape", "tomato", "seed", "bash", "doom", "export", "alias",
+    "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",
     "ps", "top",
 ];
@@ -39,11 +39,14 @@ static CTRL_C: AtomicBool = AtomicBool::new(false);
 /// Call from any running command to check if the user pressed Ctrl+C.
 /// Returns true and prints "^C" if so.
 fn check_ctrl_c() -> bool {
-    // Also drain keyboard for Ctrl+C that arrives during execution
-    if let Some(ch) = keyboard::poll_key() {
+    // Non-blocking drain: consume only Ctrl+C, push others back
+    while let Some(ch) = keyboard::try_read_key() {
         if ch == '\x03' {
             CTRL_C.store(true, Ordering::Relaxed);
+            break;
         }
+        // Not Ctrl+C — ignore (key is consumed but that's acceptable
+        // in a running command context where input goes to the command)
     }
     CTRL_C.load(Ordering::Relaxed)
 }
@@ -586,10 +589,17 @@ fn execute_command(cmd: &str) {
         "dmesg"   => cmd_dmesg(),
         "lsmem"   => cmd_lsmem(),
         "lspci"   => cmd_lspci(),
-        "lsblk"   => cmd_lsblk(),
-        "fdisk"   => cmd_fdisk(args),
+        "lsblk"   => ospab_os::axon::disk_tools::run_lsblk(args),
+        "fdisk"   => ospab_os::axon::disk_tools::run_fdisk(args),
+        "mkfs"    => ospab_os::axon::disk_tools::run_mkfs(args),
+        "mount"   => ospab_os::axon::disk_tools::run_mount(args),
         "ping"    => cmd_ping(args),
         "ifconfig" | "ip" => cmd_ifconfig(),
+        "netdiag"  => {
+            puts("Running network diagnostics (output to serial COM1)...\n");
+            ospab_os::net::diag::run_full_diagnostic();
+            puts("Done. Check serial output for full report.\n");
+        }
         "ntpdate" => cmd_ntpdate(args),
         "sync"    => cmd_sync(),
         "dump_disk" => cmd_dump_disk(args),
@@ -603,6 +613,7 @@ fn execute_command(cmd: &str) {
         "seed"    => cmd_seed(args),
         "bash"    => cmd_bash(args),
         "doom"    => cmd_doom(args),
+        "aai"     => cmd_aai(args),
         "export"  => { ospab_os::plum::preprocess(&alloc::format!("export {}", args)); }
         "alias"   => { ospab_os::plum::preprocess(&alloc::format!("alias {}", args)); }
         "unalias" => { ospab_os::plum::preprocess(&alloc::format!("unalias {}", args)); }
@@ -714,6 +725,25 @@ fn cmd_help(args: &str) {
                 dim_print("  F1=help, F2=save, F3=load, ESC=quit.\n");
                 return;
             }
+            "aai" => {
+                puts("aai <subcommand> [args]\n");
+                dim_print("  Aeterna AI utility — powered by ANE (Aeterna Neural Engine).\n\n");
+                dim_print("  Subcommands:\n");
+                dim_print("    aai load <path>   Load a .tmt-ai model from the VFS\n");
+                dim_print("    aai info          Show loaded model metadata\n");
+                dim_print("    aai bench         GEMM benchmark (SIMD perf report)\n");
+                dim_print("    aai chat <prompt> Interactive inference with KV cache\n");
+                dim_print("    aai summarize <text> Entropy + stats analysis of text\n\n");
+                dim_print("  .tmt-ai format: TMT\x01 magic + JSON metadata + f32 weights\n");
+                dim_print("  Weights are zero-copy mapped via Huge Pages (Mmap syscall).\n");
+                dim_print("  SIMD auto-dispatched: AVX-512 → AVX2+FMA → scalar.\n\n");
+                dim_print("  Example:\n");
+                dim_print("    aai load /models/tiny.tmt-ai\n");
+                dim_print("    aai info\n");
+                dim_print("    aai chat Hello, world\n");
+                dim_print("  See: tutor ai\n");
+                return;
+            }
             "cat" => {
                 puts("cat <path>\n");
                 dim_print("  Display file contents. Virtual files:\n");
@@ -800,6 +830,14 @@ fn cmd_help(args: &str) {
     lines.push(("cmd", "  seed       Init system / services. seed status"));
     lines.push(("cmd", "  doom       Classic DOOM (shareware v1.9)"));
     lines.push(("cmd", "  plum       Shell info. Also: export, alias, env"));
+    lines.push(("normal", ""));
+    lines.push(("section", "  AI — AETERNA NEURAL ENGINE (ANE)"));
+    lines.push(("cmd", "  aai load <path>   Load .tmt-ai model (zero-copy)"));
+    lines.push(("cmd", "  aai info          Model metadata + param count"));
+    lines.push(("cmd", "  aai bench         SIMD GEMM benchmark"));
+    lines.push(("cmd", "  aai chat <text>   Inference with 100 Hz streaming"));
+    lines.push(("cmd", "  aai summarize <text> Entropy + text stats"));
+    lines.push(("dim", "    Tip: help aai  or  tutor ai  for full details"));
     lines.push(("normal", ""));
     lines.push(("section", "  SHELL BUILTINS (plum)"));
     lines.push(("cmd", "  export     Set environment variable (export VAR=val)"));
@@ -1476,8 +1514,9 @@ fn cmd_ping(args: &str) {
         return;
     }
     if args.is_empty() {
-        err_print("Usage: ping <ip-address> [count]\n");
+        err_print("Usage: ping <ip-address|hostname> [count]\n");
         dim_print("  Example: ping 10.0.2.2\n");
+        dim_print("  Example: ping gateway\n");
         return;
     }
 
@@ -1489,12 +1528,23 @@ fn cmd_ping(args: &str) {
 
     let ip = match parse_ip(ip_str) {
         Some(ip) => ip,
-        None => {
-            err_print("Invalid IP address: ");
-            err_print(ip_str);
-            puts("\n");
-            return;
-        }
+        None => match ospab_os::net::resolver::resolve_host(ip_str) {
+            Ok(ip) => {
+                puts("Resolved ");
+                puts(ip_str);
+                puts(" -> ");
+                print_ip(ip);
+                puts("\n");
+                ip
+            }
+            Err(_) => {
+                err_print("Cannot resolve: ");
+                err_print(ip_str);
+                puts("\n");
+                dim_print("  Not an IP and not found in /etc/hosts\n");
+                return;
+            }
+        },
     };
 
     let count = parse_u32(count_str).unwrap_or(4).min(100);
@@ -1590,40 +1640,59 @@ fn cmd_ntpdate(args: &str) {
         return;
     }
 
-    // Parse server IP or use QEMU gateway
-    let server_ip = if args.is_empty() {
-        unsafe { ospab_os::net::GATEWAY_IP }
+    // Determine which server(s) to try
+    let result = if args.is_empty() {
+        // No argument: try all fallbacks (QEMU gateway first, then real NTP servers)
+        puts("Querying NTP servers...\n");
+        ospab_os::net::sntp::sync_system_time()
     } else {
-        match parse_ip(args) {
+        // Explicit server IP or hostname
+        let server_ip = match parse_ip(args) {
             Some(ip) => ip,
-            None => {
-                err_print("Invalid IP: ");
-                err_print(args);
-                puts("\n");
-                return;
-            }
-        }
+            None => match ospab_os::net::resolver::resolve_host(args) {
+                Ok(ip) => {
+                    puts("Resolved ");
+                    puts(args);
+                    puts(" -> ");
+                    print_ip(ip);
+                    puts("\n");
+                    ip
+                }
+                Err(_) => {
+                    err_print("Cannot resolve: ");
+                    err_print(args);
+                    puts("\n");
+                    return;
+                }
+            },
+        };
+        puts("Querying NTP server ");
+        print_ip(server_ip);
+        puts("...\n");
+        ospab_os::net::sntp::sync_time(server_ip)
     };
 
-    puts("Querying NTP server ");
-    print_ip(server_ip);
-    puts("...\n");
-
-    match ospab_os::net::sntp::sync_time(server_ip) {
-        Some(unix_ts) => {
+    match result {
+        Ok(unix_ts) => {
             framebuffer::draw_string("[  OK  ] ", FG_OK, BG);
             puts("Time synchronized: ");
             let mut buf = [0u8; 32];
-            let len = ospab_os::net::sntp::format_datetime(unix_ts, &mut buf);
+            let len = ospab_os::net::sntp::format_datetime_with_tz(
+                unix_ts,
+                ospab_os::net::sntp::read_timezone_offset(),
+                &mut buf,
+            );
             for i in 0..len {
                 framebuffer::draw_char(buf[i] as char, FG, BG);
             }
             puts("\n");
         }
-        None => {
-            err_print("NTP request timed out. Server may not support NTP.\n");
-            dim_print("Tip: QEMU gateway (10.0.2.2) doesn't always respond to NTP.\n");
-            dim_print("     Try: ntpdate <external-ntp-server-ip>\n");
+        Err(e) => {
+            err_print("NTP sync failed: ");
+            err_print(e.as_str());
+            puts("\n");
+            dim_print("Tip: Make sure QEMU is started with -netdev user,...\n");
+            dim_print("     Try: ntpdate time1.google.com\n");
         }
     }
 }
@@ -1712,7 +1781,12 @@ fn cmd_grape(args: &str) {
 // ══════════════════════════════════════════════════════════════
 
 fn cmd_tomato(args: &str) {
-    ospab_os::tomato::run(args);
+    // `tomato --tmt <subcmd>` routes to the binary package (.tmt) subsystem
+    if let Some(tmt_args) = args.strip_prefix("--tmt") {
+        ospab_os::tomato::tmt_dispatch(tmt_args.trim());
+    } else {
+        ospab_os::tomato::run(args);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1743,6 +1817,14 @@ fn cmd_doom(_args: &str) {
     dim_print("Welcome back to AETERNA.\n");
 }
 
+fn cmd_aai(args: &str) {
+    let mut row = 5usize;
+    let parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
+    let mut dispatch_args: alloc::vec::Vec<&str> = alloc::vec!["aai"];
+    for p in &parts { dispatch_args.push(p); }
+    ospab_os::aai::aai_dispatch(&dispatch_args, &mut row);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Tutor — Interactive system tutorial
 // ══════════════════════════════════════════════════════════════
@@ -1761,6 +1843,7 @@ fn cmd_tutor(args: &str) {
         "persistence" => tutor_persistence(),
         "axon"        => tutor_axon(),
         "shell"       => tutor_shell(),
+        "ai" | "ane" | "aai" => tutor_ai(),
         "topics" | "help" | "?" => tutor_topics(),
         _ => {
             puts("Unknown topic: ");
@@ -1786,7 +1869,7 @@ fn tutor_intro() {
     puts("  deterministic, high-performance computing.\n\n");
 
     framebuffer::draw_string("  What you can do right now:\n\n", FG_WARN, BG);
-    puts("  1. Explore the virtual filesystem      ");
+    puts("  1. Welcome & system overview         ");
     dim_print("(ls, cd, cat)\n");
     puts("  2. Check hardware and memory            ");
     dim_print("(lspci, free, lsmem)\n");
@@ -1797,12 +1880,14 @@ fn tutor_intro() {
     puts("  5. Sync time from the internet          ");
     dim_print("(ntpdate)\n");
     puts("  6. Install the OS to virtual disk       ");
-    dim_print("(install)\n\n");
+    dim_print("(install)\n");
+    puts("  7. Run neural inference on bare metal   ");
+    dim_print("(aai chat ...)\n\n");
 
     framebuffer::draw_string("  Quick start:\n", FG_WARN, BG);
     puts("  Type 'help' for all commands\n");
     puts("  Type 'tutor <topic>' to learn more ");
-    dim_print("(fs, net, mem, kernel)\n");
+    dim_print("(fs, net, mem, kernel, ai)\n");
     puts("  Use Up/Down arrows to browse command history\n");
     puts("  Press Ctrl+L to clear the screen\n\n");
 }
@@ -1962,11 +2047,75 @@ fn tutor_commands() {
     dim_print("  install           Launch OS installer TUI\n");
     dim_print("  reboot            Reboot the machine\n");
     dim_print("  shutdown          Power off the system\n\n");
+
+    framebuffer::draw_string("  Userland & AI:\n", FG_WARN, BG);
+    dim_print("  doom              Classic DOOM (shareware v1.9)\n");
+    dim_print("  aai load <path>   Load .tmt-ai model file\n");
+    dim_print("  aai info          Show loaded model metadata\n");
+    dim_print("  aai bench         SIMD GEMM performance benchmark\n");
+    dim_print("  aai chat <text>   Run inference + stream tokens\n");
+    dim_print("  aai summarize <text> Entropy + stats (chars/words/uniq-bytes/H)\n");
+    dim_print("  See 'tutor ai' for ANE deep dive\n\n");
 }
 
 // ══════════════════════════════════════════════════════════════
 // Output helpers
 // ══════════════════════════════════════════════════════════════
+
+fn tutor_ai() {
+    puts("\n");
+    framebuffer::draw_string("  ANE — Aeterna Neural Engine\n", FG_OK, BG);
+    puts("  ════════════════════════════\n\n");
+
+    puts("  ANE is a no_std, bare-metal neural inference library\n");
+    puts("  built into the AETERNA kernel. No Python, no framework —\n");
+    puts("  tensors and GEMM kernels running directly on the CPU.\n\n");
+
+    framebuffer::draw_string("  Architecture:\n", FG_WARN, BG);
+    puts("  lib/ane/tensor.rs    — N-D Tensor, GEMM, ReLU, Softmax\n");
+    puts("  lib/ane/layers.rs    — Linear, LayerNorm, MHA, Embedding\n");
+    puts("  lib/ane/optimizers.rs— AdamW + SGD with SIMD kernels\n");
+    puts("  lib/ane/compiler.rs  — Op-fusion graph compiler\n\n");
+
+    framebuffer::draw_string("  SIMD Dispatch (auto-detected at runtime):\n", FG_WARN, BG);
+    dim_print("  AVX-512   — 16-wide f32 FMADD (best performance)\n");
+    dim_print("  AVX2+FMA  — 8-wide f32 FMADD   (standard modern CPU)\n");
+    dim_print("  Scalar    — 16×16 tiled GEMM    (always available)\n\n");
+
+    framebuffer::draw_string("  aai — command-line frontend:\n", FG_WARN, BG);
+    dim_print("  aai load /models/tiny.tmt-ai   Load model file\n");
+    dim_print("  aai info                       Show metadata\n");
+    dim_print("  aai bench                      GEMM perf report\n");
+    dim_print("  aai chat Hello, AETERNA!       Inference + streaming\n");
+    dim_print("  aai summarize <text>           Entropy + text statistics\n\n");
+
+    framebuffer::draw_string("  .tmt-ai model format:\n", FG_WARN, BG);
+    puts("  Offset 0:    Magic  b\"TMT\\x01\"\n");
+    puts("  Offset 4:    Version u32 LE\n");
+    puts("  Offset 8:    Meta-len u32 LE\n");
+    puts("  Offset 12:   UTF-8 JSON {name, arch, d_model, n_layers,\n");
+    puts("                           n_heads, vocab_size, ctx_len}\n");
+    puts("  Offset ~64:  Raw f32 weights (64-byte aligned)\n\n");
+
+    framebuffer::draw_string("  KV-Cache (Phase 3):\n", FG_WARN, BG);
+    puts("  Ring-buffer holding key/value pairs per layer.\n");
+    puts("  Allocated once at model load (no GC pressure).\n");
+    puts("  Token streaming at 100 Hz via PIT IRQ 0.\n\n");
+
+    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
+    puts("  1. Create a model:   ");
+    dim_print("(place .tmt-ai in /models/)\n");
+    puts("  2. Load it:          ");
+    dim_print("aai load /models/tiny.tmt-ai\n");
+    puts("  3. Inspect:          ");
+    dim_print("aai info\n");
+    puts("  4. Benchmark SIMD:   ");
+    dim_print("aai bench\n");
+    puts("  5. Chat:             ");
+    dim_print("aai chat Tell me about AETERNA\n");
+    puts("  6. Analyse text:     ");
+    dim_print("aai summarize Hello, AETERNA!\n\n");
+}
 
 fn tutor_topics() {
     puts("\n");
@@ -1982,11 +2131,13 @@ fn tutor_topics() {
     dim_print("  net         — Networking (IP, ICMP, UDP)\n");
     dim_print("  mem         — Physical + heap memory\n");
     dim_print("  kernel      — AETERNA architecture\n");
+    dim_print("  ai          — ANE neural engine + aai commands\n");
     dim_print("  axon        — AXON userland coreutils\n");
     dim_print("  shell       — Shell features (plum)\n");
     dim_print("  commands    — Full command reference\n\n");
     framebuffer::draw_string("  Quick examples:\n", FG_WARN, BG);
     dim_print("  tutor fs          — filesystem walkthrough\n");
+    dim_print("  tutor ai          — neural engine & aai tool\n");
     dim_print("  tutor persistence — see how sync/recovery works\n");
     dim_print("  tutor axon        — learn new coreutils commands\n\n");
 }

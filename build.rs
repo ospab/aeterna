@@ -30,4 +30,11 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=target/doom/libdoom.a");
+
+    // Pass linker script with absolute path so rust-lld can find it regardless
+    // of what directory cargo invokes the linker from.
+    let linker_script = Path::new(&manifest).join("linker.ld");
+    if linker_script.exists() {
+        println!("cargo:rustc-link-arg=-T{}", linker_script.display());
+    }
 }

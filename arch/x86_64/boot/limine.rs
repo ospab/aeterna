@@ -522,3 +522,68 @@ pub fn module_count() -> usize {
         resp.module_count as usize
     }
 }
+
+// ─── Executable Address (kernel physical/virtual base) ──────────────────────
+
+#[repr(C)]
+pub struct ExecutableAddressResponse {
+    pub revision: u64,
+    pub physical_base: u64,
+    pub virtual_base: u64,
+}
+
+#[repr(C)]
+pub struct ExecutableAddressRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut ExecutableAddressResponse,
+}
+
+unsafe impl Sync for ExecutableAddressRequest {}
+
+#[used]
+#[link_section = ".limine_requests"]
+static mut EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest {
+    id: [
+        LIMINE_COMMON_MAGIC[0],
+        LIMINE_COMMON_MAGIC[1],
+        0x71ba76863cc55f63,
+        0xb2644a48c516a487,
+    ],
+    revision: 0,
+    response: ptr::null_mut(),
+};
+
+/// Get the physical base address where the kernel was actually loaded.
+/// This may differ from the linker script's KERNEL_PHYS if Limine slides
+/// the kernel (KASLR or relocation).
+pub fn kernel_phys_base() -> u64 {
+    unsafe {
+        if EXECUTABLE_ADDRESS_REQUEST.response.is_null() {
+            0x200000 // fallback to linker script default
+        } else {
+            (*EXECUTABLE_ADDRESS_REQUEST.response).physical_base
+        }
+    }
+}
+
+/// Get the virtual base address of the kernel (should match linker script).
+pub fn kernel_virt_base() -> u64 {
+    unsafe {
+        if EXECUTABLE_ADDRESS_REQUEST.response.is_null() {
+            0xFFFF_FFFF_8020_0000 // fallback to linker script default
+        } else {
+            (*EXECUTABLE_ADDRESS_REQUEST.response).virtual_base
+        }
+    }
+}
+
+/// Compute the offset to subtract from a kernel virtual address to get physical.
+/// `phys = virt - kernel_virt_offset()`
+///
+/// Previously hardcoded as `0xFFFF_FFFF_8000_0000` which assumed KERNEL_PHYS=0x200000.
+/// Now dynamically computed from Limine's actual load address.
+#[inline]
+pub fn kernel_virt_offset() -> u64 {
+    kernel_virt_base() - kernel_phys_base()
+}

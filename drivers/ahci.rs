@@ -213,8 +213,9 @@ fn port_write(port: u32, reg: u32, val: u32) {
 
 // ─── Utility ──────────────────────────────────────────────────────────────
 fn virt_to_phys(vaddr: usize) -> u64 {
-    // Kernel virtual offset = KERNEL_VIRT - KERNEL_PHYS = 0xffffffff80000000
-    (vaddr as u64).wrapping_sub(0xffff_ffff_8000_0000_u64)
+    // Uses actual kernel load address from Limine (handles KASLR/relocation)
+    let offset = crate::arch::x86_64::boot::kernel_virt_offset();
+    (vaddr as u64).wrapping_sub(offset)
 }
 fn phys_to_virt(phys: u64) -> usize {
     let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);

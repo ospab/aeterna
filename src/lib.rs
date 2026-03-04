@@ -64,6 +64,18 @@ pub mod seed;
 // DOOM engine (bare-metal port)
 pub mod doom;
 
+// AETERNA AI Model (AAM) - minimal transformer + tokenizer
+#[path = "../aam/mod.rs"]
+pub mod aam;
+
+// ─── ANE — Aeterna Neural Engine (no_std PyTorch replacement) ───────────────
+#[path = "../lib/ane/mod.rs"]
+pub mod ane;
+
+// aai — Aeterna AI utility (model loader + chat + bench)
+#[path = "../userland/aai/src/lib.rs"]
+pub mod aai;
+
 // ─── Tiny formatting helpers (no_std, no alloc) ─────────────────────────────
 
 /// Format a u64 as decimal ASCII into `buf` (must be ≥ 8 bytes).

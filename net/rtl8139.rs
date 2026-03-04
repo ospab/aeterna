@@ -114,10 +114,10 @@ fn inl(port: u16) -> u32 {
 }
 
 /// Convert a kernel static virtual address to physical.
-/// Kernel is linked at KERNEL_VIRT=0xffffffff80200000, physical base KERNEL_PHYS=0x200000.
-/// Kernel virtual offset = KERNEL_VIRT - KERNEL_PHYS = 0xffffffff80000000.
+/// Uses the actual kernel load address from Limine (handles KASLR/relocation).
 fn virt_to_phys(vaddr: usize) -> u32 {
-    (vaddr as u64).wrapping_sub(0xffff_ffff_8000_0000_u64) as u32
+    let offset = crate::arch::x86_64::boot::kernel_virt_offset();
+    (vaddr as u64).wrapping_sub(offset) as u32
 }
 
 /// Probe PCI bus for RTL8139 and initialize it
@@ -194,6 +194,13 @@ fn init_device(bus: u8, dev: u8, func: u8) -> bool {
         // 5. Configure interrupts: ROK (bit 0) + TOK (bit 2) + RxOverflow (bit4) + RxFIFO (bit5) + LinkChg (bit5)
         outw(io + REG_IMR, 0x003F);
 
+        // 5b. Set multicast registers to accept all (MAR0-MAR7 at offset 0x08)
+        outl(io + 0x08, 0xFFFFFFFF);
+        outl(io + 0x0C, 0xFFFFFFFF);
+
+        // 5c. Explicitly initialise CAPR to 0xFFF0 (required by some RTL8139 variants)
+        outw(io + REG_CAPR, 0xFFF0);
+
         // 6. RX config: accept all packets, proper DMA burst, 8K+16 buffer
         //    Bits 0-3: AAP|APM|AM|AB = accept all
         //    Bit 7: WRAP = 1 (ring buffer wraps)
@@ -242,6 +249,11 @@ pub fn mac_address() -> [u8; 6] {
 
 pub fn is_initialized() -> bool {
     unsafe { INITIALIZED }
+}
+
+/// Expose I/O base for diagnostics
+pub fn io_base() -> u16 {
+    unsafe { IO_BASE }
 }
 
 /// Send a packet (copies into TX descriptor buffer)
@@ -388,6 +400,49 @@ pub fn diag() -> (u16, u8, u16, u16) {
         let capr = inw(IO_BASE + REG_CAPR);
         (isr, cmd, cbr, capr)
     }
+}
+
+/// Dump first N bytes of RX buffer (for DMA debugging)
+pub fn rx_buffer_dump(n: usize) {
+    let s = crate::arch::x86_64::serial::write_str;
+    unsafe {
+        if !INITIALIZED { return; }
+        s("[RTL8139] RX buf dump (");
+        serial_dec(n as u64);
+        s(" bytes):");
+        let lim = n.min(RX_BUF_SIZE);
+        let mut any_nonzero = false;
+        for i in 0..lim {
+            if i % 16 == 0 { s("\r\n  "); }
+            serial_hex_byte(RX_BUFFER.0[i]);
+            s(" ");
+            if RX_BUFFER.0[i] != 0 { any_nonzero = true; }
+        }
+        s("\r\n");
+        if !any_nonzero {
+            s("[RTL8139] RX buffer is ALL ZEROS — DMA never wrote here\r\n");
+        }
+        // Also dump current register state
+        let rbstart = inl(IO_BASE + REG_RBSTART);
+        let rcr = inl(IO_BASE + REG_RCR);
+        let cmd_val = inb(IO_BASE + REG_CMD);
+        let imr = inw(IO_BASE + REG_IMR);
+        let cbr = inw(IO_BASE + REG_CBR);
+        let capr = inw(IO_BASE + REG_CAPR);
+        s("[RTL8139] RBSTART=0x"); serial_hex32(rbstart);
+        s(" RCR=0x"); serial_hex32(rcr);
+        s(" CMD=0x"); serial_hex_byte(cmd_val);
+        s(" IMR=0x"); serial_hex16(imr);
+        s(" CBR="); serial_dec(cbr as u64);
+        s(" CAPR="); serial_dec(capr as u64);
+        s("\r\n");
+    }
+}
+
+fn serial_hex_byte(v: u8) {
+    let hex = b"0123456789ABCDEF";
+    crate::arch::x86_64::serial::write_byte(hex[(v >> 4) as usize]);
+    crate::arch::x86_64::serial::write_byte(hex[(v & 0xF) as usize]);
 }
 
 fn serial_hex16(v: u16) {

@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod ramfs;
 pub mod disk_sync;
+pub mod aeternafs;
 
 // Re-export RamNode for disk_sync serialization
 pub use ramfs::RamNode;

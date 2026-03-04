@@ -27,3 +27,8 @@ Cargo.lock
 isos/*.iso
 doom1.wad
 *.wad
+ospab.os.md
+review.md
+*.log
+tech-manifest-new.md
+ai-rules.md
