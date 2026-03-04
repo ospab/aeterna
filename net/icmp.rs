@@ -9,11 +9,13 @@ const ICMP_ECHO_REPLY: u8   = 0;
 const ICMP_ECHO_REQUEST: u8 = 8;
 
 // Ping state: shared between sender and receiver
-static PING_WAITING: AtomicBool = AtomicBool::new(false);
+static PING_WAITING:  AtomicBool = AtomicBool::new(false);
 static PING_RECEIVED: AtomicBool = AtomicBool::new(false);
-static PING_SEQ: AtomicU64 = AtomicU64::new(0);
-static PING_RTT_TICKS: AtomicU64 = AtomicU64::new(0);
-static mut PING_SEND_TICK: u64 = 0;
+static PING_SEQ:      AtomicU64  = AtomicU64::new(0);
+// TSC stamp (µs absolute) captured when the echo-request was sent.
+static PING_SEND_US:  AtomicU64  = AtomicU64::new(0);
+// RTT result in *microseconds*.
+static PING_RTT_US:   AtomicU64  = AtomicU64::new(0);
 #[allow(dead_code)]
 static mut PING_TTL: u8 = 0;
 
@@ -27,14 +29,15 @@ pub fn handle_icmp(data: &[u8], src_ip: [u8; 4]) {
     match icmp_type {
         ICMP_ECHO_REPLY => {
             crate::arch::x86_64::serial::write_str("[ICMP] Echo Reply received\r\n");
-            if PING_WAITING.load(Ordering::Relaxed) {
+            if PING_WAITING.load(Ordering::Acquire) {
                 let seq = u16::from_be_bytes([data[6], data[7]]);
-                let now = crate::arch::x86_64::idt::timer_ticks();
-                let sent = unsafe { PING_SEND_TICK };
-                let rtt = now.saturating_sub(sent);
-                PING_RTT_TICKS.store(rtt, Ordering::Relaxed);
+                // TSC-based RTT: now_us - send_us  (sub-millisecond precision)
+                let now_us  = crate::arch::x86_64::tsc::tsc_stamp_us();
+                let sent_us = PING_SEND_US.load(Ordering::Relaxed);
+                let rtt_us  = now_us.saturating_sub(sent_us);
+                PING_RTT_US.store(rtt_us, Ordering::Relaxed);
                 PING_SEQ.store(seq as u64, Ordering::Relaxed);
-                PING_RECEIVED.store(true, Ordering::Relaxed);
+                PING_RECEIVED.store(true, Ordering::Release);
                 PING_WAITING.store(false, Ordering::Relaxed);
             }
         }
@@ -75,25 +78,23 @@ pub fn send_ping(dst_ip: [u8; 4], seq: u16) {
     pkt[2] = (cksum >> 8) as u8;
     pkt[3] = (cksum & 0xFF) as u8;
 
-    // Mark waiting
+    // Mark waiting — use TSC µs timestamp for sub-millisecond RTT measurement
     PING_RECEIVED.store(false, Ordering::Relaxed);
-    PING_WAITING.store(true, Ordering::Relaxed);
-    unsafe { PING_SEND_TICK = crate::arch::x86_64::idt::timer_ticks(); }
+    PING_WAITING.store(true, Ordering::Release);
+    PING_SEND_US.store(crate::arch::x86_64::tsc::tsc_stamp_us(), Ordering::Relaxed);
 
     // Send via IPv4
     super::ipv4::send_ipv4(1, dst_ip, &pkt[..64]);
 }
 
-/// Non-blocking check for ping reply. Call from a loop together with keyboard polling.
-/// Returns Some((seq, rtt_ms)) if a reply arrived, None if not yet.
+/// Non-blocking check for ping reply. Polls NIC and returns immediately.
+/// Returns `Some((seq, rtt_us))` where rtt_us is RTT in **microseconds**.
 pub fn poll_reply() -> Option<(u16, u64)> {
     super::poll_rx();
-    if PING_RECEIVED.load(Ordering::Relaxed) {
-        let seq = PING_SEQ.load(Ordering::Relaxed) as u16;
-        let rtt_ticks = PING_RTT_TICKS.load(Ordering::Relaxed);
-        // 100 ticks/sec → 1 tick ≈ 10 ms
-        let rtt_ms = rtt_ticks * 10;
-        return Some((seq, rtt_ms));
+    if PING_RECEIVED.load(Ordering::Acquire) {
+        let seq    = PING_SEQ.load(Ordering::Relaxed) as u16;
+        let rtt_us = PING_RTT_US.load(Ordering::Relaxed);
+        return Some((seq, rtt_us));
     }
     None
 }
@@ -104,20 +105,27 @@ pub fn cancel_wait() {
     PING_RECEIVED.store(false, Ordering::Relaxed);
 }
 
-/// Wait for ping reply. Returns Some((seq, rtt_ms)) or None on timeout/cancel.
+/// Wait for ping reply. Returns `Some((seq, rtt_us))` or `None` on timeout/cancel.
+/// The wait loop wakes on *any* interrupt (NIC IRQ, APIC timer, PIT tick) via `hlt`,
+/// then immediately calls `poll_reply()` — so latency is bounded by NIC IRQ latency,
+/// not by the 10 ms PIT period.
 pub fn wait_reply(timeout_ticks: u64) -> Option<(u16, u64)> {
-    let start = crate::arch::x86_64::idt::timer_ticks();
+    // Convert timeout from legacy 100 Hz ticks to microseconds.
+    let timeout_us  = timeout_ticks.saturating_mul(10_000);
+    let start_us    = crate::arch::x86_64::tsc::tsc_stamp_us();
     loop {
         // poll_reply() calls poll_rx() internally
         if let Some(r) = poll_reply() { return Some(r); }
 
-        let now = crate::arch::x86_64::idt::timer_ticks();
-        if now.saturating_sub(start) >= timeout_ticks {
+        let elapsed_us = crate::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(start_us);
+        if elapsed_us >= timeout_us {
             PING_WAITING.store(false, Ordering::Relaxed);
             return None;
         }
 
-        // Yield: sleep until next interrupt (timer/NIC) so terminal stays responsive
+        // Sleep until next interrupt.  The NIC IRQ (or APIC 1 ms timer) will
+        // wake us; we immediately re-check instead of waiting for the next
+        // 10 ms PIT tick.  This brings localhost RTT from ~10 ms to <1 ms.
         crate::core::scheduler::sys_yield();
     }
 }

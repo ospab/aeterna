@@ -1251,22 +1251,26 @@ fn cmd_axon_ping(args: &str) {
     for seq in 1..=count {
         crate::net::icmp::send_ping(ip, seq as u16);
 
-        // Poll for reply with ~3s timeout (100 Hz → 300 ticks)
+        // Poll for reply with 3s timeout (TSC µs)
         let mut reply: Option<(u16, u64)> = None;
-        let deadline = crate::arch::x86_64::idt::timer_ticks() + 300;
-        while crate::arch::x86_64::idt::timer_ticks() < deadline {
+        let t0 = crate::arch::x86_64::tsc::tsc_stamp_us();
+        while crate::arch::x86_64::tsc::tsc_stamp_us().wrapping_sub(t0) < 3_000_000 {
             reply = crate::net::icmp::poll_reply();
             if reply.is_some() { break; }
             unsafe { core::arch::asm!("hlt"); }
         }
 
         match reply {
-            Some((_s, ms)) => {
+            Some((_s, rtt_us)) => {
                 received += 1;
-                // Clamp readout: 1 tick = ~10ms, sub-tick shows as <10ms
-                let display_ms = if ms == 0 { 1 } else { ms };
                 ok("64 bytes from "); puts(target);
-                puts(&format!(": icmp_seq={} ttl=64 time={}ms\n", seq, display_ms));
+                if rtt_us < 1000 {
+                    puts(&format!(": icmp_seq={} ttl=64 time={} µs\n", seq, rtt_us));
+                } else {
+                    let ms = rtt_us / 1000;
+                    let frac = (rtt_us % 1000) / 10;
+                    puts(&format!(": icmp_seq={} ttl=64 time={}.{:02} ms\n", seq, ms, frac));
+                }
             }
             None => {
                 err("Request timeout for icmp_seq=");

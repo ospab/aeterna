@@ -15,5 +15,7 @@ pub mod font;
 pub mod fbconsole;
 pub mod keyboard;
 pub mod mem;
+pub mod tsc;
+pub mod apic;
 pub use boot::*;
 pub use init::init;

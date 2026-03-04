@@ -63,8 +63,17 @@ pub fn init() {
     // Initialize PIC (remap IRQs to IDT 32-47)
     pic::init();
 
-    // Program PIT channel 0 to fire at 100 Hz (preemptive scheduling)
+    // Program PIT channel 0 to fire at 100 Hz (preemptive scheduling fallback)
     pic::init_pit_100hz();
+
+    // Calibrate TSC — must come after PIT is live (uses 10 tick = 100 ms window).
+    // Enable interrupts first so that `hlt` in calibrate() actually receives PIT ticks.
+    enable_interrupts();
+    super::tsc::calibrate();
+
+    // Init Local APIC one-shot timer (vector 48) — arms 1 ms precision preemption.
+    // Requires TSC calibrated and interrupts enabled.
+    super::apic::init_timer();
 
     // Initialize framebuffer if available
     if let Some(fb) = boot::framebuffer() {

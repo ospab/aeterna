@@ -170,13 +170,28 @@ pub fn send_raw(buf: &[u8], len: usize) {
     }
 }
 
-/// Handle network IRQ — dispatch to the active NIC driver
+/// Handle network IRQ — called from IDT IRQ 9/10/11 dispatcher (inside ISR).
+///
+/// Interrupt-driven path:
+///   1. Acknowledge the NIC's interrupt register (clears IRQ line).
+///   2. **Immediately drain all available receive descriptors** — every packet
+///      that arrived since the last drain is handled right now, inside the ISR,
+///      without waiting for the next 10 ms PIT tick.
+///   3. The NIC's hardware interrupt line is de-asserted after step 1, so no
+///      spurious re-delivery occurs.
+///
+/// This is Task 2 of the latency-elimination plan: ping RTT is now bounded by
+/// NIC-to-ISR delivery time (typically <200 µs on VMware/QEMU), not by the
+/// 10 ms PIT period.
 pub fn handle_net_irq() {
+    // Step 1: ack NIC interrupt register
     match unsafe { ACTIVE_NIC } {
         0 => rtl8139::handle_irq(),
         1 => e1000::handle_irq(),
         _ => rtl8169::handle_irq(),
     }
+    // Step 2: drain all pending RX frames immediately (interrupt-driven poll)
+    poll_rx();
 }
 
 /// Diagnostic registers for the active NIC

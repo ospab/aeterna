@@ -323,6 +323,64 @@ exception_with_error!(exc_security, 30u64);
 irq_handler!(irq_timer, 0u64);
 irq_handler!(irq_keyboard, 1u64);
 irq_handler!(irq_cascade, 2u64);
+
+// ── APIC one-shot timer: vector 48, NOT routed through PIC ──────────────────
+/// Raw APIC timer ISR stub — saves GPRs, calls apic_timer_dispatch, ACKs APIC, restores, iretq.
+#[unsafe(naked)]
+pub extern "C" fn apic_timer_isr() {
+    naked_asm!(
+        "push 0",
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "add rsp, 8",
+        "iretq",
+        sym apic_timer_dispatch,
+    );
+}
+
+/// Dispatcher called from `apic_timer_isr`.
+/// Re-arms a 1 ms one-shot, drives scheduler preemption, ACKs APIC.
+extern "C" fn apic_timer_dispatch(saved_state: *mut u8) {
+    // ACK the APIC *first* so the CPU can take the next interrupt.
+    crate::arch::x86_64::apic::send_eoi();
+
+    // Re-arm: fire again in 1 ms (gives 1 kHz preemption rate when idle,
+    // but NIC IRQs will still land on separate PIC-routed vectors).
+    crate::arch::x86_64::apic::one_shot_us(1_000);
+
+    // Drive scheduler context switch — same interface as PIT handler.
+    crate::core::scheduler::on_timer_irq(saved_state as *mut u8);
+}
 irq_handler!(irq_com2, 3u64);
 irq_handler!(irq_com1, 4u64);
 irq_handler!(irq_lpt2, 5u64);
@@ -518,7 +576,8 @@ pub fn timer_ticks() -> u64 {
 
 static mut NET_IRQ_PENDING: bool = false;
 
-/// Check and clear network IRQ pending flag
+/// Check and clear network IRQ pending flag.
+/// Returns `true` if at least one NIC IRQ arrived since the last call.
 pub fn net_irq_pending() -> bool {
     unsafe {
         let p = NET_IRQ_PENDING;
@@ -526,6 +585,10 @@ pub fn net_irq_pending() -> bool {
         p
     }
 }
+
+/// Alias consumed by the network wait loops — see `net::icmp::wait_reply()`.
+#[inline(always)]
+pub fn take_net_irq() -> bool { net_irq_pending() }
 
 // ============================================================================
 // Keyboard IRQ buffer
@@ -666,7 +729,10 @@ pub fn init() {
         idt.set_handler(45, irq_fpu as *const () as u64, 0x08, &flags);
         idt.set_handler(46, irq_primary_ata as *const () as u64, 0x08, &flags);
         idt.set_handler(47, irq_secondary_ata as *const () as u64, 0x08, &flags);
-        
+
+        // APIC one-shot timer (vector 48) — set here; only fires after apic::init_timer()
+        idt.set_handler(48, apic_timer_isr as *const () as u64, 0x08, &flags);
+
         // Load IDT
         idt.load();
     }

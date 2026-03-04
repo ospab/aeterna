@@ -84,13 +84,16 @@ pub fn run(args: &str) {
     for seq in 1..=count {
         crate::net::icmp::send_ping(ip, seq as u16);
 
-        // Wait up to 3 s for reply (300 ticks @ 100 Hz)
-        let deadline = crate::arch::x86_64::idt::timer_ticks() + 300;
+        // Wait up to 3 s for reply — TSC-based timeout (not PIT-dependent)
+        let send_us = crate::arch::x86_64::tsc::tsc_stamp_us();
+        let timeout_us: u64 = 3_000_000; // 3 seconds in µs
         let mut reply: Option<(u16, u64)> = None;
-        while crate::arch::x86_64::idt::timer_ticks() < deadline {
+        loop {
             crate::net::poll_rx();
             reply = crate::net::icmp::poll_reply();
             if reply.is_some() { break; }
+            let elapsed = crate::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(send_us);
+            if elapsed >= timeout_us { break; }
             crate::core::scheduler::sys_yield();
         }
         if reply.is_none() {
@@ -98,22 +101,28 @@ pub fn run(args: &str) {
         }
 
         match reply {
-            Some((_s, ms)) => {
+            Some((_s, rtt_us)) => {
                 received += 1;
-                let display_ms = if ms == 0 { 1 } else { ms };
+                // Format RTT: show µs if < 1000, else ms with decimals
                 ok("64 bytes from ");
                 puts(target);
-                puts(&format!(": icmp_seq={} ttl=64 time={}ms\n", seq, display_ms));
+                if rtt_us < 1_000 {
+                    puts(&format!(": icmp_seq={} ttl=64 time={} µs\n", seq, rtt_us));
+                } else {
+                    let ms  = rtt_us / 1_000;
+                    let frac = (rtt_us % 1_000) / 10; // two decimal places
+                    puts(&format!(": icmp_seq={} ttl=64 time={}.{:02} ms\n", seq, ms, frac));
+                }
             }
             None => {
                 err(&format!("Request timeout for icmp_seq={}\n", seq));
             }
         }
 
-        // Inter-ping delay: 1 s (100 ticks @ 100 Hz)
+        // Inter-ping delay: ~1 second using TSC (no PIT dependency)
         if seq < count {
-            let next_send = crate::arch::x86_64::idt::timer_ticks() + 100;
-            while crate::arch::x86_64::idt::timer_ticks() < next_send {
+            let delay_start = crate::arch::x86_64::tsc::tsc_stamp_us();
+            while crate::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(delay_start) < 1_000_000 {
                 crate::net::poll_rx();
                 crate::core::scheduler::sys_yield();
             }
