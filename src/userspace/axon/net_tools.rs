@@ -129,39 +129,59 @@ pub fn cmd_ping(args: &str) {
     let args = args.trim();
     if args.is_empty() {
         err("ping: missing host\n");
-        dim("Usage: ping [-c N] <ip>\n");
+        dim("Usage: ping [-c N] [-i secs] <host|ip>\n");
         dim("  Example: ping 10.0.2.2\n");
+        dim("  Example: ping -c 3 localhost\n");
         return;
     }
 
-    // Parse optional -c N
-    let (target, count) = {
-        let mut words = args.splitn(3, ' ');
-        let first = words.next().unwrap_or("");
-        if first == "-c" {
-            let n = words.next().unwrap_or("4").parse::<usize>().unwrap_or(4);
-            let host = words.next().unwrap_or("10.0.2.2").trim();
-            (host, n)
-        } else if first.is_empty() {
-            ("10.0.2.2", 4usize)
-        } else {
-            (first, args[first.len()..].trim().parse::<usize>().unwrap_or(4))
+    // Parse args: [-c N] [-i secs] <host|ip>
+    let mut count      = 4usize;
+    let mut target     = "";
+    let mut iticks     = 100u64; // 1 s at 100 Hz
+    let mut words_iter = args.split_whitespace().peekable();
+    while let Some(w) = words_iter.next() {
+        match w {
+            "-c" => {
+                if let Some(v) = words_iter.next() {
+                    count = v.parse::<usize>().unwrap_or(4).max(1);
+                }
+            }
+            "-i" => {
+                if let Some(v) = words_iter.next() {
+                    if let Ok(f) = v.parse::<f32>() {
+                        iticks = (f * 100.0) as u64;
+                    }
+                }
+            }
+            _ if w.starts_with('-') => {
+                err("ping: unknown option: "); err(w); err("\n");
+                return;
+            }
+            _ => { target = w; }
         }
+    }
+    if target.is_empty() {
+        err("ping: missing destination\n");
+        return;
+    }
+
+    // Resolve: IPv4 literal first, then /etc/hosts
+    let ip = match crate::net::resolver::parse_ipv4(target) {
+        Some(ip) => ip,
+        None => match crate::net::resolver::resolve_host(target) {
+            Ok(ip) => {
+                ok("Resolved "); puts(target); ok(" -> ");
+                puts(&alloc::format!("{}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
+                ip
+            }
+            Err(e) => {
+                err("ping: cannot resolve "); err(target);
+                err(": "); err(e.as_str()); err("\n");
+                return;
+            }
+        },
     };
-
-    // Parse dotted-decimal IP
-    let parts: alloc::vec::Vec<&str> = target.split('.').collect();
-    if parts.len() != 4 {
-        err("ping: invalid IP format (use dotted-decimal)\n");
-        return;
-    }
-    let mut ip = [0u8; 4];
-    for (i, p) in parts.iter().enumerate() {
-        match p.trim().parse::<u8>() {
-            Ok(b) => ip[i] = b,
-            Err(_) => { err("ping: bad IP octet\n"); return; }
-        }
-    }
 
     if !crate::net::is_up() {
         err("ping: network is down\n");
@@ -209,9 +229,9 @@ pub fn cmd_ping(args: &str) {
             }
         }
 
-        // 1-second inter-ping delay (100 ticks @ 100 Hz)
+        // inter-ping delay (default 1 s = 100 ticks @ 100 Hz; overridden by -i)
         if seq < count {
-            let wait = crate::arch::x86_64::idt::timer_ticks() + 100;
+            let wait = crate::arch::x86_64::idt::timer_ticks() + iticks;
             while crate::arch::x86_64::idt::timer_ticks() < wait {
                 crate::net::poll_rx();
                 unsafe { core::arch::asm!("hlt"); }

@@ -588,6 +588,48 @@ pub fn write_sectors(drive_idx: usize, lba: u64, count: u32, data: &[u8]) -> boo
     run_pio_command(port, ai, ATA_CMD_WRITE_DMA_EX, lba, count, count, false)
 }
 
+/// Send ATA FLUSH CACHE EXT (0xEA) to the specified drive to drain its
+/// volatile write-back cache.  This is a non-data command: no PRD is set up.
+/// The installer calls this after writing the partition table so that UEFI
+/// firmware sees consistent sector data on the next boot.
+pub fn flush_cache(drive_idx: usize) -> bool {
+    let d = match drive_info(drive_idx) { Some(d) => *d, None => return true };
+    let port = d.port_idx as u32;
+    let ai   = d.alloc_idx as usize;
+
+    unsafe {
+        let ct = &mut CMD_TABLES[ai];
+        for b in ct.cfis.iter_mut() { *b = 0; }
+
+        // H2D Register FIS for FLUSH CACHE EXT
+        ct.cfis[0] = FIS_TYPE_REG_H2D;
+        ct.cfis[1] = 1 << 7;  // C bit = command, not control
+        ct.cfis[2] = 0xEA;    // ATA_CMD_FLUSH_CACHE_EXT
+        ct.cfis[7] = 0x40;    // LBA mode bit
+
+        // No data transfer — zero out the single PRD entry
+        ct.prdt[0].dba_lo = 0;
+        ct.prdt[0].dba_hi = 0;
+        ct.prdt[0]._rsv   = 0;
+        ct.prdt[0].dbc    = 0;
+
+        // Command-list header: 5 DWORDs FIS, 0 PRD entries, no write bit
+        CMD_LISTS[ai].0[0].flags  = 5u16;  // cfis_len = 5 DWORDs, W=0, P=0
+        CMD_LISTS[ai].0[0].prdtl  = 0;
+        CMD_LISTS[ai].0[0].prdbc  = 0;
+    }
+
+    port_write(port, PORT_IS, 0xFFFF_FFFF);
+    port_write(port, PORT_CI, 1);
+    if wait_ci_clear(port, 1, "FLUSH_EXT") {
+        crate::arch::x86_64::serial::write_str("[AHCI] Flush cache OK\r\n");
+        true
+    } else {
+        crate::arch::x86_64::serial::write_str("[AHCI] Flush cache timeout\r\n");
+        false   // non-fatal
+    }
+}
+
 /// Zero-copy DMA write using a physical buffer allocated by the PMM.
 /// `buffer_phys` must point to a physically contiguous region of at least
 /// `count * 512` bytes. Returns true on success.

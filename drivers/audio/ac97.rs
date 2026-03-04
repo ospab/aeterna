@@ -817,6 +817,9 @@ pub fn dump_mem_map() {
         return;
     }
 
+    let mut dma_min: u64 = 0;
+    let mut dma_end: u64 = 0;
+
     unsafe {
         // BDL array
         serial::write_str("[AC97-MEM] BDL  phys=0x"); log_u32(BDL_PHYS);
@@ -840,9 +843,12 @@ pub fn dump_mem_map() {
         serial::write_str("[AC97-MEM] PCM range phys=0x"); log_u32(min_phys);
         serial::write_str(" .. 0x"); log_u32(max_phys + 0x1000);
         serial::write_str("  ("); log_u32((BDL_ENTRIES as u32) * 4096); serial::write_str(" bytes)\r\n");
+
+        dma_min = min_phys as u64;
+        dma_end = (max_phys as u64) + 0x1000;
     }
 
-    // Framebuffer info
+    // Framebuffer info + overlap detection
     if let Some(fb) = crate::arch::x86_64::framebuffer::info() {
         let fb_virt = fb.address as u64;
         let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0);
@@ -855,6 +861,26 @@ pub fn dump_mem_map() {
         serial::write_str(" ("); log_u64(fb.width); serial::write_str("x"); log_u64(fb.height);
         serial::write_str("  pitch="); log_u64(fb.pitch);
         serial::write_str(")\r\n");
+
+        // Explicit overlap check: DMA range vs LFB MMIO range
+        if dma_end > 0 {
+            let lfb_end = fb_phys.saturating_add(fb_size);
+            let overlap = !(dma_end <= fb_phys || dma_min >= lfb_end);
+            if overlap {
+                serial::write_str("[AC97-MEM] *** OVERLAP: DMA bufs [0x");
+                log_u64(dma_min);
+                serial::write_str(", 0x");
+                log_u64(dma_end);
+                serial::write_str(") intersects LFB [0x");
+                log_u64(fb_phys);
+                serial::write_str(", 0x");
+                log_u64(lfb_end);
+                serial::write_str(") ***\r\n");
+                serial::write_str("[AC97-MEM] *** This WILL cause graphical corruption in DOOM! ***\r\n");
+            } else {
+                serial::write_str("[AC97-MEM] DMA/LFB: no overlap (OK)\r\n");
+            }
+        }
     } else {
         serial::write_str("[AC97-MEM] FB   not available\r\n");
     }

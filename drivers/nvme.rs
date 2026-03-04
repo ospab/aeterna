@@ -721,6 +721,33 @@ pub fn read_sectors(lba: u64, count: u32, buf: &mut [u8]) -> bool {
     true
 }
 
+/// Send an NVMe Flush command (I/O opcode 0x00) to commit any volatile write
+/// cache to non-volatile storage.  Call after bulk writes to ensure UEFI can
+/// read back consistent data on the next boot.
+/// Returns true on success or if the controller is not yet initialised.
+pub fn flush() -> bool {
+    if !is_initialized() { return true; }
+    unsafe {
+        let mut cmd = SqEntry::zero();
+        // NVMe 1.4 §6.8 — Flush command, I/O opcode 0x00, NSID 1
+        // No PRPs required — the controller ignores them for Flush.
+        cmd.set_opcode_cid(0x00, next_cid());
+        cmd.nsid = NSID;
+        match io_submit_poll(&cmd) {
+            Ok(_) => {
+                crate::arch::x86_64::serial::write_str("[NVMe] Flush OK\r\n");
+                true
+            }
+            Err(e) => {
+                crate::arch::x86_64::serial::write_str("[NVMe] Flush error status=0x");
+                serial_hex16(e);
+                crate::arch::x86_64::serial::write_str("\r\n");
+                false   // non-fatal — data was written, may not be persisted
+            }
+        }
+    }
+}
+
 /// Write `count` sectors starting at `lba` from `buf`.
 pub fn write_sectors(lba: u64, count: u32, buf: &[u8]) -> bool {
     if !is_initialized() { return false; }

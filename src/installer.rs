@@ -66,6 +66,13 @@ fn put_size(mb: u64) {
     } else { put_u64(mb); puts(" MiB"); }
 }
 
+fn put_hex32(v: u32) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    for i in (0..8).rev() {
+        putc(HEX[((v >> (i * 4)) & 0xF) as usize] as char);
+    }
+}
+
 // ── Keyboard ─────────────────────────────────────────────────────────────────
 fn check_abort() -> bool {
     if let Some('\x03') = keyboard::try_read_key() { ABORT.store(true, Ordering::Relaxed); }
@@ -190,6 +197,25 @@ fn disk_read(disk: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
         if attempt < 2 { for _ in 0..100_000usize { unsafe { core::arch::asm!("pause"); } } }
     }
     false
+}
+
+// ── Write-cache flush barrier ─────────────────────────────────────────────────
+//
+// After writing the GPT and FAT32 structures, we issue a storage write-barrier
+// so that UEFI firmware reads consistent sector data on the next power-cycle.
+// NVMe : Flush command (opcode 0x00), writes volatile WC to non-volatile store.
+// AHCI : ATA FLUSH CACHE EXT (0xEA), same effect for SATA/AHCI drives.
+// Also adds a brief pause so the controller settles before we read back.
+fn disk_flush(disk: usize) {
+    slog("[INSTALLER] Issuing write-cache flush...\r\n");
+    if disk == usize::MAX {
+        ospab_os::drivers::nvme::flush();
+    } else {
+        ospab_os::drivers::ahci::flush_cache(disk);
+    }
+    // Short stall to let the controller drain its internal pipeline
+    for _ in 0..500_000usize { unsafe { core::arch::asm!("pause"); } }
+    slog("[INSTALLER] Flush done\r\n");
 }
 
 // ── Binary sources from Limine boot modules ───────────────────────────────────
@@ -578,6 +604,9 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     }
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
+    // Flush write-cache so the UEFI firmware reads back committed data on boot
+    disk_flush(disk.index);
+
     // ══════════════════════════════════════════════════════════════════════
     // 4 — FAT32 ESP  BPB + FAT tables
     hdr!("FAT32 BPB + FAT tables");
@@ -750,6 +779,9 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     }
     ok("OK\n");
 
+    // Final flush: all FAT32 + kernel + identity data committed before readback
+    disk_flush(disk.index);
+
     // ══════════════════════════════════════════════════════════════════════
     // Verify
     puts("\n"); draw_sep(); puts("  Verifying...\n\n");
@@ -759,10 +791,49 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         puts("    Protective MBR    : ");
         if disk_read(disk.index,0,1,&mut buf) && buf[450]==0xEE { ok("OK\n"); } else { err("FAIL\n"); all_ok=false; }
     }
+    // ── GPT: signature + header CRC32 + entries CRC32 ────────────────────────
     {
         let mut buf = [0u8; 512];
-        puts("    GPT header        : ");
-        if disk_read(disk.index,1,1,&mut buf) && &buf[..8]==b"EFI PART" { ok("OK\n"); } else { err("FAIL\n"); all_ok=false; }
+        puts("    GPT signature     : ");
+        if disk_read(disk.index,1,1,&mut buf) && &buf[..8]==b"EFI PART" {
+            ok("OK\n");
+        } else { err("FAIL (LBA 1 missing 'EFI PART')\n"); all_ok=false; }
+
+        puts("    GPT header CRC32  : ");
+        if disk_read(disk.index,1,1,&mut buf) && &buf[..8]==b"EFI PART" {
+            let stored = u32::from_le_bytes([buf[16],buf[17],buf[18],buf[19]]);
+            buf[16]=0; buf[17]=0; buf[18]=0; buf[19]=0;   // zero field before check
+            let computed = crc32(&buf[..92]);
+            if stored == computed {
+                ok("OK (0x"); put_hex32(stored); ok(")\n");
+            } else {
+                err("MISMATCH stored=0x"); put_hex32(stored);
+                err(" computed=0x"); put_hex32(computed); err("\n");
+                err("  !! UEFI will see this as corrupt and show No Media !!\n");
+                all_ok = false;
+            }
+        } else { err("unreadable\n"); all_ok = false; }
+
+        puts("    GPT entries CRC32 : ");
+        if disk_read(disk.index,1,1,&mut buf) && &buf[..8]==b"EFI PART" {
+            let hdr_ecrc = u32::from_le_bytes([buf[88],buf[89],buf[90],buf[91]]);
+            extern crate alloc;
+            let mut ebuf = alloc::vec![0u8; 32usize * 512];
+            let mut read_ok = true;
+            for s in 0u64..32 {
+                let o = s as usize * 512;
+                if !disk_read(disk.index, 2+s, 1, &mut ebuf[o..o+512]) { read_ok=false; break; }
+            }
+            if read_ok {
+                let comp = crc32(&ebuf);
+                if comp == hdr_ecrc { ok("OK (0x"); put_hex32(comp); ok(")\n"); }
+                else {
+                    err("MISMATCH stored=0x"); put_hex32(hdr_ecrc);
+                    err(" computed=0x"); put_hex32(comp); err("\n");
+                    all_ok = false;
+                }
+            } else { err("read error\n"); all_ok = false; }
+        } else { err("header unreadable\n"); all_ok = false; }
     }
     {
         let mut buf = [0u8; 512];
