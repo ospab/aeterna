@@ -68,24 +68,39 @@ static APIC_CNT_PER_US: AtomicU32 = AtomicU32::new(0);
 // ─────────────────────────────────────────────────────────────────────────────
 // MMIO helpers
 
-fn apic_base() -> u64 {
+/// Returns the physical base address of the Local APIC (from IA32_APIC_BASE MSR).
+fn apic_phys_base() -> u64 {
     let lo = APIC_BASE_LO.load(Ordering::Relaxed) as u64;
     let hi = APIC_BASE_HI.load(Ordering::Relaxed) as u64;
     (hi << 32) | lo
 }
 
-/// Read a 32-bit xAPIC register at byte-offset `off` from APIC base.
+/// Returns the HHDM-mapped virtual address of the Local APIC MMIO page.
+///
+/// The APIC resides at a physical address (default 0xFEE00000) that is NOT
+/// identity-mapped in AETERNA — only the HHDM window (HHDM_OFF + phys) is valid.
+/// Using the raw physical address as a pointer causes an immediate #PF.
+#[inline(always)]
+fn apic_virt_base() -> u64 {
+    let phys = apic_phys_base();
+    // Limine maps all physical RAM (and MMIO) at `hhdm_offset + phys`.
+    // boot::hhdm_offset() is set from the Limine HHDM response before arch::init().
+    let hhdm = super::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);
+    hhdm + phys
+}
+
+/// Read a 32-bit xAPIC register at byte-offset `off` from APIC MMIO base.
 #[inline(always)]
 unsafe fn reg_r(off: usize) -> u32 {
-    // SAFETY: APIC MMIO — volatile read required; address is page-mapped by firmware/Limine.
-    core::ptr::read_volatile((apic_base() + off as u64) as *const u32)
+    // SAFETY: APIC MMIO — volatile read; address is valid via HHDM virtual mapping.
+    core::ptr::read_volatile((apic_virt_base() + off as u64) as *const u32)
 }
 
 /// Write a 32-bit xAPIC register.
 #[inline(always)]
 unsafe fn reg_w(off: usize, val: u32) {
-    // SAFETY: volatile write to APIC MMIO.
-    core::ptr::write_volatile((apic_base() + off as u64) as *mut u32, val);
+    // SAFETY: volatile write to APIC MMIO via HHDM virtual mapping.
+    core::ptr::write_volatile((apic_virt_base() + off as u64) as *mut u32, val);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
