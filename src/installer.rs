@@ -286,6 +286,11 @@ fn slog_dec(mut v: u64) {
     while v > 0 { b[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
     for j in (0..i).rev() { serial::write_byte(b[j]); }
 }
+fn slog_hex32(v: u32) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    serial::write_str("0x");
+    for i in (0..8).rev() { serial::write_byte(HEX[((v >> (i * 4)) & 0xF) as usize]); }
+}
 
 // ── GPT ───────────────────────────────────────────────────────────────────────
 const ESP_GUID:  [u8; 16] = [0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B];
@@ -544,6 +549,7 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     // ══════════════════════════════════════════════════════════════════════
     // 1 — Protective MBR
     hdr!("Protective MBR");
+    slog("[INSTALLER] Step 1: Protective MBR\r\n");
     {
         let mut mbr = [0u8; 512];
         mbr[446]=0; mbr[447]=0; mbr[448]=2; mbr[449]=0; mbr[450]=0xEE;
@@ -553,11 +559,13 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         mbr[510]=0x55; mbr[511]=0xAA;
         if !disk_write(disk.index, 0, 1, &mbr) { die!("MBR write error"); }
     }
+    slog("[INSTALLER] MBR OK\r\n");
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
     // ══════════════════════════════════════════════════════════════════════
     // 2 — GPT partition entries (sectors 2-33) + backup
     hdr!("GPT partition entries");
+    slog("[INSTALLER] Step 2: GPT partition entries\r\n");
     let disk_guid = make_uuid(disk.index as u64 * 3, 0xFF);
     let esp_guid  = make_uuid(disk.index as u64 * 3, 0);
     let root_guid = make_uuid(disk.index as u64 * 3, 1);
@@ -576,16 +584,21 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     }
     let entries_crc = crc32(&entries);
     let bak_entries_lba = disk.sectors - 33;
+    slog("  ESP: LBA "); slog_dec(esp_start); slog(".."); slog_dec(esp_end); slog("\r\n");
+    slog("  ROOT: LBA "); slog_dec(root_start); slog(".."); slog_dec(root_end); slog("\r\n");
+    slog("  entries_crc="); slog_hex32(entries_crc); slog("\r\n");
     for s in 0u64..32 {
         let o = (s as usize)*512;
         if !disk_write(disk.index, 2+s, 1, &entries[o..o+512]) { die!("GPT entries write error"); }
     }
     for s in 0u64..32 { let o=(s as usize)*512; disk_write(disk.index,bak_entries_lba+s,1,&entries[o..o+512]); }
+    slog("[INSTALLER] GPT entries OK (backup LBA "); slog_dec(bak_entries_lba); slog(")\r\n");
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
     // ══════════════════════════════════════════════════════════════════════
     // 3 — GPT headers (primary + backup)
     hdr!("GPT headers");
+    slog("[INSTALLER] Step 3: GPT headers\r\n");
     {
         let mut hdr = [0u8; 512];
         hdr[0..8].copy_from_slice(b"EFI PART");
@@ -595,33 +608,80 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         hdr[56..72].copy_from_slice(&disk_guid);
         w64(&mut hdr,72,2); w32(&mut hdr,80,128); w32(&mut hdr,84,128); w32(&mut hdr,88,entries_crc);
         let hcrc = crc32(&hdr[..92]); w32(&mut hdr,16,hcrc);
+        slog("  primary hdr CRC="); slog_hex32(hcrc); slog("\r\n");
         if !disk_write(disk.index,1,1,&hdr) { die!("GPT primary header write error"); }
         // Backup
         w32(&mut hdr,16,0);
         w64(&mut hdr,24,disk.sectors-1); w64(&mut hdr,32,1); w64(&mut hdr,72,bak_entries_lba);
         let bcrc = crc32(&hdr[..92]); w32(&mut hdr,16,bcrc);
+        slog("  backup  hdr CRC="); slog_hex32(bcrc); slog("\r\n");
         disk_write(disk.index,disk.sectors-1,1,&hdr);
     }
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
     // Flush write-cache so the UEFI firmware reads back committed data on boot
+    slog("[INSTALLER] Flushing write-cache after GPT...\r\n");
     disk_flush(disk.index);
 
     // ══════════════════════════════════════════════════════════════════════
     // 4 — FAT32 ESP  BPB + FAT tables
     hdr!("FAT32 BPB + FAT tables");
-    const SPC:  u8  = 8;   // sectors/cluster = 4 KiB
+
+    // ── Compute FAT32 geometry ────────────────────────────────────────────
+    //
+    // EDK2/Tianocore (VMware UEFI) determines FAT type by cluster count:
+    //   CountOfClusters < 65525  →  FAT16  (WRONG for us → "No Media")
+    //   CountOfClusters ≥ 65525  →  FAT32  (correct)
+    //
+    // So we MUST choose SPC (sectors-per-cluster) small enough to push
+    // the cluster count above 65525.  For 256 MiB ESP, SPC=8 gives only
+    // ~65400 clusters (< 65525) → EDK2 misidentifies as FAT16 → corrupt.
+    //
+    // We use the Microsoft FAT specification formula for FATSz:
+    //   TmpVal1 = DskSize - BPB_RsvdSecCnt
+    //   TmpVal2 = 256 * BPB_SecPerClus + BPB_NumFATs
+    //   FATSz   = ceil(TmpVal1 / TmpVal2)
+
     const RSVD: u16 = 32;
     const NFAT: u8  = 2;
     let fat32_total = esp_sectors as u32;
-    let max_clust   = (fat32_total - RSVD as u32) / SPC as u32;
-    let fat_sec     = (max_clust * 4 + 511) / 512;
-    let data_rel    = RSVD as u32 + fat_sec * NFAT as u32; // sectors from ESP start
+
+    // Pick SPC so that data_clusters ≥ 65600 (safe margin above 65525)
+    let spc: u8 = {
+        let mut s: u32 = 8;
+        loop {
+            let tmp2 = 256 * s + NFAT as u32;
+            let fsz  = (fat32_total - RSVD as u32 + tmp2 - 1) / tmp2;
+            let drel = RSVD as u32 + fsz * NFAT as u32;
+            let dcls = (fat32_total.saturating_sub(drel)) / s;
+            if dcls >= 65600 || s == 1 { break; }
+            s /= 2;
+        }
+        s as u8
+    };
+
+    let tmp1    = fat32_total - RSVD as u32;
+    let tmp2    = 256u32 * spc as u32 + NFAT as u32;
+    let fat_sec = (tmp1 + tmp2 - 1) / tmp2;
+    let data_rel = RSVD as u32 + fat_sec * NFAT as u32;
+    let data_clusters = (fat32_total - data_rel) / spc as u32;
+
+    slog("[INSTALLER] FAT32 geometry:\r\n");
+    slog("  total_sectors="); slog_dec(fat32_total as u64);
+    slog("  SPC="); slog_dec(spc as u64);
+    slog("  RSVD="); slog_dec(RSVD as u64);
+    slog("  NFAT="); slog_dec(NFAT as u64); slog("\r\n");
+    slog("  fat_sec="); slog_dec(fat_sec as u64);
+    slog("  data_rel="); slog_dec(data_rel as u64);
+    slog("  data_clusters="); slog_dec(data_clusters as u64);
+    if data_clusters >= 65525 { slog(" (FAT32 OK)\r\n"); }
+    else { slog(" (< 65525 = EDK2 sees FAT16 = BUG!)\r\n"); }
+
     {
         let mut vbr = [0u8; 512];
         vbr[0]=0xEB; vbr[1]=0x58; vbr[2]=0x90;
         vbr[3..11].copy_from_slice(b"AETERNA ");
-        w16(&mut vbr,11,512); vbr[13]=SPC; w16(&mut vbr,14,RSVD);
+        w16(&mut vbr,11,512); vbr[13]=spc; w16(&mut vbr,14,RSVD);
         vbr[16]=NFAT; w16(&mut vbr,17,0); w16(&mut vbr,19,0); vbr[21]=0xF8;
         w16(&mut vbr,22,0); w16(&mut vbr,24,63); w16(&mut vbr,26,255);
         w32(&mut vbr,28,esp_start as u32); w32(&mut vbr,32,fat32_total);
@@ -631,35 +691,43 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         vbr[71..82].copy_from_slice(b"AETERNA ESP"); vbr[82..90].copy_from_slice(b"FAT32   ");
         vbr[510]=0x55; vbr[511]=0xAA;
         if !disk_write(disk.index,esp_start,1,&vbr) { die!("FAT32 VBR write error"); }
+        slog("[INSTALLER] VBR written at LBA "); slog_dec(esp_start); slog("\r\n");
+
         let mut fsi = [0u8; 512];
         w32(&mut fsi,0,0x41615252); w32(&mut fsi,484,0x61417272);
-        w32(&mut fsi,488,max_clust.saturating_sub(8)); w32(&mut fsi,492,8);
+        w32(&mut fsi,488,data_clusters.saturating_sub(8)); w32(&mut fsi,492,8);
         fsi[510]=0x55; fsi[511]=0xAA;
         disk_write(disk.index,esp_start+1,1,&fsi);
-        disk_write(disk.index,esp_start+6,1,&vbr);
-        disk_write(disk.index,esp_start+7,1,&fsi);
+        disk_write(disk.index,esp_start+6,1,&vbr);  // backup VBR
+        disk_write(disk.index,esp_start+7,1,&fsi);  // backup FSInfo
+        slog("[INSTALLER] FSInfo + backups written\r\n");
     }
     {
         let zero = [0u8; 512];
         let fat1 = esp_start + RSVD as u64;
         let fat2 = fat1 + fat_sec as u64;
-        for fc in [fat1, fat2] { for s in 0..fat_sec.min(512) as u64 { disk_write(disk.index,fc+s,1,&zero); } }
+        slog("[INSTALLER] FAT1 LBA="); slog_dec(fat1);
+        slog("  FAT2 LBA="); slog_dec(fat2);
+        slog("  fat_sec="); slog_dec(fat_sec as u64); slog("\r\n");
+        for fc in [fat1, fat2] { for s in 0..fat_sec as u64 { disk_write(disk.index,fc+s,1,&zero); } }
         let mut fat0 = [0u8; 512];
         w32(&mut fat0,0,0x0FFF_FFF8); w32(&mut fat0,4,0x0FFF_FFFF); w32(&mut fat0,8,0x0FFF_FFFF);
         disk_write(disk.index,fat1,1,&fat0); disk_write(disk.index,fat2,1,&fat0);
+        slog("[INSTALLER] FAT tables zeroed + FAT[0..2] initialized\r\n");
     }
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
-    // FAT LBAs — needed both in Step 5 (directory chains) and Steps 6/7 (file chains)
+    // FAT LBAs — needed in Steps 5, 6, 7
     let fat1_lba = esp_start + RSVD as u64;
     let fat2_lba = fat1_lba + fat_sec as u64;
 
     // ══════════════════════════════════════════════════════════════════════
     // 5 — ESP directory tree (dynamic, non-overlapping cluster allocation)
     hdr!("ESP directory tree");
-    let cb = SPC as usize * 512; // bytes per cluster
+    slog("[INSTALLER] Step 5: ESP directory tree\r\n");
+    let cb = spc as usize * 512; // bytes per cluster
     // Helper: sector LBA for cluster N  (cluster 2 = data region start)
-    let clba = |c: u32| -> u64 { esp_start + data_rel as u64 + (c as u64 - 2) * SPC as u64 };
+    let clba = |c: u32| -> u64 { esp_start + data_rel as u64 + (c as u64 - 2) * spc as u64 };
 
     // Allocate clusters in order — no overlaps possible
     let mut nc   = 2u32;
@@ -682,7 +750,7 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     let zero = [0u8; 512];
     for c in [root_c, efi_dc, boot_dc, sysb_c] {
         let lba = clba(c);
-        for s in 0..SPC as u64 { disk_write(disk.index, lba+s, 1, &zero); }
+        for s in 0..spc as u64 { disk_write(disk.index, lba+s, 1, &zero); }
     }
 
     // Root dir /
@@ -723,6 +791,13 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     write_chain(disk.index, fat1_lba, fat2_lba, efi_dc,  1); // cluster 3  /EFI/
     write_chain(disk.index, fat1_lba, fat2_lba, boot_dc, 1); // cluster 4  /EFI/BOOT/
     write_chain(disk.index, fat1_lba, fat2_lba, sysb_c,  1); // cluster 5  /boot/
+    slog("[INSTALLER] Dir clusters: root="); slog_dec(root_c as u64);
+    slog(" efi_dc="); slog_dec(efi_dc as u64);
+    slog(" boot_dc="); slog_dec(boot_dc as u64);
+    slog(" sysb="); slog_dec(sysb_c as u64);
+    slog(" conf="); slog_dec(conf_c as u64); slog("\r\n");
+    slog("  efi_c="); slog_dec(efi_c as u64); slog(" efi_nc="); slog_dec(efi_nc as u64);
+    slog("  ker_c="); slog_dec(ker_c as u64); slog(" ker_nc="); slog_dec(ker_nc as u64); slog("\r\n");
 
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
@@ -730,8 +805,11 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     // 6 — /EFI/BOOT/BOOTX64.EFI
     hdr!("/EFI/BOOT/BOOTX64.EFI");
     if efi_size > 0 {
-        write_clusters(disk.index, efi_data, efi_size, efi_c, efi_nc, &clba, SPC);
+        write_clusters(disk.index, efi_data, efi_size, efi_c, efi_nc, &clba, spc);
         write_chain(disk.index, fat1_lba, fat2_lba, efi_c, efi_nc);
+        slog("[INSTALLER] EFI written: clusters "); slog_dec(efi_c as u64);
+        slog("..+"); slog_dec(efi_nc as u64);
+        slog("  size="); slog_dec(efi_size as u64); slog("\r\n");
         ok("OK"); puts(" ("); put_u64(efi_size as u64); puts(" B)\n");
     } else {
         warn("SKIP (no Limine EFI module)\n");
@@ -742,8 +820,11 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     // 7 — /boot/KERNEL
     hdr!("/boot/KERNEL");
     if kernel_size > 0 {
-        write_clusters(disk.index, kernel_data, kernel_size, ker_c, ker_nc, &clba, SPC);
+        write_clusters(disk.index, kernel_data, kernel_size, ker_c, ker_nc, &clba, spc);
         write_chain(disk.index, fat1_lba, fat2_lba, ker_c, ker_nc);
+        slog("[INSTALLER] KERNEL written: clusters "); slog_dec(ker_c as u64);
+        slog("..+"); slog_dec(ker_nc as u64);
+        slog("  size="); slog_dec(kernel_size as u64); slog("\r\n");
         ok("OK"); puts(" ("); put_u64(kernel_size as u64); puts(" B, ");
         put_u64(ker_nc as u64); puts(" clusters)\n");
     } else {
@@ -753,6 +834,7 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     if check_abort() { abort_screen(); return; }
 
     // Write /limine.conf (chain = 1 cluster)
+    slog("[INSTALLER] Writing /limine.conf at cluster "); slog_dec(conf_c as u64); slog("\r\n");
     write_chain(disk.index, fat1_lba, fat2_lba, conf_c, 1);
     {
         let cb_lba = clba(conf_c);
@@ -770,6 +852,7 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     // ══════════════════════════════════════════════════════════════════════
     // 8 — AETERNA identity sector on root partition
     hdr!("AETERNA identity record");
+    slog("[INSTALLER] Step 8: Identity at LBA "); slog_dec(root_start); slog("\r\n");
     {
         let mut id = [0u8; 512];
         id[0..8].copy_from_slice(b"AETERNA ");
@@ -791,11 +874,13 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     ok("OK\n");
 
     // Final flush: all FAT32 + kernel + identity data committed before readback
+    slog("[INSTALLER] Final flush before verification...\r\n");
     disk_flush(disk.index);
 
     // ══════════════════════════════════════════════════════════════════════
     // Verify
     puts("\n"); draw_sep(); puts("  Verifying...\n\n");
+    slog("[INSTALLER] === Verification ===\r\n");
     let mut all_ok = true;
     {
         let mut buf = [0u8; 512];
@@ -849,7 +934,38 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     {
         let mut buf = [0u8; 512];
         puts("    FAT32 VBR         : ");
-        if disk_read(disk.index,esp_start,1,&mut buf) && buf[510]==0x55 && buf[511]==0xAA { ok("OK\n"); } else { err("FAIL\n"); all_ok=false; }
+        if disk_read(disk.index,esp_start,1,&mut buf) && buf[510]==0x55 && buf[511]==0xAA {
+            ok("OK\n");
+            // Dump key BPB fields to serial for debugging
+            let bpb_spc  = buf[13];
+            let bpb_rsvd = u16::from_le_bytes([buf[14], buf[15]]);
+            let bpb_nfat = buf[16];
+            let bpb_fatsz = u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]);
+            let bpb_tot32 = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+            let dr = bpb_rsvd as u32 + bpb_fatsz * bpb_nfat as u32;
+            let dc = (bpb_tot32 - dr) / bpb_spc as u32;
+            slog("[VERIFY] BPB: SPC="); slog_dec(bpb_spc as u64);
+            slog(" RSVD="); slog_dec(bpb_rsvd as u64);
+            slog(" NFAT="); slog_dec(bpb_nfat as u64);
+            slog(" FATSz="); slog_dec(bpb_fatsz as u64);
+            slog(" Tot32="); slog_dec(bpb_tot32 as u64); slog("\r\n");
+            slog("[VERIFY] data_rel="); slog_dec(dr as u64);
+            slog(" data_clusters="); slog_dec(dc as u64);
+            if dc >= 65525 { slog(" -> FAT32 OK\r\n"); }
+            else { slog(" -> FAT16 BUG! EDK2 will reject!\r\n"); }
+        } else { err("FAIL\n"); all_ok=false; }
+    }
+    // Read-back FAT sector 0 — dump first 8 entries to serial
+    {
+        let mut fbuf = [0u8; 512];
+        if disk_read(disk.index, fat1_lba, 1, &mut fbuf) {
+            slog("[VERIFY] FAT1 sector 0 (first 8 entries):\r\n");
+            for i in 0..8u32 {
+                let off = i as usize * 4;
+                let val = u32::from_le_bytes([fbuf[off], fbuf[off+1], fbuf[off+2], fbuf[off+3]]);
+                slog("  FAT["); slog_dec(i as u64); slog("]="); slog_hex32(val); slog("\r\n");
+            }
+        }
     }
     {
         let mut buf = [0u8; 512];
