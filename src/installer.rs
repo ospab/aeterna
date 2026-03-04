@@ -650,6 +650,10 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     }
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
+    // FAT LBAs — needed both in Step 5 (directory chains) and Steps 6/7 (file chains)
+    let fat1_lba = esp_start + RSVD as u64;
+    let fat2_lba = fat1_lba + fat_sec as u64;
+
     // ══════════════════════════════════════════════════════════════════════
     // 5 — ESP directory tree (dynamic, non-overlapping cluster allocation)
     hdr!("ESP directory tree");
@@ -711,13 +715,20 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         dir_ent(&mut d, 64, b"KERNEL     ", 0x20, ker_c, kernel_size as u32);
         disk_write(disk.index, clba(sysb_c), 1, &d);
     }
+
+    // FAT chain entries for all directories — without these, UEFI reads
+    // FAT[cluster]=0 ("free") and treats the filesystem as corrupt.
+    // root_c=2 is already end-of-chain in fat0; write_chain the rest.
+    write_chain(disk.index, fat1_lba, fat2_lba, root_c,  1); // cluster 2
+    write_chain(disk.index, fat1_lba, fat2_lba, efi_dc,  1); // cluster 3  /EFI/
+    write_chain(disk.index, fat1_lba, fat2_lba, boot_dc, 1); // cluster 4  /EFI/BOOT/
+    write_chain(disk.index, fat1_lba, fat2_lba, sysb_c,  1); // cluster 5  /boot/
+
     ok("OK\n"); if check_abort() { abort_screen(); return; }
 
     // ══════════════════════════════════════════════════════════════════════
     // 6 — /EFI/BOOT/BOOTX64.EFI
     hdr!("/EFI/BOOT/BOOTX64.EFI");
-    let fat1_lba = esp_start + RSVD as u64;
-    let fat2_lba = fat1_lba + fat_sec as u64;
     if efi_size > 0 {
         write_clusters(disk.index, efi_data, efi_size, efi_c, efi_nc, &clba, SPC);
         write_chain(disk.index, fat1_lba, fat2_lba, efi_c, efi_nc);
