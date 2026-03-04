@@ -759,8 +759,23 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
         d[0..11].copy_from_slice(b"AETERNA ESP"); d[11]=0x08; // volume label
         dir_ent(&mut d, 32, b"EFI        ", 0x10, efi_dc, 0);
         dir_ent(&mut d, 64, b"BOOT       ", 0x10, sysb_c, 0);
-        dir_ent(&mut d, 96, b"LIMINE  CFG", 0x20, conf_c, conf_content.len() as u32);
+        // "limine.conf" — extension .conf is 4 chars, doesn't fit 8.3.
+        // Without an LFN entry, FAT shows "LIMINE.CFG" and Limine
+        // can't find its config.  We write 1 LFN entry + 8.3 short entry.
+        {
+            let sn: &[u8; 11] = b"LIMINE~1CON";
+            let cksum = lfn_checksum(sn);
+            // "limine.conf" in UCS-2LE
+            let long_name: [u16; 11] = [
+                0x6C, 0x69, 0x6D, 0x69, 0x6E, 0x65,  // l i m i n e
+                0x2E,                                  // .
+                0x63, 0x6F, 0x6E, 0x66,                // c o n f
+            ];
+            lfn_entry(&mut d, 96, 0x41, &long_name, cksum); // seq=1|LAST
+            dir_ent(&mut d, 128, sn, 0x20, conf_c, conf_content.len() as u32);
+        }
         disk_write(disk.index, clba(root_c), 1, &d);
+        slog("[INSTALLER] Root dir: LFN entry for limine.conf written\r\n");
     }
     // /EFI/
     {
@@ -1037,6 +1052,54 @@ fn dir_ent(dir: &mut [u8], off: usize, name: &[u8; 11], attr: u8, clust: u32, si
 fn dot_ents(dir: &mut [u8], my: u32, parent: u32) {
     dir_ent(dir, 0,  b".          ", 0x10, my, 0);
     dir_ent(dir, 32, b"..         ", 0x10, parent, 0);
+}
+/// 8.3 short-name checksum used by FAT32 Long File Name entries.
+fn lfn_checksum(sn: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for i in 0..11 {
+        sum = (if sum & 1 != 0 { 0x80u8 } else { 0u8 })
+            .wrapping_add(sum >> 1)
+            .wrapping_add(sn[i]);
+    }
+    sum
+}
+/// Write one LFN directory entry at `dir[off..off+32]`.
+/// `seq` = ordinal (1-based, OR 0x40 for last entry).
+/// `name` = full long name as UCS-2LE code units.
+/// `cksum` = checksum of the corresponding 8.3 short name.
+fn lfn_entry(dir: &mut [u8], off: usize, seq: u8, name: &[u16], cksum: u8) {
+    let base = (seq & 0x3F) as usize - 1;  // 0-based index
+    let start = base * 13;
+    let e = &mut dir[off..off+32];
+    e[0] = seq;
+    // Chars 1-5  (bytes 1..10)
+    for i in 0..5usize {
+        let ch = if start+i < name.len() { name[start+i] }
+                 else if start+i == name.len() { 0x0000 }
+                 else { 0xFFFF };
+        e[1+i*2]   = ch as u8;
+        e[1+i*2+1] = (ch >> 8) as u8;
+    }
+    e[11] = 0x0F; // LFN attribute
+    e[12] = 0x00; // type
+    e[13] = cksum;
+    // Chars 6-11 (bytes 14..25)
+    for i in 0..6usize {
+        let ch = if start+5+i < name.len() { name[start+5+i] }
+                 else if start+5+i == name.len() { 0x0000 }
+                 else { 0xFFFF };
+        e[14+i*2]   = ch as u8;
+        e[14+i*2+1] = (ch >> 8) as u8;
+    }
+    e[26] = 0; e[27] = 0; // first cluster = 0
+    // Chars 12-13 (bytes 28..31)
+    for i in 0..2usize {
+        let ch = if start+11+i < name.len() { name[start+11+i] }
+                 else if start+11+i == name.len() { 0x0000 }
+                 else { 0xFFFF };
+        e[28+i*2]   = ch as u8;
+        e[28+i*2+1] = (ch >> 8) as u8;
+    }
 }
 fn write_clusters<F>(disk: usize, data: &[u8], size: usize, start: u32, nc: u32, clba: &F, spc: u8)
 where F: Fn(u32) -> u64 {
