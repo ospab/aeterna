@@ -1,7 +1,7 @@
 ﻿/*
  * AETERNA Installer — aeterna-install
  *
- * Inspired by archinstall — interactive, step-by-step, honest about what it writes.
+ * Interactive, step-by-step disk installer for AETERNA Microkernel.
  *
  * Flow:
  *   1. Scan ATA/AHCI + NVMe disks
@@ -285,12 +285,11 @@ fn w64(buf: &mut [u8], o: usize, v: u64) { buf[o..o+8].copy_from_slice(&v.to_le_
 fn draw_header() {
     framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0);
     hl("╔══════════════════════════════════════════════╗\n");
-    hl("║"); puts("   aeterna-install  —  AETERNA Microkernel   "); hl("║\n");
-    hl("║"); dim("   v"); dim(crate::version::OS_VERSION);
-    dim("  x86_64   (inspired by archinstall)  "); hl("║\n");
+    hl("║"); puts("   aeterna-install  --  AETERNA Microkernel   "); hl("║\n");
+    hl("║"); dim("           x86_64   |   UEFI + BIOS           "); hl("║\n");
     hl("╚══════════════════════════════════════════════╝\n\n");
 }
-fn draw_sep() { dim("  ────────────────────────────────────────────\n"); }
+fn draw_sep() { dim("  ──────────────────────────────────────────────\n"); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Main entry point
