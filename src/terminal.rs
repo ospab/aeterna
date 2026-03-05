@@ -779,174 +779,132 @@ fn cmd_help(args: &str) {
         }
     }
 
-    // Build help content as lines
-    let mut lines = alloc::vec::Vec::new();
-    lines.push(("header", "  AETERNA Shell Guide"));
-    lines.push(("normal", "  ("));
-    lines.push(("normal", crate::version::VERSION_STR));
-    lines.push(("normal", ")"));
-    lines.push(("normal", "  =========================================="));
-    lines.push(("normal", ""));
-    lines.push(("section", "  NAVIGATION & SHELL"));
-    lines.push(("cmd", "  help       This guide. 'help <cmd>' for details"));
-    lines.push(("cmd", "  help ping  Example: detailed ping help"));
-    lines.push(("cmd", "  tutor      Interactive system tutorial"));
-    lines.push(("cmd", "  history    Show command history"));
-    lines.push(("cmd", "  clear      Clear screen (also Ctrl+L)"));
-    lines.push(("dim", "    Tip: Up/Down arrows browse history, Ctrl+C cancels"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  FILE SYSTEM"));
-    lines.push(("cmd", "  ls         List directory contents"));
-    lines.push(("cmd", "  cd         Change directory (cd /proc)"));
-    lines.push(("cmd", "  pwd        Print working directory"));
-    lines.push(("cmd", "  cat        Read file (cat /proc/meminfo)"));
-    lines.push(("cmd", "  mkdir      Create directory (mkdir /tmp/test)"));
-    lines.push(("cmd", "  touch      Create empty file (touch /tmp/hello)"));
-    lines.push(("cmd", "  rm         Remove file (rm /tmp/hello)"));
-    lines.push(("cmd", "  write      Write text to file (write /path text)"));
-    lines.push(("cmd", "  echo       Print text, or echo text > file"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  SYSTEM INFO"));
-    lines.push(("cmd", "  version    Kernel and OS version"));
-    lines.push(("cmd", "  uname      System info (-a for full)"));
-    lines.push(("cmd", "  about      About AETERNA kernel"));
-    lines.push(("cmd", "  whoami     Current user"));
-    lines.push(("cmd", "  hostname   System hostname"));
-    lines.push(("cmd", "  date       Date and uptime"));
-    lines.push(("cmd", "  uptime     System uptime counter"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  HARDWARE & MEMORY"));
-    lines.push(("cmd", "  free       Memory usage (physical + heap)"));
-    lines.push(("cmd", "  lsmem      Memory region details"));
-    lines.push(("cmd", "  lspci      PCI device listing"));
-    lines.push(("cmd", "  lsblk      List block storage devices"));
-    lines.push(("cmd", "  fdisk      Show disk/partition info"));
-    lines.push(("cmd", "  dmesg      Kernel event log"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  NETWORKING"));
-    lines.push(("cmd", "  ifconfig   Network interface status"));
-    lines.push(("cmd", "  ping       ICMP ping (ping 10.0.2.2)"));
-    lines.push(("cmd", "  netdiag    Full NIC/stack diagnostics → serial"));
-    lines.push(("cmd", "  ntpdate    NTP time sync"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  AUDIO"));
-    lines.push(("cmd", "  soundtest  Audio driver diagnostics + 440 Hz tone"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  SYSTEM CONTROL"));
-    lines.push(("cmd", "  save       Save filesystem to disk (plum)"));
-    lines.push(("cmd", "  sync       Flush VFS to disk"));
-    lines.push(("cmd", "  dump_disk  Hex dump of sector 2048"));
-    lines.push(("cmd", "  install    Launch system installer"));
-    lines.push(("cmd", "  reboot     Reboot system"));
-    lines.push(("cmd", "  shutdown   Shutdown (also poweroff, halt)"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  USERLAND TOOLS"));
-    lines.push(("cmd", "  grape      Text editor (nano-like). grape <file>"));
-    lines.push(("cmd", "  tomato     Package manager. tomato --help"));
-    lines.push(("cmd", "  seed       Init system / services. seed status"));
-    lines.push(("cmd", "  doom       Classic DOOM (shareware v1.9)"));
-    lines.push(("cmd", "  plum       Shell info. Also: export, alias, env"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  AI — AETERNA NEURAL ENGINE (ANE)"));
-    lines.push(("cmd", "  aai load <path>   Load .tmt-ai model (zero-copy)"));
-    lines.push(("cmd", "  aai info          Model metadata + param count"));
-    lines.push(("cmd", "  aai bench         SIMD GEMM benchmark"));
-    lines.push(("cmd", "  aai chat <text>   Inference with 100 Hz streaming"));
-    lines.push(("cmd", "  aai summarize <text> Entropy + text stats"));
-    lines.push(("dim", "    Tip: help aai  or  tutor ai  for full details"));
-    lines.push(("normal", ""));
-    lines.push(("section", "  SHELL BUILTINS (plum)"));
-    lines.push(("cmd", "  export     Set environment variable (export VAR=val)"));
-    lines.push(("cmd", "  alias      Define command alias (alias name=cmd)"));
-    lines.push(("cmd", "  env        Show all environment variables"));
-    lines.push(("cmd", "  set        Show/set variables"));
-    lines.push(("cmd", "  type       Show command type (type ls)"));
-    lines.push(("cmd", "  source     Execute script file (source /path)"));
-    lines.push(("cmd", "  bash       Execute bash scripts (bash script.sh)"));
-
-    show_paged_output(&lines);
+    help_display();
 }
 
-/// Display content with pagination (Space=next, b=back, q=quit)
-fn show_paged_output(lines: &[(&str, &str)]) {
-    let screen_rows = framebuffer::screen_rows() as usize;
-    let lines_per_page = screen_rows.saturating_sub(3); // reserve 3 for prompt
-    let total_pages = (lines.len() + lines_per_page - 1) / lines_per_page;
-    let mut current_page = 0usize;
+// ── Help display helpers ───────────────────────────────────────────────────
 
-    loop {
-        framebuffer::clear(BG);
-        framebuffer::set_cursor_pos(0, 0);
+/// Pad to `target` width (ASCII characters only).
+fn help_pad(len: usize, target: usize) {
+    for _ in 0..target.saturating_sub(len) { puts(" "); }
+}
 
-        let start = current_page * lines_per_page;
-        let end = (start + lines_per_page).min(lines.len());
+/// Print a section header: coloured "--[ NAME ]"
+fn help_sec(title: &str) {
+    puts("\n");
+    framebuffer::draw_string("  --[ ", FG_DIM, BG);
+    framebuffer::draw_string(title, FG_WARN, BG);
+    framebuffer::draw_string(" ]\n", FG_DIM, BG);
+}
 
-        // Draw page content
-        for i in start..end {
-            let (typ, text) = lines[i];
-            match typ {
-                "header" => framebuffer::draw_string(text, FG_OK, BG),
-                "section" => framebuffer::draw_string(text, FG_WARN, BG),
-                "dim" => framebuffer::draw_string(text, FG_DIM, BG),
-                "cmd" => framebuffer::draw_string(text, FG, BG),
-                _ => framebuffer::draw_string(text, FG, BG),
-            }
-            puts("\n");
-        }
+/// Two-column command row: `cmd1  desc1   cmd2  desc2`
+fn help_row2(c1: &str, d1: &str, c2: &str, d2: &str) {
+    puts("  ");
+    framebuffer::draw_string(c1, FG, BG);
+    help_pad(c1.len(), 16);
+    framebuffer::draw_string(d1, FG_DIM, BG);
+    help_pad(d1.len(), 26);
+    framebuffer::draw_string(c2, FG, BG);
+    help_pad(c2.len(), 16);
+    framebuffer::draw_string(d2, FG_DIM, BG);
+    puts("\n");
+}
 
-        // Draw navigation prompt
-        if total_pages > 1 {
-            puts("\n");
-            framebuffer::draw_string("  -- Page ", FG_DIM, BG);
-            let pg_str = alloc::format!("{}/{}", current_page + 1, total_pages);
-            framebuffer::draw_string(&pg_str, FG, BG);
-            framebuffer::draw_string(" -- ", FG_DIM, BG);
-            framebuffer::draw_string("[Space]", FG_WARN, BG);
-            framebuffer::draw_string("=next ", FG_DIM, BG);
-            if current_page > 0 {
-                framebuffer::draw_string("[b]", FG_WARN, BG);
-                framebuffer::draw_string("=back ", FG_DIM, BG);
-            }
-            framebuffer::draw_string("[q]", FG_WARN, BG);
-            framebuffer::draw_string("=quit", FG_DIM, BG);
+/// Single-column command row: `cmd  desc` (full width)
+fn help_row1(c1: &str, d1: &str) {
+    puts("  ");
+    framebuffer::draw_string(c1, FG, BG);
+    help_pad(c1.len(), 16);
+    framebuffer::draw_string(d1, FG_DIM, BG);
+    puts("\n");
+}
 
-            // Wait for key
-            loop {
-                if let Some(key) = keyboard::poll_key() {
-                    match key {
-                        ' ' | '\n' => {
-                            if current_page + 1 < total_pages {
-                                current_page += 1;
-                            } else {
-                                return; // last page, exit on Space
-                            }
-                            break;
-                        }
-                        'b' | 'B' => {
-                            if current_page > 0 {
-                                current_page -= 1;
-                            }
-                            break;
-                        }
-                        'q' | 'Q' | '\x03' => {
-                            framebuffer::clear(BG);
-                            framebuffer::set_cursor_pos(0, 0);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        } else {
-            // Single page — wait for any key
-            puts("\n");
-            framebuffer::draw_string("  -- Press any key to continue --", FG_DIM, BG);
-            keyboard::poll_key();
-            framebuffer::clear(BG);
-            framebuffer::set_cursor_pos(0, 0);
-            return;
-        }
-    }
+/// Full help screen — all commands, no forced pagination.
+fn help_display() {
+    framebuffer::clear(BG);
+    framebuffer::set_cursor_pos(0, 0);
+
+    // Header
+    framebuffer::draw_string("  AETERNA Shell", FG_OK, BG);
+    framebuffer::draw_string(" -- Command Reference", FG, BG);
+    framebuffer::draw_string("  [ v", FG_DIM, BG);
+    framebuffer::draw_string(crate::version::VERSION_STR, FG_DIM, BG);
+    framebuffer::draw_string(" ]\n", FG_DIM, BG);
+    framebuffer::draw_string("  ", FG_DIM, BG);
+    framebuffer::draw_string("help <cmd>", FG_WARN, BG);
+    framebuffer::draw_string(" per-command detail   ", FG_DIM, BG);
+    framebuffer::draw_string("tutor <topic>", FG_WARN, BG);
+    framebuffer::draw_string(" guided walkthroughs\n", FG_DIM, BG);
+    framebuffer::draw_string("  ================================================================\n", FG_DIM, BG);
+
+    // NAVIGATION & SHELL
+    help_sec("NAVIGATION & SHELL");
+    help_row2("help",          "This guide",              "clear",         "Clear screen  (Ctrl+L)");
+    help_row2("help <cmd>",    "Per-command detail",      "history",       "Command history");
+    help_row2("tutor <topic>", "Guided walkthroughs",     "tutor topics",  "List all topics");
+    dim_print("  Keys: Up/Down=history  Ctrl+C=cancel  Ctrl+L=clear\n");
+
+    // FILESYSTEM
+    help_sec("FILESYSTEM");
+    help_row2("ls [path]",     "List directory",          "cd <path>",     "Change directory");
+    help_row2("cat <file>",    "View file",               "pwd",           "Working directory");
+    help_row2("mkdir <dir>",   "Create directory",        "touch <file>",  "Create empty file");
+    help_row2("rm <file>",     "Delete file",             "save",          "Persist to disk");
+    help_row2("echo text",     "Print / write  (echo t>f)","write <f> <t>", "Write text to file");
+
+    // SYSTEM INFO
+    help_sec("SYSTEM INFO");
+    help_row2("version",       "OS + kernel version",     "uname [-a]",    "System identification");
+    help_row2("about",         "AETERNA ASCII art",        "whoami",        "Current user");
+    help_row2("hostname",      "System hostname",         "date",          "Date and uptime");
+    help_row2("uptime",        "Uptime counter",           "dmesg",         "Kernel event log");
+
+    // HARDWARE & MEMORY
+    help_sec("HARDWARE & MEMORY");
+    help_row2("free",          "Memory overview",         "meminfo",       "Detailed mem stats");
+    help_row2("lsmem",         "Memory region list",      "lspci",         "PCI device listing");
+    help_row2("lsblk",         "Block devices",           "soundtest",     "Audio diagnostics");
+    help_row2("fdisk <dev>",   "Partition info",          "mkfs",          "Format partition");
+    help_row2("mount",         "Mount filesystem",        "dump_disk",     "Hex dump LBA 2048");
+
+    // NETWORKING
+    help_sec("NETWORKING");
+    help_row2("ifconfig",      "Interface status/config", "ping <ip>",     "ICMP echo test");
+    help_row2("ntpdate [ip]",  "NTP time sync",           "netdiag",       "Full NIC diagnostics");
+
+    // STORAGE & SYSTEM CONTROL
+    help_sec("STORAGE & CONTROL");
+    help_row2("sync",          "Flush VFS to disk",       "install",       "OS installer TUI");
+    help_row2("reboot",        "Reboot system",           "shutdown",      "Power off  (poweroff/halt)");
+    help_row2("ps",            "Process list",            "top",           "Process activity");
+
+    // USERLAND TOOLS
+    help_sec("USERLAND TOOLS");
+    help_row2("grape <file>",  "Text editor (nano-like)", "tomato",        "Package manager");
+    help_row2("seed [cmd]",    "Init / service manager",  "doom",          "Classic DOOM (1993)");
+    help_row2("bash <script>", "Run shell script",        "plum",          "Shell info");
+
+    // AI — ANE
+    help_sec("AI -- AETERNA NEURAL ENGINE  (ANE)");
+    help_row2("aai load <f>",  "Load .tmt-ai model",      "aai info",      "Model metadata");
+    help_row2("aai bench",     "SIMD GEMM benchmark",     "aai chat <t>",  "Run inference");
+    help_row1("aai summarize", "Entropy + text statistics    (see: tutor ai  /  help aai)");
+
+    // SHELL BUILTINS
+    help_sec("SHELL BUILTINS  (plum)");
+    help_row2("export VAR=v",  "Set environment variable", "alias n=cmd",   "Create alias");
+    help_row2("env",           "Show all variables",       "set",           "Show/set vars");
+    help_row2("unset <var>",   "Remove variable",          "unalias <n>",   "Remove alias");
+    help_row2("type <cmd>",    "Find command type",        "source <f>",    "Run script file");
+
+    // AXON COREUTILS
+    help_sec("TEXT & FILE UTILS  (axon coreutils)");
+    dim_print("  wc  head  tail  grep  sort  uniq  cut  awk  diff     text processing\n");
+    dim_print("  cp  mv  find  du  tree  stat  xxd  nl  df  which     file utilities\n");
+    dim_print("  kill  printf  xargs                                   system utils\n");
+    dim_print("  (see: tutor axon  for examples and full details)\n");
+
+    puts("\n");
 }
 
 fn cmd_echo(args: &str) {
@@ -2316,58 +2274,88 @@ fn tutor_kernel() {
 }
 
 fn tutor_commands() {
-    puts("\n");
-    framebuffer::draw_string("  Complete Command Reference\n", FG_OK, BG);
-    puts("  ═══════════════════════════\n\n");
+    framebuffer::clear(BG);
+    framebuffer::set_cursor_pos(0, 0);
 
-    framebuffer::draw_string("  Shell Features:\n", FG_WARN, BG);
-    puts("  - Up/Down arrows: browse command history\n");
-    puts("  - Ctrl+C: cancel current input line\n");
-    puts("  - Ctrl+L: clear screen\n");
-    puts("  - Tab: insert 4 spaces\n");
-    puts("  - Backspace: delete last character\n\n");
+    framebuffer::draw_string("  AETERNA Shell", FG_OK, BG);
+    framebuffer::draw_string(" -- Complete Command Reference\n", FG, BG);
+    framebuffer::draw_string("  =======================================================\n\n", FG_DIM, BG);
 
-    framebuffer::draw_string("  File Commands:\n", FG_WARN, BG);
-    dim_print("  ls [path]         List directory (/proc, /etc, etc.)\n");
-    dim_print("  cd <path>         Change directory\n");
-    dim_print("  pwd               Print working directory\n");
-    dim_print("  cat <file>        Display file contents\n\n");
+    // Shell Keys
+    framebuffer::draw_string("  Shell Keys:\n", FG_WARN, BG);
+    dim_print("  Up/Down       Browse history    Ctrl+L   Clear screen\n");
+    dim_print("  Ctrl+C        Cancel input      Tab      4 spaces\n\n");
 
+    // Filesystem
+    framebuffer::draw_string("  Filesystem:\n", FG_WARN, BG);
+    dim_print("  ls [path]     List directory         cd <path>    Change directory\n");
+    dim_print("  cat <file>    View file              pwd          Working directory\n");
+    dim_print("  mkdir <dir>   Create directory       touch <file> Create file\n");
+    dim_print("  rm <file>     Delete file            save         Persist to disk\n");
+    dim_print("  echo t > f    Write text to file     write <f> t  Write text\n\n");
+
+    // System Info
     framebuffer::draw_string("  System Info:\n", FG_WARN, BG);
-    dim_print("  version           OS and kernel version\n");
-    dim_print("  uname -a          Full system identification\n");
-    dim_print("  about             About AETERNA (ASCII art)\n");
-    dim_print("  whoami            Current user (root)\n");
-    dim_print("  hostname          System name (ospab)\n");
-    dim_print("  date              Current date and uptime\n");
-    dim_print("  uptime            Detailed uptime counter\n\n");
+    dim_print("  version       OS + kernel version    uname [-a]   System info\n");
+    dim_print("  about         AETERNA ASCII art       whoami       Current user\n");
+    dim_print("  hostname      System hostname         date         Date + uptime\n");
+    dim_print("  uptime        Uptime counter          dmesg        Kernel log\n\n");
 
-    framebuffer::draw_string("  Hardware:\n", FG_WARN, BG);
-    dim_print("  free / meminfo    Memory usage overview\n");
-    dim_print("  lsmem             Memory region details\n");
-    dim_print("  lspci             PCI device listing\n");
-    dim_print("  dmesg             Kernel event ring buffer\n\n");
+    // Hardware & Memory
+    framebuffer::draw_string("  Hardware & Memory:\n", FG_WARN, BG);
+    dim_print("  free          Memory overview         meminfo      Detailed stats\n");
+    dim_print("  lsmem         Memory region list      lspci        PCI devices\n");
+    dim_print("  lsblk         Block devices           soundtest    Audio diag\n\n");
 
+    // Disk & Storage
+    framebuffer::draw_string("  Disk & Storage:\n", FG_WARN, BG);
+    dim_print("  fdisk <dev>   Partition info          mkfs         Format partition\n");
+    dim_print("  mount         Mount filesystem        sync         Flush to disk\n");
+    dim_print("  dump_disk     Hex dump LBA 2048       install      OS installer\n\n");
+
+    // Networking
     framebuffer::draw_string("  Networking:\n", FG_WARN, BG);
-    dim_print("  ifconfig          Network interface config\n");
-    dim_print("  ping <ip> [n]     ICMP echo request\n");
-    dim_print("  ntpdate [ip]      NTP time synchronization\n\n");
+    dim_print("  ifconfig      Interface config        ping <ip>    ICMP test\n");
+    dim_print("  ntpdate [ip]  NTP time sync           netdiag      Full NIC diag\n\n");
 
+    // System Control
     framebuffer::draw_string("  System Control:\n", FG_WARN, BG);
-    dim_print("  echo <text>       Print text to console\n");
-    dim_print("  history           Show command history\n");
-    dim_print("  install           Launch OS installer TUI\n");
-    dim_print("  reboot            Reboot the machine\n");
-    dim_print("  shutdown          Power off the system\n\n");
+    dim_print("  reboot        Reboot system           shutdown     Power off\n");
+    dim_print("  poweroff      Alias for shutdown      halt         Stop CPU\n");
+    dim_print("  ps            Process list            top          Process activity\n");
+    dim_print("  history       Command history         clear        Clear screen\n\n");
 
-    framebuffer::draw_string("  Userland & AI:\n", FG_WARN, BG);
-    dim_print("  doom              Classic DOOM (shareware v1.9)\n");
-    dim_print("  aai load <path>   Load .tmt-ai model file\n");
-    dim_print("  aai info          Show loaded model metadata\n");
-    dim_print("  aai bench         SIMD GEMM performance benchmark\n");
-    dim_print("  aai chat <text>   Run inference + stream tokens\n");
-    dim_print("  aai summarize <text> Entropy + stats (chars/words/uniq-bytes/H)\n");
-    dim_print("  See 'tutor ai' for ANE deep dive\n\n");
+    // Userland Apps
+    framebuffer::draw_string("  Userland Apps:\n", FG_WARN, BG);
+    dim_print("  grape <file>  Text editor (nano-like)\n");
+    dim_print("  tomato        Package manager  (-S pkg  -R pkg  -Q  -Syu)\n");
+    dim_print("  seed [cmd]    Init system / service manager  (seed status)\n");
+    dim_print("  doom          Classic DOOM shareware v1.9\n");
+    dim_print("  bash <script> Run shell script\n");
+    dim_print("  plum          Shell info and builtins\n\n");
+
+    // AI — ANE
+    framebuffer::draw_string("  AI -- Aeterna Neural Engine (ANE):\n", FG_WARN, BG);
+    dim_print("  aai load <f>  Load .tmt-ai model (zero-copy)\n");
+    dim_print("  aai info      Model metadata + param count\n");
+    dim_print("  aai bench     SIMD GEMM performance benchmark\n");
+    dim_print("  aai chat <t>  Run inference + stream tokens at 100 Hz\n");
+    dim_print("  aai summarize Entropy + stats (chars/words/uniq-bytes/H)\n");
+    dim_print("  See: tutor ai  for full ANE deep-dive\n\n");
+
+    // Shell Builtins (plum)
+    framebuffer::draw_string("  Shell Builtins (plum):\n", FG_WARN, BG);
+    dim_print("  export VAR=v  Set env variable        alias n=cmd  Create alias\n");
+    dim_print("  env           Show all variables      set          Show/set vars\n");
+    dim_print("  unset <var>   Remove variable         unalias <n>  Remove alias\n");
+    dim_print("  type <cmd>    Find command type       source <f>   Run script\n\n");
+
+    // AXON Coreutils
+    framebuffer::draw_string("  AXON Coreutils (text & file utilities):\n", FG_WARN, BG);
+    dim_print("  wc   head   tail   grep   sort   uniq   cut   awk   diff\n");
+    dim_print("  cp   mv     find   du     tree   stat   xxd   nl    df\n");
+    dim_print("  kill which  printf xargs\n");
+    dim_print("  See: tutor axon  for full details and examples\n");
 }
 
 // ══════════════════════════════════════════════════════════════
