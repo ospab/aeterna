@@ -117,6 +117,7 @@ pub fn active_driver_name() -> &'static str {
 pub fn dump_status() {
     match ACTIVE_DRIVER.load(Ordering::Relaxed) {
         1 => ac97::dump_status(),
+        2 => hda::dump_status(),
         3 => es1371::dump_status(),
         _ => {}
     }
@@ -145,5 +146,21 @@ pub fn sample_rate() -> u32 {
         2 => hda::sample_rate(),    // actual rate programmed into the HDA stream
         3 => es1371::sample_rate(), // actual rate programmed into the ES1371 codec
         _ => 44100,                 // AC97 default
+    }
+}
+
+/// Returns the current master volume (0..100).
+pub fn volume() -> u8 {
+    match ACTIVE_DRIVER.load(Ordering::Relaxed) {
+        2 => hda::volume(),
+        _ => 80, // fixed for drivers without volume control
+    }
+}
+
+/// Set master volume (0..100).
+pub fn set_volume(pct: u8) {
+    match ACTIVE_DRIVER.load(Ordering::Relaxed) {
+        2 => hda::set_volume(pct),
+        _ => {} // not yet implemented for AC97/ES1371
     }
 }

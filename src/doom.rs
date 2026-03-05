@@ -756,14 +756,63 @@ pub fn run() {
 
 // ─── HDA audio bridge (exported to DOOM C engine) ────────────────────────────
 
+/// Fractional accumulator for 44100→48000 resampler (persists across calls).
+static mut RESAMPLE_FRAC: u32 = 0;
+
 /// Push raw PCM data into the HDA ring buffer.
 /// Called by the DOOM sound module on every game tick.
-/// `data` must point to interleaved stereo 16-bit LE @ 44100 Hz.
+/// `data` points to interleaved stereo 16-bit LE @ 44100 Hz.
+///
+/// Since the HDA stream runs at 48000 Hz, we resample on the fly using
+/// linear interpolation with ratio 160/147 (48000/44100).
 #[no_mangle]
 pub unsafe extern "C" fn rust_hda_write_pcm(data: *const u8, len: u32) {
-    if data.is_null() || len == 0 { return; }
-    let slice = core::slice::from_raw_parts(data, len as usize);
-    crate::drivers::audio::write_pcm(slice);
+    if data.is_null() || len < 4 { return; }
+    let input = core::slice::from_raw_parts(data, len as usize);
+    let in_frames = input.len() / 4;  // stereo 16-bit = 4 bytes/frame
+    if in_frames == 0 { return; }
+
+    // Max output: ceil(in_frames * 160/147) + 1.
+    // DOOM sends at most 1260 frames/tic → ~1373 output frames = 5492 bytes.
+    // Use a fixed stack buffer large enough for the worst case.
+    const MAX_OUT_BYTES: usize = 6144;
+    let mut out_buf = [0u8; MAX_OUT_BYTES];
+    let mut out_pos: usize = 0;
+
+    let mut in_idx: usize = 0;
+    let mut frac: u32 = RESAMPLE_FRAC;
+
+    while in_idx < in_frames && out_pos + 4 <= MAX_OUT_BYTES {
+        let i0 = in_idx;
+        let i1 = if in_idx + 1 < in_frames { in_idx + 1 } else { in_idx };
+
+        // Read stereo samples at i0 and i1
+        let l0 = i16::from_le_bytes([input[i0 * 4], input[i0 * 4 + 1]]) as i32;
+        let r0 = i16::from_le_bytes([input[i0 * 4 + 2], input[i0 * 4 + 3]]) as i32;
+        let l1 = i16::from_le_bytes([input[i1 * 4], input[i1 * 4 + 1]]) as i32;
+        let r1 = i16::from_le_bytes([input[i1 * 4 + 2], input[i1 * 4 + 3]]) as i32;
+
+        // Linear interpolation: out = s0 + (s1 - s0) * frac / 160
+        let fl = (l0 + (l1 - l0) * frac as i32 / 160) as i16;
+        let fr = (r0 + (r1 - r0) * frac as i32 / 160) as i16;
+
+        out_buf[out_pos..out_pos + 2].copy_from_slice(&fl.to_le_bytes());
+        out_buf[out_pos + 2..out_pos + 4].copy_from_slice(&fr.to_le_bytes());
+        out_pos += 4;
+
+        // Advance resampler: output rate / input rate = 160 / 147
+        // Each output sample advances the input position by 147/160.
+        frac += 147;
+        while frac >= 160 {
+            frac -= 160;
+            in_idx += 1;
+        }
+    }
+    RESAMPLE_FRAC = frac;
+
+    if out_pos > 0 {
+        crate::drivers::audio::write_pcm(&out_buf[..out_pos]);
+    }
 }
 
 /// Returns 1 if the HDA audio driver is initialized and streaming, 0 otherwise.

@@ -171,9 +171,9 @@ static mut MMIO_BASE: u64 = 0;
 /// Number of input streams (from GCAP[11:8])
 static mut ISS: u8 = 0;
 
-/// Physical address of output stream's DMA buffer (2 pages = 8 KiB total)
-static mut DMA_BUF_PHYS:  [u64; 2] = [0; 2];
-static mut DMA_BUF_VIRT:  [u64; 2] = [0; 2];
+/// Physical address of output stream's DMA buffer (8 pages = 32 KiB total)
+static mut DMA_BUF_PHYS:  [u64; 8] = [0; 8];
+static mut DMA_BUF_VIRT:  [u64; 8] = [0; 8];
 
 /// BDL physical and virtual addresses
 static mut BDL_PHYS: u64 = 0;
@@ -184,8 +184,18 @@ static mut WRITE_POS: usize = 0;
 
 /// Total DMA ring buffer size in bytes
 const DMA_BUF_SIZE: usize = 4096; // per buffer entry
-const DMA_ENTRIES:  usize = 2;
-const DMA_TOTAL:    usize = DMA_BUF_SIZE * DMA_ENTRIES; // 8 KiB ring
+const DMA_ENTRIES:  usize = 8;
+const DMA_TOTAL:    usize = DMA_BUF_SIZE * DMA_ENTRIES; // 32 KiB ring
+
+/// Master volume (0 = mute, 100 = max).  Mapped to HDA amp gain 0..127.
+static mut MASTER_VOLUME: u8 = 80;
+
+/// First DAC NID found during configure_codec (used for volume control).
+static mut FIRST_DAC_NID: u8 = 0;
+
+/// Widget NIDs of all Pin Complexes discovered during codec configuration.
+static mut PIN_NIDS: [u8; 16] = [0; 16];
+static mut PIN_COUNT: u8 = 0;
 
 // ─── MMIO helpers ─────────────────────────────────────────────────────────
 
@@ -424,7 +434,7 @@ unsafe fn setup_output_stream() -> bool {
     let ctl = (ctl & 0x00FFFFFF) | SD_STREAM_TAG;
     sd_write32(sd, SD_OFF_CTL, ctl);
 
-    serial::write_str("[HDA] Output stream configured: 44100Hz/16-bit/2ch\r\n");
+    serial::write_str("[HDA] Output stream configured: 48000Hz/16-bit/2ch, 32KiB ring\r\n");
     true
 }
 
@@ -485,6 +495,9 @@ unsafe fn configure_codec(codec: u8) {
     // ── 4. Configure each widget ────────────────────────────────────────────
     let mut first_dac: u8 = 0;
 
+    // Volume: convert MASTER_VOLUME (0..100) → HDA gain (0..0x7F)
+    let vol_gain: u16 = (MASTER_VOLUME as u16 * 0x7F / 100).min(0x7F);
+
     for nid in widget_start..widget_end {
         let cap         = imm_send(make_get_param(codec, nid, PARAM_AUDIO_CAP));
         let widget_type = (cap >> 20) & 0xF;
@@ -492,10 +505,9 @@ unsafe fn configure_codec(codec: u8) {
         match widget_type {
             0x0 => {
                 // ── Audio Output (DAC) ──────────────────────────────────────
-                // Only assign stream 1 to the very first DAC; the others stay
-                // silent (no stream) — this is intentional for basic mono/stereo.
                 if first_dac == 0 {
                     first_dac = nid;
+                    FIRST_DAC_NID = nid;
                     // Stream format: 48 kHz, 16-bit, stereo
                     imm_send(make_set_fmt(codec, nid, SDFMT_48000_16_STEREO));
                     // Bind to stream TAG=1, channel 0
@@ -540,12 +552,17 @@ unsafe fn configure_codec(codec: u8) {
 
             0x4 => {
                 // ── Pin Complex ─────────────────────────────────────────────
+                // Track pin NIDs for runtime volume control.
+                if (PIN_COUNT as usize) < PIN_NIDS.len() {
+                    PIN_NIDS[PIN_COUNT as usize] = nid;
+                    PIN_COUNT += 1;
+                }
                 // Enable as output: HP_EN (bit7) + OUT_EN (bit6) = 0xC0.
-                // Setting both ensures we get sound from both line-out and HP jacks.
                 imm_send(make_verb(codec, nid, VERB_SET_PIN_WIDGET_CTL, 0xC0));
 
-                // Unmute pin output amp, max gain.
-                imm_send(make_set_amp(codec, nid, 0xB07F));
+                // Pin output amp at current master volume.
+                let pin_amp: u16 = 0xB000 | vol_gain;
+                imm_send(make_set_amp(codec, nid, pin_amp));
 
                 // EAPD: bit1=EAPD enable (powers external amplifier on laptops).
                 imm_send(make_verb(codec, nid, VERB_SET_EAPD, 0x02));
@@ -774,6 +791,74 @@ pub fn is_ready() -> bool {
 /// Returns the sample rate the HDA stream was configured with (Hz).
 pub fn sample_rate() -> u32 {
     unsafe { SAMPLE_RATE_HZ }
+}
+
+/// Returns the current master volume (0..100).
+pub fn volume() -> u8 {
+    unsafe { MASTER_VOLUME }
+}
+
+/// Set master volume (0..100).  Immediately updates the HDA pin amp gains.
+pub fn set_volume(pct: u8) {
+    let pct = pct.min(100);
+    unsafe {
+        MASTER_VOLUME = pct;
+        if !AUDIO_READY.load(Ordering::Relaxed) { return; }
+        let gain: u16 = (pct as u16 * 0x7F / 100).min(0x7F);
+        // bit15=output, bit13=left, bit12=right, bit7=0(unmute), bits6:0=gain
+        let amp: u16 = 0xB000 | gain;
+        for i in 0..PIN_COUNT as usize {
+            imm_send(make_set_amp(0, PIN_NIDS[i], amp));
+        }
+    }
+}
+
+/// Dump HDA register state to the serial port AND return a summary string.
+pub fn dump_status() {
+    if !AUDIO_READY.load(Ordering::Relaxed) {
+        serial::write_str("[HDA] Not initialized\r\n");
+        return;
+    }
+    unsafe {
+        let gcap  = read16(REG_GCAP);
+        let gctl  = read32(REG_GCTL);
+        let gsts  = read16(REG_GSTS);
+        let intctl = read32(REG_INTCTL);
+        let intsts = read32(REG_INTSTS);
+        let wall   = read32(REG_WALCLK);
+        let sd     = output_sd_base();
+        let sd_ctl = sd_read32(sd, SD_OFF_CTL);
+        let sd_sts = sd_read8(sd, SD_OFF_STS);
+        let sd_lpib = sd_read32(sd, SD_OFF_LPIB);
+        let sd_cbl  = sd_read32(sd, SD_OFF_CBL);
+        let sd_lvi  = sd_read16(sd, SD_OFF_LVI);
+        let sd_fmt  = sd_read16(sd, SD_OFF_FMT);
+
+        serial::write_str("[HDA] GCAP=");   serial_u16(gcap);
+        serial::write_str(" GCTL=");        serial_u64(gctl as u64);
+        serial::write_str(" GSTS=");        serial_u16(gsts);
+        serial::write_str("\r\n");
+        serial::write_str("[HDA] INTCTL="); serial_u64(intctl as u64);
+        serial::write_str(" INTSTS=");      serial_u64(intsts as u64);
+        serial::write_str(" WALCLK=");      serial_u64(wall as u64);
+        serial::write_str("\r\n");
+        serial::write_str("[HDA] SD: CTL="); serial_u64(sd_ctl as u64);
+        serial::write_str(" STS=0x");       serial_u8(sd_sts);
+        serial::write_str(" LPIB=");        serial_u64(sd_lpib as u64);
+        serial::write_str(" CBL=");         serial_u64(sd_cbl as u64);
+        serial::write_str(" LVI=");         serial_u16(sd_lvi);
+        serial::write_str(" FMT=");         serial_u16(sd_fmt);
+        serial::write_str("\r\n");
+        serial::write_str("[HDA] WR_POS="); serial_u64(WRITE_POS as u64);
+        serial::write_str(" VOLUME=");      serial_u64(MASTER_VOLUME as u64);
+        serial::write_str("%\r\n");
+    }
+}
+
+/// Returns the current DMA link position (LPIB) for external diagnostics.
+pub fn dma_position() -> u32 {
+    if !AUDIO_READY.load(Ordering::Relaxed) { return 0; }
+    unsafe { sd_read32(output_sd_base(), SD_OFF_LPIB) }
 }
 
 // ─── Serial formatting helpers ────────────────────────────────────────────

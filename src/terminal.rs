@@ -26,7 +26,7 @@ const BUILTINS: &[&str] = &[
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
     "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",
-    "ps", "top", "bench",
+    "ps", "top", "bench", "vol", "mute",
 ];
 
 extern crate alloc;
@@ -601,6 +601,8 @@ fn execute_command(cmd: &str) {
             puts("Done. Check serial output for full report.\n");
         }
         "soundtest" => cmd_soundtest(),
+        "vol"      => cmd_vol(args),
+        "mute"     => cmd_mute(),
         "ntpdate" => cmd_ntpdate(args),
         "sync"    => cmd_sync(),
         "dump_disk" => cmd_dump_disk(args),
@@ -731,11 +733,24 @@ fn cmd_help(args: &str) {
                 puts("soundtest\n");
                 dim_print("  Audio driver diagnostics + test tone.\n");
                 dim_print("  Reports active driver (AC97 / HDA / none),\n");
-                dim_print("  DMA ring state, IRQ line, and all AC97\n");
+                dim_print("  DMA ring state, IRQ line, volume, and\n");
                 dim_print("  hardware registers to serial COM1.\n");
-                dim_print("  Then plays a 440 Hz sine tone (0.5 s)\n");
-                dim_print("  through all available audio outputs.\n");
+                dim_print("  Then plays a 440 Hz sine tone (0.5 s).\n");
                 dim_print("  Use: soundtest\n");
+                return;
+            }
+            "vol" => {
+                puts("vol [0-100]\n");
+                dim_print("  Show or set master volume.\n");
+                dim_print("  vol       — show current volume\n");
+                dim_print("  vol 80    — set volume to 80%\n");
+                dim_print("  vol +10   — increase by 10%\n");
+                dim_print("  vol -10   — decrease by 10%\n");
+                return;
+            }
+            "mute" => {
+                puts("mute\n");
+                dim_print("  Toggle mute (set volume to 0 / restore).\n");
                 return;
             }
             "aai" => {
@@ -865,6 +880,7 @@ fn help_display() {
     help_row2("free",          "Memory overview",         "meminfo",       "Detailed mem stats");
     help_row2("lsmem",         "Memory region list",      "lspci",         "PCI device listing");
     help_row2("lsblk",         "Block devices",           "soundtest",     "Audio diagnostics");
+    help_row2("vol [0-100]",   "Volume control",          "mute",          "Toggle mute");
     help_row2("fdisk <dev>",   "Partition info",          "mkfs",          "Format partition");
     help_row2("mount",         "Mount filesystem",        "dump_disk",     "Hex dump LBA 2048");
 
@@ -1400,6 +1416,84 @@ fn cmd_dump_disk(_args: &str) {
     }
 }
 
+// ─── vol — volume control ────────────────────────────────────────────────────
+
+fn simple_parse_u8(s: &str) -> u8 {
+    let mut val: u16 = 0;
+    for &b in s.as_bytes() {
+        if b >= b'0' && b <= b'9' {
+            val = val * 10 + (b - b'0') as u16;
+            if val > 255 { return 255; }
+        } else {
+            break;
+        }
+    }
+    val as u8
+}
+
+/// Saved volume before mute (for toggle restore).
+static mut PRE_MUTE_VOL: u8 = 80;
+
+fn cmd_vol(args: &str) {
+    use ospab_os::drivers::audio;
+
+    if !audio::is_ready() {
+        framebuffer::draw_string("No audio driver active.\n", FG_ERR, BG);
+        return;
+    }
+
+    let arg = args.trim();
+    if arg.is_empty() {
+        // Show current volume
+        let v = audio::volume();
+        puts("Volume: ");
+        print_dec(v as u64);
+        puts("%\n");
+        return;
+    }
+
+    // Parse argument: plain number, or +N / -N
+    let new_vol = if let Some(rest) = arg.strip_prefix('+') {
+        let delta = simple_parse_u8(rest);
+        audio::volume().saturating_add(delta).min(100)
+    } else if let Some(rest) = arg.strip_prefix('-') {
+        let delta = simple_parse_u8(rest);
+        audio::volume().saturating_sub(delta)
+    } else {
+        simple_parse_u8(arg).min(100)
+    };
+
+    audio::set_volume(new_vol);
+    puts("Volume: ");
+    print_dec(new_vol as u64);
+    puts("%\n");
+}
+
+fn cmd_mute() {
+    use ospab_os::drivers::audio;
+
+    if !audio::is_ready() {
+        framebuffer::draw_string("No audio driver active.\n", FG_ERR, BG);
+        return;
+    }
+
+    let cur = audio::volume();
+    if cur == 0 {
+        // Unmute — restore previous volume
+        let restore = unsafe { PRE_MUTE_VOL };
+        let restore = if restore == 0 { 80 } else { restore };
+        audio::set_volume(restore);
+        puts("Unmuted (");
+        print_dec(restore as u64);
+        puts("%)\n");
+    } else {
+        // Mute — save current volume, set to 0
+        unsafe { PRE_MUTE_VOL = cur; }
+        audio::set_volume(0);
+        puts("Muted\n");
+    }
+}
+
 // ─── soundtest — audio subsystem diagnostics + 440 Hz test tone ──────────────
 
 fn cmd_soundtest() {
@@ -1433,6 +1527,20 @@ fn cmd_soundtest() {
     serial::write_str("\r\n");
     puts("IRQ line      : "); print_dec(irq as u64); puts("\n");
 
+    // ── Sample rate ──────────────────────────────────────────────────────────
+    let rate = audio::sample_rate();
+    puts("Sample rate   : "); print_dec(rate as u64); puts(" Hz\n");
+
+    // ── Volume ───────────────────────────────────────────────────────────────
+    let vol = audio::volume();
+    puts("Volume        : "); print_dec(vol as u64); puts("%\n");
+
+    // ── HDA DMA position ─────────────────────────────────────────────────────
+    if driver == "HDA" && ready {
+        let lpib = audio::hda::dma_position();
+        puts("DMA position  : "); print_dec(lpib as u64); puts(" / 32768\n");
+    }
+
     // ── AC97-specific DMA state ───────────────────────────────────────────────
     if driver == "AC97" && ready {
         let (civ, fill, in_flight) = audio::ac97::dma_status();
@@ -1443,10 +1551,13 @@ fn cmd_soundtest() {
         serial::write_str("  in_flight=");
         serial::write_str(ospab_os::format_u64(&mut nbuf, in_flight as u64));
         serial::write_str("\r\n");
+        puts("CIV="); print_dec(civ as u64);
+        puts(" FILL="); print_dec(fill as u64);
+        puts(" in_flight="); print_dec(in_flight as u64); puts("\n");
     }
 
-    // ── full register dump (serial only, driver-agnostic) ────────────────────
-    puts("Full register dump → serial COM1.\n");
+    // ── full register dump (serial) ──────────────────────────────────────────
+    puts("Full register dump -> serial COM1.\n");
     audio::dump_status();
     audio::dump_mem_map();
 
@@ -1515,7 +1626,7 @@ fn cmd_soundtest() {
 
     puts("Bytes submitted : "); print_dec(total_bytes as u64); puts("\n");
     framebuffer::draw_string("Test tone queued to audio driver.\n", FG_OK, BG);
-    dim_print("Full register dump on serial COM1 (115200 baud).\n");
+    puts("Tip: use 'vol <0-100>' to adjust volume.\n");
 }
 
 fn cmd_reboot() {
@@ -2314,7 +2425,8 @@ fn tutor_commands() {
     framebuffer::draw_string("  Hardware & Memory:\n", FG_WARN, BG);
     dim_print("  free          Memory overview         meminfo      Detailed stats\n");
     dim_print("  lsmem         Memory region list      lspci        PCI devices\n");
-    dim_print("  lsblk         Block devices           soundtest    Audio diag\n\n");
+    dim_print("  lsblk         Block devices           soundtest    Audio diag\n");
+    dim_print("  vol [0-100]   Volume control          mute         Toggle mute\n\n");
 
     // Disk & Storage
     framebuffer::draw_string("  Disk & Storage:\n", FG_WARN, BG);
