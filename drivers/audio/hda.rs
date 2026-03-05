@@ -762,20 +762,15 @@ pub fn write_pcm(pcm: &[u8]) {
     if !AUDIO_READY.load(Ordering::Relaxed) { return; }
 
     unsafe {
-        let ring = [
-            core::slice::from_raw_parts_mut(DMA_BUF_VIRT[0] as *mut u8, DMA_BUF_SIZE),
-            core::slice::from_raw_parts_mut(DMA_BUF_VIRT[1] as *mut u8, DMA_BUF_SIZE),
-        ];
-
         let mut remaining = pcm;
         while !remaining.is_empty() {
-            let buf_idx   = WRITE_POS / DMA_BUF_SIZE;
-            let buf_off   = WRITE_POS % DMA_BUF_SIZE;
-            let space     = DMA_BUF_SIZE - buf_off;
-            let copy_len  = space.min(remaining.len());
+            let buf_idx  = (WRITE_POS / DMA_BUF_SIZE) % DMA_ENTRIES;
+            let buf_off  = WRITE_POS % DMA_BUF_SIZE;
+            let space    = DMA_BUF_SIZE - buf_off;
+            let copy_len = space.min(remaining.len());
 
-            ring[buf_idx % DMA_ENTRIES][buf_off..buf_off + copy_len]
-                .copy_from_slice(&remaining[..copy_len]);
+            let dst = (DMA_BUF_VIRT[buf_idx] + buf_off as u64) as *mut u8;
+            core::ptr::copy_nonoverlapping(remaining.as_ptr(), dst, copy_len);
 
             WRITE_POS = (WRITE_POS + copy_len) % DMA_TOTAL;
             remaining = &remaining[copy_len..];
