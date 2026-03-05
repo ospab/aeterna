@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 8259 PIC (Programmable Interrupt Controller) driver for AETERNA microkernel.
 Remaps IRQ 0-15 to IDT vectors 32-47.

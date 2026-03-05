@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Central version constants for ospab.os / AETERNA kernel.
 After each build iteration, increment PATCH (0-99), then MINOR, etc.

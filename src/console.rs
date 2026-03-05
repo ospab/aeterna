@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 CUI console: 80x25 VGA text, newline, scroll. Shared for boot log and terminal.
 */

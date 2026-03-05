@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Physical memory manager for AETERNA microkernel.
 Parses Limine memory map, tracks usable regions, provides frame allocation.

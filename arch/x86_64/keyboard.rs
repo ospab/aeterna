@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 PS/2 keyboard driver: interrupt-driven via IRQ1 buffer + scancode decoding.
 US QWERTY layout. Supports Shift, CapsLock, Ctrl+C, Backspace, Tab, Escape.

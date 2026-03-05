@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Low-level memory functions (memcpy, memset, memmove) for no_std kernel.
 */

@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Boot log: Linux-style init messages to VGA + serial (manifest p.20).
 */

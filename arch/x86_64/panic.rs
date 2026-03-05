@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Global panic handler: framebuffer-based, NEVER halts.
 Displays red KERNEL PANIC banner + event log + panic info.

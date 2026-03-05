@@ -1,5 +1,5 @@
 ﻿/*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Interrupt Descriptor Table (IDT) and exception handlers for AETERNA microkernel.
 Rewritten for proper PIC support and diagnostic output (tech-manifest п.4, п.8).

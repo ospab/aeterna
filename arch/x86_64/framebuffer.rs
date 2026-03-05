@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Framebuffer output: pixel-level control + 8x16 VGA text rendering.
 Supports scrolling, cursor tracking, and optimized row copy.

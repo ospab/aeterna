@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Standard 8x16 VGA BIOS font (CP437 compatible).
 Each glyph is 8 pixels wide, 16 pixels tall.

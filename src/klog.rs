@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Kernel event log: lock-free ring buffer for last N events.
 Used by panic handler and diagnostic tools.

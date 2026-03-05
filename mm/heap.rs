@@ -1,5 +1,5 @@
 /*
-Boost Software License - Version 1.1
+Business Source License 1.1
 Copyright (c) 2026 ospab
 Kernel heap allocator for AETERNA microkernel.
 Uses linked_list_allocator backed by physical memory from Limine.
