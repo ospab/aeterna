@@ -26,7 +26,7 @@ const BUILTINS: &[&str] = &[
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
     "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",
-    "ps", "top",
+    "ps", "top", "bench",
 ];
 
 extern crate alloc;
@@ -615,6 +615,7 @@ fn execute_command(cmd: &str) {
         "bash"    => cmd_bash(args),
         "doom"    => cmd_doom(args),
         "aai"     => cmd_aai(args),
+        "bench"   => cmd_bench(args),
         "export"  => { ospab_os::plum::preprocess(&alloc::format!("export {}", args)); }
         "alias"   => { ospab_os::plum::preprocess(&alloc::format!("alias {}", args)); }
         "unalias" => { ospab_os::plum::preprocess(&alloc::format!("unalias {}", args)); }
@@ -889,6 +890,10 @@ fn help_display() {
     help_row2("aai load <f>",  "Load .tmt-ai model",      "aai info",      "Model metadata");
     help_row2("aai bench",     "SIMD GEMM benchmark",     "aai chat <t>",  "Run inference");
     help_row1("aai summarize", "Entropy + text statistics    (see: tutor ai  /  help aai)");
+
+    // BENCHMARKS
+    help_sec("BENCHMARKS");
+    help_row1("bench [iters]", "System Latency Tax (RDTSC FMA cycles)  default 2048 iterations");
 
     // SHELL BUILTINS
     help_sec("SHELL BUILTINS  (plum)");
@@ -2085,6 +2090,10 @@ fn cmd_doom(_args: &str) {
     // After exit, we're back in the terminal
     puts("\n");
     dim_print("Welcome back to AETERNA.\n");
+}
+
+fn cmd_bench(args: &str) {
+    ospab_os::bench::run(args);
 }
 
 fn cmd_aai(args: &str) {

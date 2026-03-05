@@ -76,6 +76,9 @@ pub mod ane;
 #[path = "../userland/aai/src/lib.rs"]
 pub mod aai;
 
+// bench — System Latency Tax benchmark (RDTSC FMA workload)
+pub mod bench;
+
 // ─── Tiny formatting helpers (no_std, no alloc) ─────────────────────────────
 
 /// Format a u64 as decimal ASCII into `buf` (must be ≥ 8 bytes).

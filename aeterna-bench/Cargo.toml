@@ -1,0 +1,20 @@
+[package]
+name       = "aeterna-bench"
+version    = "1.0.0"
+authors    = ["ospab"]
+edition    = "2021"
+description = "aeterna-bench — System Latency Tax benchmark (Linux companion binary)"
+repository  = "https://github.com/ospab/aeterna"
+
+# No external dependencies — pure Rust, stdlib only.
+[dependencies]
+
+[[bin]]
+name = "aeterna-bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug     = false
+lto       = true      # whole-program FMA optimisation
+codegen-units = 1     # single CGU for reproducible inlining

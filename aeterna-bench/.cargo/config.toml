@@ -1,0 +1,23 @@
+# aeterna-bench local cargo config
+#
+# Purpose: Override the workspace-root .cargo/config.toml so this crate
+#          compiles as a standard std binary, not the bare-metal kernel target.
+#
+# Strategy:
+#   • rust-toolchain.toml pins this crate to stable.
+#   • Stable cargo silently ignores parent's [unstable] build-std entries,
+#     so the pre-compiled std from rustup is used automatically.
+#   • [build] target here overrides the parent's x86_64-ospab.json.
+#
+# Windows (native):
+#   cd aeterna-bench && cargo build --release
+#
+# Linux / WSL:
+#   cd aeterna-bench && cargo build --release
+#   (host default becomes x86_64-unknown-linux-gnu on Linux)
+#   Or explicitly: cargo build --release --target x86_64-unknown-linux-gnu
+
+[build]
+# Native Windows host default; Linux users can pass --target to override,
+# or rely on the host default when building from a Linux shell.
+target = "x86_64-pc-windows-msvc"
