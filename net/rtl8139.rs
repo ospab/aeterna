@@ -53,6 +53,24 @@ static mut MAC: [u8; 6] = [0; 6];
 static mut TX_CUR: u8 = 0;
 static mut RX_OFFSET: usize = 0;
 static mut INITIALIZED: bool = false;
+static DETACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Detach the kernel driver from the hardware.
+/// Used when a userspace driver takes over.
+pub fn detach() {
+    DETACHED.store(true, core::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        if INITIALIZED && IO_BASE != 0 {
+            // Mask all interrupts
+            let io = IO_BASE;
+            unsafe {
+                asm!("out dx, ax", in("dx") io + 0x3C, in("ax") 0u16, options(nomem, nostack)); // REG_IMR
+                asm!("out dx, ax", in("dx") io + 0x3E, in("ax") 0xFFFFu16, options(nomem, nostack)); // REG_ISR
+            }
+            crate::arch::x86_64::serial::write_str("[RTL8139] Kernel driver DETACHED\r\n");
+        }
+    }
+}
 
 /// Read a PCI config u32
 fn pci_read(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
@@ -248,7 +266,7 @@ pub fn mac_address() -> [u8; 6] {
 }
 
 pub fn is_initialized() -> bool {
-    unsafe { INITIALIZED }
+    unsafe { INITIALIZED && !DETACHED.load(core::sync::atomic::Ordering::Relaxed) }
 }
 
 /// Expose I/O base for diagnostics
@@ -377,6 +395,7 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
 
 /// Handle IRQ from RTL8139 - acknowledge interrupt
 pub fn handle_irq() {
+    if DETACHED.load(core::sync::atomic::Ordering::Relaxed) { return; }
     unsafe {
         if !INITIALIZED { return; }
         let isr = inw(IO_BASE + REG_ISR);

@@ -517,6 +517,23 @@ fn dir_remove_entry(st: &AeternaFsState, dir_ino: u32, name: &str) -> bool {
 impl FileSystem for AeternaFs {
     fn name(&self) -> &str { "aeternafs" }
 
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let content = self.read_file(path)?;
+        if offset >= content.len() { return Some(0); }
+        let to_copy = buf.len().min(content.len() - offset);
+        buf[..to_copy].copy_from_slice(&content[offset..offset + to_copy]);
+        Some(to_copy)
+    }
+
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> bool {
+        let mut content = self.read_file(path).unwrap_or_default();
+        if content.len() < offset + data.len() {
+            content.resize(offset + data.len(), 0);
+        }
+        content[offset..offset + data.len()].copy_from_slice(data);
+        self.write_file(path, &content)
+    }
+
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let st = self.state.lock();
         if !st.ready { return None; }

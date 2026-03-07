@@ -21,6 +21,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{DirEntry, FileSystem, NodeType};
@@ -39,10 +40,6 @@ pub enum RamNode {
 
 /// Simple spin lock for single-core (no contention, just prevents reentrance)
 static LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Set to true in main.rs to indicate the storage layer is ready.
-/// Actual sync scheduling now uses IS_DIRTY + deferred_tick().
-pub static AUTOSYNC_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// True when RamFS has unflushed changes.
 /// Set by every mutation; cleared by sync_filesystem() after a successful flush.
@@ -109,7 +106,7 @@ pub fn init() {
         tree.insert(
             String::from("/etc/os-release"),
             RamNode::File(Vec::from(
-                b"NAME=\"ospab.os\"\nVERSION=\"2.0.3\"\nID=ospab\nPRETTY_NAME=\"ospab.os 2.0.3 (AETERNA)\"\nHOME_URL=\"https://github.com/nicorp/ospab-os\"\nBUILD_ID=nightly\n" as &[u8],
+                b"NAME=\"ospab.os\"\nVERSION=\"1.0.0\"\nID=ospab\nPRETTY_NAME=\"ospab.os 1.0.0 (AETERNA)\"\nHOME_URL=\"https://github.com/nicorp/ospab-os\"\nBUILD_ID=nightly\n" as &[u8],
             )),
         );
 
@@ -143,18 +140,26 @@ pub fn init() {
             )),
         );
 
+        // /CHANGELOG.md
+        tree.insert(
+            String::from("/CHANGELOG.md"),
+            RamNode::File(Vec::from(
+                b"# AETERNA Changelog\n\n## [1.0.0] - 2026-03-05\n- First public release of AETERNA microkernel\n- POSIX-style VFS layer with RamFS and AHCI sync\n- Networking via RTL8139 and Intel e1000 (ARP, IP, ICMP, UDP, SNTP)\n- Interactive shell (plum) with env, aliases, and bash scripts\n- Text editor (grape) and package manager (tomato)\n- Port of DOOM (doomgeneric) running on bare metal\n- Internal Verification Suite (IVS) for mem/sched/net/audio\n- Compute-First preemptive scheduler with Capability-based security\n- SIMD-accelerated Aeterna Neural Engine (ANE) for AI inference\n" as &[u8],
+            )),
+        );
+
         // /info/welcome.txt
         tree.insert(
             String::from("/info/welcome.txt"),
             RamNode::File(Vec::from(
-                b"Welcome to AETERNA!\n\nThis is ospab.os v2.0.3, a microkernel operating system\nwritten from scratch in Rust. This file is stored in RamFS --\na real in-memory filesystem.\n\nTry:\n  ls /       -- directory listing\n  cat /etc/os-release\n  mkdir /tmp/test\n  touch /tmp/test/hello.txt\n  echo Hello, AETERNA! > /tmp/test/hello.txt\n  cat /tmp/test/hello.txt\n" as &[u8],
+                b"Welcome to AETERNA!\n\nThis is ospab.os v1.0.0, a research kernel\nwritten from scratch in Rust. This file is stored in RamFS --\na real in-memory filesystem.\n\nTry:\n  ls /       -- directory listing\n  cat /etc/os-release\n  mkdir /tmp/test\n  touch /tmp/test/hello.txt\n  echo Hello, AETERNA! > /tmp/test/hello.txt\n  cat /tmp/test/hello.txt\n" as &[u8],
             )),
         );
 
         // /boot/KERNEL (metadata, not real binary)
         tree.insert(
             String::from("/boot/KERNEL"),
-            RamNode::File(Vec::from(b"AETERNA 2.0.3 x86_64 ELF64\n" as &[u8])),
+            RamNode::File(Vec::from(b"AETERNA 1.0.0 x86_64 ELF64\n" as &[u8])),
         );
 
         // /boot/limine.conf (copy of real config)
@@ -237,6 +242,71 @@ unsafe impl Sync for RamFsInstance {}
 impl FileSystem for RamFsInstance {
     fn name(&self) -> &str {
         "ramfs"
+    }
+
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let path = normalize(path);
+        lock();
+        let result = unsafe {
+            let tree = TREE.as_ref()?;
+            match tree.get(&path) {
+                Some(RamNode::File(data)) => {
+                    if offset >= data.len() {
+                        Some(0)
+                    } else {
+                        let available = data.len() - offset;
+                        let to_copy = available.min(buf.len());
+                        buf[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
+                        Some(to_copy)
+                    }
+                }
+                _ => None, // Not a file or doesn't exist
+            }
+        };
+        unlock();
+        result
+    }
+
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> bool {
+        let path = normalize(path);
+        lock();
+        let ok = unsafe {
+            match TREE.as_mut() {
+                Some(tree) => {
+                    match tree.get_mut(&path) {
+                        Some(RamNode::File(existing)) => {
+                            let end = offset + data.len();
+                            if existing.len() < end {
+                                existing.resize(end, 0);
+                            }
+                            existing[offset..end].copy_from_slice(data);
+                            true
+                        }
+                        _ => {
+                            // File doesn't exist or is a directory — if not dir, create it
+                            if tree.contains_key(&path) {
+                                // Exists but it's a directory
+                                false
+                            } else {
+                                // Auto-create parent dirs
+                                let par = parent(&path);
+                                if par != "/" && !tree.contains_key(&par) {
+                                    self.mkdir_internal(tree, &par);
+                                }
+                                let mut file_data = vec![0u8; offset + data.len()];
+                                file_data[offset..offset + data.len()].copy_from_slice(data);
+                                tree.insert(path, RamNode::File(file_data));
+                                true
+                            }
+                        }
+                    }
+                }
+                None => false,
+            }
+        };
+        unlock();
+        if ok { crate::fs::disk_sync::mark_dirty(); }
+        ok
     }
 
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
@@ -469,6 +539,62 @@ impl FileSystem for RamFsInstance {
         if ok { crate::fs::disk_sync::mark_dirty(); }
         ok
     }
+
+    fn rename(&self, from: &str, to: &str) -> bool {
+        let from_path = normalize(from);
+        let to_path = normalize(to);
+        if from_path == to_path { return true; }
+
+        lock();
+        let ok = unsafe {
+            let tree = match TREE.as_mut() {
+                Some(t) => t,
+                None => { unlock(); return false; }
+            };
+
+            // Check source exists
+            if !tree.contains_key(&from_path) {
+                false
+            } else {
+                // Collect all entries to move (source + children for directories)
+                let prefix = alloc::format!("{}/", from_path);
+                let mut moves: Vec<(String, RamNode)> = Vec::new();
+
+                // Remove the source node itself
+                if let Some(node) = tree.remove(&from_path) {
+                    moves.push((to_path.clone(), node));
+                }
+
+                // Collect children (for directories)
+                let children: Vec<String> = tree.keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+
+                for child_key in children {
+                    if let Some(node) = tree.remove(&child_key) {
+                        let new_key = alloc::format!("{}{}", to_path, &child_key[from_path.len()..]);
+                        moves.push((new_key, node));
+                    }
+                }
+
+                // Ensure parent directory of destination exists
+                let par = parent(&to_path);
+                if par != "/" && !tree.contains_key(&par) {
+                    self.mkdir_internal(tree, &par);
+                }
+
+                // Insert all at new paths
+                for (path, node) in moves {
+                    tree.insert(path, node);
+                }
+                IS_DIRTY.store(true, Ordering::Relaxed);
+                true
+            }
+        };
+        unlock();
+        ok
+    }
 }
 
 impl RamFsInstance {
@@ -505,7 +631,7 @@ pub fn refresh_proc_files() {
             // /proc/version
             tree.insert(
                 String::from("/proc/version"),
-                RamNode::File(Vec::from(b"AETERNA 2.0.3 ospab.os x86_64 AETERNA/Microkernel\n" as &[u8])),
+                RamNode::File(Vec::from(b"AETERNA 1.0.0 ospab.os x86_64 AETERNA/Microkernel\n" as &[u8])),
             );
 
             // /proc/cpuinfo

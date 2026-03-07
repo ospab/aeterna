@@ -1336,7 +1336,10 @@ pub fn tmt_dispatch(args: &str) {
                 String::from(output)
             };
 
-            // Pack an empty stub package (real packaging requires more context)
+            warn("  [SIMULATION MODE] No source files specified; output contains 0 embedded files.\n");
+            warn("  To bundle real files use the tmt_pack() API directly with a files slice.\n\n");
+
+            // Pack a stub package (header + metadata, no embedded files)
             let meta = [("description", "AETERNA binary package")];
             let files: &[(&str, &[u8])] = &[];
             let blob = tmt_pack(pkg_name, pkg_ver, TMT_ARCH_X64, &meta, files);

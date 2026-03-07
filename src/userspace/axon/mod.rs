@@ -105,6 +105,7 @@ pub fn dispatch(command: &str, args: &str) -> bool {
         "netstat"      => { netstat::run(args); true }
         "df"           => { net_tools::cmd_df(args); true }
         "ping"         => { ping::run(args); true }
+        "traceroute"   => { net_tools::cmd_traceroute(args); true }
         "lspci"        => { lspci::run(args); true }
         "fdisk"        => { disk_tools::run_fdisk(args); true }
         "lsblk"        => { disk_tools::run_lsblk(args); true }
@@ -1461,25 +1462,67 @@ fn cmd_printf(args: &str) {
 // \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 
 fn cmd_env(args: &str) {
-    if !args.is_empty() {
-        // Try to run command with env vars (just dispatch the rest)
-        dim("env: command exec not yet supported вЂ” showing environment\n\n");
+    // Parse: [KEY=VAL ...] [cmd [args...]]
+    // Leading KEY=VAL tokens are set in the environment; remaining tokens are
+    // the command to execute.  With no arguments, print the current environment.
+    let mut rest = args.trim();
+    let mut overrides: alloc::vec::Vec<(&str, &str)> = alloc::vec::Vec::new();
+
+    loop {
+        let token = rest.splitn(2, ' ').next().unwrap_or("").trim();
+        if token.is_empty() { break; }
+        if let Some(eq) = token.find('=') {
+            let key = &token[..eq];
+            let val = &token[eq+1..];
+            // Only treat as env override if key looks like a shell identifier
+            let is_id = key.bytes().next()
+                .map_or(false, |b| b.is_ascii_alphabetic() || b == b'_')
+                && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if is_id {
+                overrides.push((key, val));
+                rest = rest[token.len()..].trim();
+                continue;
+            }
+        }
+        break;
     }
-    // Print current shell environment from plum
-    let env = plum::get_env();
-    if env.is_empty() {
-        dim("(no environment variables set)\n");
-    } else {
-        for (k, v) in &env {
-            puts(k); puts("="); puts(v); puts("\n");
+
+    if rest.is_empty() {
+        let env = plum::get_env();
+        if env.is_empty() {
+            dim("(no environment variables set)\n");
+        } else {
+            for (k, v) in &env {
+                puts(k); puts("="); puts(v); puts("\n");
+            }
+        }
+        return;
+    }
+
+    let (cmd, cmd_args) = match rest.find(' ') {
+        Some(pos) => (&rest[..pos], rest[pos+1..].trim()),
+        None      => (rest, ""),
+    };
+
+    let mut saved: alloc::vec::Vec<(alloc::string::String, Option<alloc::string::String>)>
+        = alloc::vec::Vec::new();
+    for (k, v) in &overrides {
+        let old = plum::getenv(k).map(alloc::string::String::from);
+        plum::setenv(k, v);
+        saved.push((alloc::string::String::from(*k), old));
+    }
+
+    if !dispatch(cmd, cmd_args) {
+        err(cmd); err(": command not found\n");
+    }
+
+    for (k, old) in saved {
+        match old {
+            Some(v) => plum::setenv(&k, &v),
+            None    => plum::unsetenv(&k),
         }
     }
 }
-
-// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-// which \ Show which subsystem provides a command
-// \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-
 fn cmd_which(args: &str) {
     let cmd = args.trim();
     if cmd.is_empty() {
@@ -1550,7 +1593,7 @@ pub fn command_list() -> &'static [&'static str] {
         "stat", "du", "tree", "basename", "dirname", "yes", "true",
         "false", "seq", "sort", "uniq", "cut", "rev", "xxd", "nl",
         "diff", "awk", "ps", "top", "kill",
-        "netstat", "df", "ping", "printf", "env", "which", "xargs",
+        "netstat", "df", "ping", "traceroute", "printf", "env", "which", "xargs",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }

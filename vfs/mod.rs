@@ -25,9 +25,11 @@ extern crate alloc;
 pub mod ramfs;
 pub mod disk_sync;
 pub mod aeternafs;
+pub mod procfs;
 
 // Re-export RamNode for disk_sync serialization
 pub use ramfs::RamNode;
+use alloc::boxed::Box;
 
 // Helper for disk_sync
 pub fn get_tree_copy() -> Option<alloc::collections::BTreeMap<String, RamNode>> {
@@ -63,9 +65,16 @@ pub trait FileSystem: Send + Sync {
     /// Name of this filesystem (e.g., "ramfs", "ext2")
     fn name(&self) -> &str;
 
-    /// Read the contents of a file at the given path (relative to mount point).
-    /// Returns None if the file does not exist.
+    /// Read data from a file starting at offset into a buffer.
+    /// Returns number of bytes read.
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize>;
+
+    /// Read the entire content of a file.
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
+
+    /// Write data to a file starting at offset from a buffer.
+    /// Returns true on success.
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> bool;
 
     /// Write data to a file, creating it if it doesn't exist.
     /// Returns true on success.
@@ -93,6 +102,66 @@ pub trait FileSystem: Send + Sync {
 
     /// Remove a file. Returns true on success.
     fn remove(&self, path: &str) -> bool;
+
+    /// Rename/move a file or directory. Returns true on success.
+    fn rename(&self, _from: &str, _to: &str) -> bool { false }
+}
+
+// ─── Userspace FS Proxy ──────────────────────────────────────────────────────
+
+/// A proxy that forwards VFS calls to a userspace server process via IPC.
+pub struct UserFs {
+    pub server_pid: u32,
+    pub channel_id: u32,
+    pub name: String,
+}
+
+impl FileSystem for UserFs {
+    fn name(&self) -> &str { &self.name }
+
+    fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        crate::arch::x86_64::serial::write_str("[VFS-PROXY] read_at forwarded to PID ");
+        serial_dec(self.server_pid as u64);
+        crate::arch::x86_64::serial::write_str(" via CH ");
+        serial_dec(self.channel_id as u64);
+        crate::arch::x86_64::serial::write_str("\r\n");
+        
+        // In a full implementation, we allocate a desc, write opcode/path, send, and wait.
+        // For now, just simulate sending the request.
+        crate::core::ipc::userspace_ipc::send_to_channel(self.channel_id, 0, 0); // Placeholder phys_addr
+        
+        None
+    }
+
+    fn read_file(&self, _path: &str) -> Option<Vec<u8>> { None }
+
+    fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> bool {
+        crate::arch::x86_64::serial::write_str("[VFS-PROXY] write_at forwarded to PID ");
+        serial_dec(self.server_pid as u64);
+        crate::arch::x86_64::serial::write_str(" via CH ");
+        serial_dec(self.channel_id as u64);
+        crate::arch::x86_64::serial::write_str("\r\n");
+
+        crate::core::ipc::userspace_ipc::send_to_channel(self.channel_id, 0, 0); // Placeholder phys_addr
+
+        false
+    }
+
+    fn write_file(&self, _path: &str, _data: &[u8]) -> bool { false }
+    fn append_file(&self, _path: &str, _data: &[u8]) -> bool { false }
+    fn readdir(&self, _path: &str) -> Option<Vec<DirEntry>> { None }
+    fn mkdir(&self, _path: &str) -> bool { false }
+    fn touch(&self, _path: &str) -> bool { false }
+    fn exists(&self, _path: &str) -> bool { false }
+    fn stat(&self, _path: &str) -> Option<DirEntry> { None }
+    fn remove(&self, _path: &str) -> bool { false }
+}
+
+fn serial_dec(mut val: u64) {
+    if val == 0 { crate::arch::x86_64::serial::write_byte(b'0'); return; }
+    let mut buf = [0u8; 20]; let mut i = 0;
+    while val > 0 { buf[i] = b'0' + (val % 10) as u8; val /= 10; i += 1; }
+    for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
 }
 
 // ─── Mount table ────────────────────────────────────────────────────────────
@@ -207,6 +276,18 @@ pub fn mount(path: &str, fs: &'static dyn FileSystem) -> bool {
     true
 }
 
+/// Register a userspace process as a filesystem server for a given path.
+pub fn register_userspace_fs(path: &str, server_pid: u32, channel_id: u32) -> bool {
+    let name = alloc::format!("userfs-{}", server_pid);
+    let fs = Box::leak(Box::new(UserFs {
+        server_pid,
+        channel_id,
+        name,
+    }));
+
+    mount(path, fs)
+}
+
 // ─── Path resolution ────────────────────────────────────────────────────────
 
 /// Find the filesystem that handles a given absolute path.
@@ -310,6 +391,21 @@ pub fn remove(path: &str) -> bool {
     }
 }
 
+/// Rename/move a file or directory
+pub fn rename(from: &str, to: &str) -> bool {
+    match resolve(from) {
+        Some((fs, rel_from)) => {
+            // Compute relative 'to' path within the same mount
+            let rel_to = match resolve(to) {
+                Some((_, rel)) => rel,
+                None => return false,
+            };
+            fs.rename(&rel_from, &rel_to)
+        }
+        None => false,
+    }
+}
+
 // ─── File descriptor operations ─────────────────────────────────────────────
 
 /// Open a file, returning a file descriptor number.
@@ -384,21 +480,19 @@ pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
         let path = &fds[fd].path;
         let offset = fds[fd].offset;
 
-        match read_file(path) {
-            Some(data) => {
-                if offset >= data.len() {
-                    return 0; // EOF
-                }
-                let available = data.len() - offset;
-                let to_copy = available.min(buf.len());
-                buf[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
+        // Resolve absolute VFS path to (filesystem, RelativePath)
+        let (fs, rel_path) = match resolve(path) {
+            Some(res) => res,
+            None => return -1,
+        };
 
+        match fs.read_at(&rel_path, offset, buf) {
+            Some(bytes_read) => {
                 // Update offset (need mutable access)
                 if let Some(fds_mut) = FD_TABLE.as_mut() {
-                    fds_mut[fd].offset += to_copy;
+                    fds_mut[fd].offset += bytes_read;
                 }
-
-                to_copy as i64
+                bytes_read as i64
             }
             None => -1,
         }
@@ -428,18 +522,13 @@ pub fn sys_write(fd: usize, data: &[u8]) -> i64 {
         let path = fds[fd].path.clone();
         let offset = fds[fd].offset;
 
-        // Read existing content so we can patch it at the current fd offset.
-        // This is essential for DOOM saves: fwrite is called many times with
-        // small chunks — we must accumulate them rather than replace the file.
-        let mut content = read_file(&path).unwrap_or_default();
+        // Resolve absolute VFS path to (filesystem, RelativePath)
+        let (fs, rel_path) = match resolve(&path) {
+            Some(res) => res,
+            None => return -1,
+        };
 
-        let end = offset + data.len();
-        if content.len() < end {
-            content.resize(end, 0);
-        }
-        content[offset..end].copy_from_slice(data);
-
-        if write_file(&path, &content) {
+        if fs.write_at(&rel_path, offset, data) {
             if let Some(fds_mut) = FD_TABLE.as_mut() {
                 fds_mut[fd].offset += data.len();
                 fds_mut[fd].dirty = true;

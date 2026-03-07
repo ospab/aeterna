@@ -7,7 +7,6 @@ All events logged to kernel ring buffer (klog) and serial.
 */
 #![no_std]
 #![no_main]
-#![allow(warnings)]
 
 extern crate alloc;
 
@@ -133,6 +132,10 @@ pub extern "C" fn _start() -> ! {
     boot_ok("Virtual memory manager (4-level page tables)");
     klog::memory("VMM initialized");
 
+    boot_pending("Deterministic Memory Fabric (MED)");
+    ospab_os::mm::numa::init();
+    boot_ok("Memory Fabric: MEDs initialized");
+
     // ══════════════════════════════════════════════
     // Phase 2.8: PCI bus enumeration
     // ══════════════════════════════════════════════
@@ -166,8 +169,10 @@ pub extern "C" fn _start() -> ! {
     ospab_os::fs::init();
     ospab_os::fs::ramfs::init();
     ospab_os::fs::mount("/", ospab_os::fs::ramfs::instance());
+    ospab_os::fs::mount("/proc", ospab_os::fs::procfs::instance());
     let node_count = ospab_os::fs::ramfs::node_count();
     boot_ok("VFS + RamFS mounted at /");
+    boot_ok("ProcFs mounted at /proc");
     klog::boot("VFS ready");
     serial::write_str("  RamFS: ");
     serial_u32(node_count as u32);
@@ -251,10 +256,7 @@ pub extern "C" fn _start() -> ! {
             boot_warn_new_fs();
         }
 
-        // ── Enable auto-sync: every VFS write will flush to disk ──
-        ospab_os::fs::ramfs::AUTOSYNC_ENABLED.store(true, core::sync::atomic::Ordering::SeqCst);
-        serial::write_str("[FS] Auto-sync ENABLED — all writes persist to disk\r\n");
-        boot_ok("Disk persistence: auto-sync enabled");
+        boot_ok("Disk persistence: deferred sync enabled");
     } else {
         boot_warn("Storage: no drives found (ATA/AHCI)");
         klog::boot("No storage devices");

@@ -489,6 +489,8 @@ unsafe fn configure_codec(codec: u8) {
     // ── 3. Power up every widget first (some codecs won't respond otherwise) ─
     for nid in widget_start..widget_end {
         imm_send(make_verb(codec, nid, VERB_SET_POWER_STATE, 0x00));
+        // AGGRESSIVE: Send EAPD enable to EVERY node. Some laptop vendors map EAPD to non-pin nodes.
+        imm_send(make_verb(codec, nid, VERB_SET_EAPD, 0x02));
     }
     wait_ticks(3);
 
@@ -572,7 +574,12 @@ unsafe fn configure_codec(codec: u8) {
                 imm_send(make_verb(codec, nid, 0x701, 0x00)); // SET_CONNECT_SEL = 0
             }
 
-            _ => {}
+            _ => {
+                // For unknown vendor-specific widgets, try to unmute their amps just in case
+                // they are proprietary mixers or volume dials hidden in the path.
+                imm_send(make_set_amp(codec, nid, 0xB07F)); // Unmute, max gain (out)
+                imm_send(make_set_amp(codec, nid, 0x707F)); // Unmute, max gain (in, idx 0)
+            }
         }
     }
 

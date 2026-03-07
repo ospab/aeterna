@@ -13,3 +13,4 @@ the VFS syscall layer (crate::fs::*).
 pub mod plum;
 pub mod axon;
 pub mod ivs;
+pub mod drivers;

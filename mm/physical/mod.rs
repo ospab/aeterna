@@ -8,6 +8,12 @@ Parses Limine memory map, tracks usable regions, provides frame allocation.
 /// Physical page frame size (4 KiB)
 pub const FRAME_SIZE: u64 = 4096;
 
+/// Huge page frame size (2 MiB) — for TENSOR mapping
+pub const HUGE_FRAME_SIZE: u64 = 2 * 1024 * 1024;
+
+/// Ultra huge page frame size (1 GiB) — for heavy AI models
+pub const GIGA_FRAME_SIZE: u64 = 1024 * 1024 * 1024;
+
 /// Maximum number of usable memory regions we track
 const MAX_REGIONS: usize = 64;
 
@@ -27,8 +33,18 @@ pub struct PhysMemStats {
     pub region_count: usize,
 }
 
-/// Simple bump allocator for physical frames
-/// Not optimized — sufficient for early boot and heap setup
+/// Simple bump allocator for physical frames.
+///
+/// # Design note — intentional one-way allocator (v1.0.0)
+///
+/// This allocator only advances a pointer forward; there is no `free_frame()`.
+/// Physical frames allocated here are permanent for the lifetime of the kernel.
+/// This is acceptable for v1.0.0 because:
+///   - The heap (linked_list_allocator) handles short-lived kernel allocations.
+///   - Long-lived objects (heap arena, AHCI/DMA buffers, address spaces) are
+///     never individually freed — they outlive the kernel.
+/// A slab/free-list allocator is planned for Phase 9+ once multi-process
+/// memory isolation requires frame recycling.
 static mut REGIONS: [PhysRegion; MAX_REGIONS] = [PhysRegion { base: 0, length: 0 }; MAX_REGIONS];
 static mut REGION_COUNT: usize = 0;
 static mut TOTAL_MEMORY: u64 = 0;
@@ -146,6 +162,38 @@ pub fn alloc_frames(count: u64) -> Option<u64> {
     }
 }
 
+/// Allocate a single 2 MiB huge frame.
+/// Returns physical address aligned to 2 MiB, or None.
+pub fn alloc_huge_frame() -> Option<u64> {
+    alloc_huge_frames(1)
+}
+
+/// Allocate contiguous 2 MiB huge frames.
+pub fn alloc_huge_frames(count: u64) -> Option<u64> {
+    let bytes_needed = count * HUGE_FRAME_SIZE;
+    unsafe {
+        for i in 0..REGION_COUNT {
+            let region = &REGIONS[i];
+            let region_end = region.base + region.length;
+
+            // Align current pointer to 2MB boundary
+            let start = (NEXT_FREE_FRAME + HUGE_FRAME_SIZE - 1) & !(HUGE_FRAME_SIZE - 1);
+            
+            // Adjust start to be within this region
+            let start = if start >= region.base { start } else {
+                (region.base + HUGE_FRAME_SIZE - 1) & !(HUGE_FRAME_SIZE - 1)
+            };
+
+            if start + bytes_needed <= region_end {
+                NEXT_FREE_FRAME = start + bytes_needed;
+                FRAMES_ALLOCATED += count * (HUGE_FRAME_SIZE / FRAME_SIZE);
+                return Some(start);
+            }
+        }
+        None
+    }
+}
+
 /// Get memory statistics
 pub fn stats() -> PhysMemStats {
     unsafe {
@@ -206,4 +254,8 @@ fn log_dec(mut val: u64) {
     for j in (0..i).rev() {
         crate::arch::x86_64::serial::write_byte(buf[j]);
     }
+}
+
+pub fn get_usable_regions() -> &'static [PhysRegion] {
+    unsafe { &REGIONS[..REGION_COUNT] }
 }

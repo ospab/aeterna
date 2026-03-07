@@ -363,6 +363,15 @@ pub fn run() {
     let mut locale_idx: usize = 0;
     const LOCALES: &[&str] = &["en_US.UTF-8","ru_RU.UTF-8","de_DE.UTF-8","fr_FR.UTF-8","zh_CN.UTF-8"];
 
+    let mut cursor = 0usize;
+    const MI_DRIVE: usize = 0;
+    const MI_LAYOUT: usize = 1;
+    const MI_HOSTNAME: usize = 2;
+    const MI_PASSWORD: usize = 3;
+    const MI_LOCALE: usize = 4;
+    const MI_INSTALL: usize = 5;
+    const MI_QUIT: usize = 6;
+
     loop {
         if ABORT.load(Ordering::Relaxed) { abort_screen(); return; }
 
@@ -374,155 +383,179 @@ pub fn run() {
         dim("                     "); hl("|\n");
         hl( "  +---------------------------------------------------+\n");
 
-        // [1] Drive
-        puts("  "); hl("[1]"); dim("  Storage device :  ");
+        let mut draw_item = |idx: usize, label: &str, val_str: &str, warn_flag: bool| {
+            if cursor == idx { hl("  > "); hl(label); } else { puts("    "); dim(label); }
+            if warn_flag { warn(val_str); } else { ok(val_str); }
+            puts("\n");
+        };
+
+        // [0] Drive
+        let mut drive_str = alloc::string::String::new();
+        let mut drive_warn = false;
         match sel_disk {
-            None => warn("(not selected)                         "),
+            None => { drive_str.push_str("(not selected)"); drive_warn = true; }
             Some(i) => if let Some(vd) = all_disks.get(i) {
-                ok("/dev/"); ok(vd.name()); puts("  "); put_size(vd.size_mb);
-                for _ in 0..14usize.saturating_sub(vd.name().len()) { puts(" "); }
-            } else { warn("(not selected)                         "); },
+                drive_str = alloc::format!("/dev/{} ({} MiB)", vd.name(), vd.size_mb);
+            } else { drive_str.push_str("(not selected)"); drive_warn = true; },
         }
-        match sel_disk { None => warn(" [--]\n"), Some(_) => ok(" [ OK ]\n") }
+        draw_item(MI_DRIVE, "Storage device :  ", &drive_str, drive_warn);
 
-        // [2] Partition layout
-        puts("  "); hl("[2]"); dim("  Partition layout:  ");
-        put_size(esp_mb); puts(" ESP + AETERNA root");
-        dim("               [ OK ]\n");
+        // [1] Partition layout
+        draw_item(MI_LAYOUT, "Partition layout:  ", &alloc::format!("{} MiB ESP + root", esp_mb), false);
 
-        // [3] Hostname
-        puts("  "); hl("[3]"); dim("  Hostname        :  ");
-        if hname_len == 0 { warn("(not set)"); } else {
-            for i in 0..hname_len { putc(hname_buf[i] as char); }
-        }
-        puts("\n");
+        // [2] Hostname
+        let hname = if hname_len == 0 { "(not set)" } else { unsafe { core::str::from_utf8_unchecked(&hname_buf[..hname_len]) } };
+        draw_item(MI_HOSTNAME, "Hostname        :  ", hname, hname_len == 0);
 
-        // [4] Password
-        puts("  "); hl("[4]"); dim("  Root password   :  ");
-        if pass_len == 0 { dim("(empty — no authentication)"); } else { ok("set"); }
-        puts("\n");
+        // [3] Password
+        let pwd_str = if pass_len == 0 { "(empty — no authentication)" } else { "set" };
+        draw_item(MI_PASSWORD, "Root password   :  ", pwd_str, pass_len == 0);
 
-        // [5] Locale
-        puts("  "); hl("[5]"); dim("  Locale          :  ");
-        ok(LOCALES[locale_idx]); puts("\n");
+        // [4] Locale
+        draw_item(MI_LOCALE, "Locale          :  ", LOCALES[locale_idx], false);
 
         hl( "  +---------------------------------------------------+\n\n");
-
+        
         // Disk scan info
         puts("  Detected disks: "); put_u64(all_disks.len() as u64);
         if all_disks.is_empty() { warn("  -- no disk found, attach virtual disk"); }
         else if ospab_os::drivers::nvme::is_initialized() { dim("  (includes NVMe)"); }
         puts("\n\n");
 
-        // Action row
         hl( "  +---------------------------------------------------+\n");
-        match sel_disk {
-            None => {
-                dim("  [i]"); dim("  Install "); warn("  <-- select a storage device first\n");
-            }
-            Some(_) => {
-                hl( "  [i]"); hl( "  Install "); ok( "  <-- all set, ready to install!\n");
-            }
-        }
-        puts("  "); dim("[q]  Quit installer\n");
+        // Install action
+        if cursor == MI_INSTALL { hl("  > Install\n"); } else { puts("    Install\n"); }
+        // Quit action
+        if cursor == MI_QUIT { hl("  > Quit installer\n"); } else { puts("    Quit installer\n"); }
         hl( "  +---------------------------------------------------+\n");
-        puts("\n  > ");
+
+        puts("\n  "); dim("Use Up/Down arrows to navigate, Enter to select."); puts("\n");
 
         let ch = loop { match keyboard::poll_key() { Some(c) => break c, None => unsafe { core::arch::asm!("hlt"); } } };
-        putc(ch); puts("\n");
 
         match ch {
-            '1' => {
-                draw_header();
-                puts("  Available disks:\n\n");
-                if all_disks.is_empty() {
-                    err("  No disks detected.\n\n");
-                    warn("  Attach a disk to QEMU:\n");
-                    dim("    -drive file=disk.img,format=raw,if=none,id=d0\n");
-                    dim("    -device ahci,id=ahci0 -device ide-hd,drive=d0,bus=ahci0.0\n\n");
-                    dim("  Press ENTER...\n  > "); wait_enter(); continue;
-                }
-                for (i, vd) in all_disks.iter().enumerate() {
-                    puts("  ["); put_u64(i as u64 + 1); puts("]  /dev/"); hl(vd.name());
-                    puts("  "); put_size(vd.size_mb); puts("  ");
-                    if vd.is_nvme() { dim("NVMe SSD"); }
-                    else if let Some(d) = ospab_os::drivers::disk_info(vd.index) {
-                        let model = ospab_os::drivers::model_str(d);
-                        if !model.is_empty() { puts(model); } else { dim("(unknown)"); }
-                        puts("  "); dim(match d.kind {
-                            ospab_os::drivers::DiskKind::Ahci => "AHCI/SATA",
-                            ospab_os::drivers::DiskKind::Ata  => "ATA/IDE",
-                        });
+            keyboard::KEY_UP => { if cursor > 0 { cursor -= 1; } else { cursor = 6; } }
+            keyboard::KEY_DOWN => { if cursor < 6 { cursor += 1; } else { cursor = 0; } }
+            '\n' => {
+                match cursor {
+                    MI_DRIVE => {
+                        let mut sub_cursor = 0usize;
+                        loop {
+                            draw_header();
+                            puts("  Available disks:\n\n");
+                            if all_disks.is_empty() {
+                                err("  No disks detected.\n\n");
+                                dim("  Press ENTER to return...\n  > "); wait_enter(); break;
+                            }
+                            for (i, vd) in all_disks.iter().enumerate() {
+                                if sub_cursor == i { hl("  > /dev/"); hl(vd.name()); }
+                                else { puts("    /dev/"); dim(vd.name()); }
+                                puts("  "); put_size(vd.size_mb); puts("  ");
+                                if vd.is_nvme() { dim("NVMe SSD"); }
+                                else if let Some(d) = ospab_os::drivers::disk_info(vd.index) {
+                                    let model = ospab_os::drivers::model_str(d);
+                                    if !model.is_empty() { puts(model); } else { dim("(unknown)"); }
+                                }
+                                puts("\n");
+                            }
+                            puts("\n");
+                            if sub_cursor == all_disks.len() { hl("  > Cancel\n"); } else { puts("    Cancel\n"); }
+                            
+                            match loop { match keyboard::poll_key() { Some(c) => break c, _ => unsafe{core::arch::asm!("hlt");} }} {
+                                keyboard::KEY_UP => { if sub_cursor > 0 { sub_cursor -= 1; } else { sub_cursor = all_disks.len(); } }
+                                keyboard::KEY_DOWN => { if sub_cursor < all_disks.len() { sub_cursor += 1; } else { sub_cursor = 0; } }
+                                '\n' => {
+                                    if sub_cursor < all_disks.len() {
+                                        if all_disks[sub_cursor].sectors < 204_800 {
+                                            err("\n  Disk too small (need >= 100 MiB).\n");
+                                            dim("  Press ENTER...\n  > "); wait_enter();
+                                        } else {
+                                            sel_disk = Some(sub_cursor);
+                                            break;
+                                        }
+                                    } else { break; }
+                                }
+                                '\x03' => { ABORT.store(true, Ordering::Relaxed); break; }
+                                _ => {}
+                            }
+                        }
                     }
-                    puts("\n");
-                }
-                puts("\n"); warn("  WARNING: selected disk will be ERASED.\n\n");
-                match read_digit_line("  Drive [1-N] (Enter=cancel): ", all_disks.len()) {
-                    Some(idx) => {
-                        if all_disks[idx].sectors < 204_800 {
-                            err("  Disk too small (need >= 100 MiB).\n");
-                            dim("  Press ENTER...\n  > "); wait_enter();
-                        } else { sel_disk = Some(idx); }
+                    MI_LAYOUT => {
+                        let opts = [256, 512, 128, 64];
+                        let mut sub_cursor = 0usize;
+                        loop {
+                            draw_header();
+                            puts("  Choose ESP size (rest = AETERNA root):\n\n");
+                            for (i, &opt) in opts.iter().enumerate() {
+                                if sub_cursor == i { hl("  > "); put_size(opt); } else { puts("    "); put_size(opt); }
+                                if opt == 256 { ok("  ← recommended"); }
+                                else if opt == 64 { warn("  (small disks only)"); }
+                                puts("\n");
+                            }
+                            match loop { match keyboard::poll_key() { Some(c) => break c, _ => unsafe{core::arch::asm!("hlt");} }} {
+                                keyboard::KEY_UP => { if sub_cursor > 0 { sub_cursor -= 1; } else { sub_cursor = 3; } }
+                                keyboard::KEY_DOWN => { if sub_cursor < 3 { sub_cursor += 1; } else { sub_cursor = 0; } }
+                                '\n' => { esp_mb = opts[sub_cursor]; break; }
+                                '\x03' => { ABORT.store(true, Ordering::Relaxed); break; }
+                                _ => {}
+                            }
+                        }
                     }
-                    None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
+                    MI_HOSTNAME => {
+                        draw_header();
+                        puts("  Hostname (default: aeterna):\n  Current: ");
+                        for i in 0..hname_len { putc(hname_buf[i] as char); } puts("\n\n");
+                        let mut tmp = [0u8; 32];
+                        match read_text_line("  New Hostname: ", &mut tmp) {
+                            Some(0) => {}
+                            Some(n) => { hname_buf = tmp; hname_len = n; }
+                            None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
+                        }
+                    }
+                    MI_PASSWORD => {
+                        draw_header(); puts("  Root password (empty = none):\n\n");
+                        let mut tmp = [0u8; 32];
+                        match read_text_line("  New Password: ", &mut tmp) {
+                            Some(n) => { pass_buf = tmp; pass_len = n; }
+                            None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
+                        }
+                    }
+                    MI_LOCALE => {
+                        let mut sub_cursor = locale_idx;
+                        loop {
+                            draw_header();
+                            puts("  Select locale:\n\n");
+                            for (i, loc) in LOCALES.iter().enumerate() {
+                                if sub_cursor == i { hl("  > "); hl(loc); } else { puts("    "); dim(loc); }
+                                if i == locale_idx { ok("  ← current"); }
+                                puts("\n");
+                            }
+                            match loop { match keyboard::poll_key() { Some(c) => break c, _ => unsafe{core::arch::asm!("hlt");} }} {
+                                keyboard::KEY_UP => { if sub_cursor > 0 { sub_cursor -= 1; } else { sub_cursor = LOCALES.len() - 1; } }
+                                keyboard::KEY_DOWN => { if sub_cursor < LOCALES.len() - 1 { sub_cursor += 1; } else { sub_cursor = 0; } }
+                                '\n' => { locale_idx = sub_cursor; break; }
+                                '\x03' => { ABORT.store(true, Ordering::Relaxed); break; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    MI_INSTALL => {
+                        let idx = match sel_disk { Some(i) => i, None => {
+                            err("\n  No drive selected. Please configure a Storage device.\n");
+                            dim("  Press ENTER...\n  > "); wait_enter(); continue;
+                        }};
+                        let disk = match all_disks.get(idx) { Some(&d) => d, None => { err("\n  Drive unavailable.\n"); wait_enter(); continue; } };
+                        do_install(disk, esp_mb, &hname_buf[..hname_len], &pass_buf[..pass_len], LOCALES[locale_idx]);
+                        framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0);
+                        return;
+                    }
+                    MI_QUIT => {
+                        framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0); return;
+                    }
+                    _ => {}
                 }
             }
-            '2' => {
-                draw_header();
-                puts("  Choose ESP size (rest = AETERNA root):\n\n");
-                puts("  [1]  256 MiB  "); ok("← recommended\n");
-                puts("  [2]  512 MiB\n");
-                puts("  [3]  128 MiB\n");
-                puts("  [4]   64 MiB  "); warn("(small disks only)\n");
-                puts("\n");
-                match read_digit_line("  Layout [1-4] (Enter=cancel): ", 4) {
-                    Some(0) => esp_mb = 256, Some(1) => esp_mb = 512,
-                    Some(2) => esp_mb = 128, Some(3) => esp_mb = 64,
-                    _ => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
-                }
-            }
-            '3' => {
-                draw_header();
-                puts("  Hostname (default: aeterna):\n  Current: ");
-                for i in 0..hname_len { putc(hname_buf[i] as char); } puts("\n\n");
-                let mut tmp = [0u8; 32];
-                match read_text_line("  Hostname: ", &mut tmp) {
-                    Some(0) => {}
-                    Some(n) => { hname_buf = tmp; hname_len = n; }
-                    None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
-                }
-            }
-            '4' => {
-                draw_header(); puts("  Root password (empty = none):\n\n");
-                let mut tmp = [0u8; 32];
-                match read_text_line("  Password: ", &mut tmp) {
-                    Some(n) => { pass_buf = tmp; pass_len = n; }
-                    None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
-                }
-            }
-            '5' => {
-                draw_header(); puts("  Select locale:\n\n");
-                for (i, loc) in LOCALES.iter().enumerate() {
-                    puts("  ["); put_u64(i as u64 + 1); puts("]  ");
-                    if i == locale_idx { ok(loc); puts("  ← current\n"); } else { puts(loc); puts("\n"); }
-                }
-                puts("\n");
-                match read_digit_line("  Locale [1-N] (Enter=cancel): ", LOCALES.len()) {
-                    Some(idx) => locale_idx = idx,
-                    None => { if ABORT.load(Ordering::Relaxed) { abort_screen(); return; } }
-                }
-            }
-            'i' | 'I' => {
-                let idx = match sel_disk { Some(i) => i, None => {
-                    err("  No drive selected.  Use option [1].\n");
-                    dim("  Press ENTER...\n  > "); wait_enter(); continue;
-                }};
-                let disk = match all_disks.get(idx) { Some(&d) => d, None => { err("  Drive unavailable.\n"); continue; } };
-                do_install(disk, esp_mb, &hname_buf[..hname_len], &pass_buf[..pass_len], LOCALES[locale_idx]);
-                framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0);
-                return;
-            }
-            'q' | 'Q' | '\x03' => { framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0); return; }
+            '\x03' => { ABORT.store(true, Ordering::Relaxed); }
             _ => {}
         }
     }

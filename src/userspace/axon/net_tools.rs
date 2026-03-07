@@ -25,6 +25,13 @@ fn err(s: &str)   { framebuffer::draw_string(s, FG_ERR, BG); }
 fn dim(s: &str)   { framebuffer::draw_string(s, FG_DIM, BG); }
 fn hl(s: &str)    { framebuffer::draw_string(s, FG_HL, BG); }
 
+fn check_ctrl_c() -> bool {
+    while let Some(ch) = crate::arch::x86_64::keyboard::try_read_key() {
+        if ch == '\x03' { return true; }
+    }
+    false
+}
+
 fn put_usize(mut n: usize) {
     if n == 0 { puts("0"); return; }
     let mut buf = [0u8; 20];
@@ -291,6 +298,161 @@ pub fn cmd_df(_args: &str) {
             puts("%  /dev/disk");
             put_usize(i);
             puts("\n");
+        }
+    }
+}
+
+// ─── traceroute ───────────────────────────────────────────────────────────────
+//
+// ICMP-based traceroute: sends Echo Requests with incrementing IP TTL values.
+// Each router that drops the packet due to TTL=0 replies with ICMP Time
+// Exceeded (type 11), revealing the route.
+//
+// In QEMU user-mode networking intermediate hops silently drop the expired
+// packets (the virtual NAT does not forward Time Exceeded replies back), so
+// those hops will show "* * *" — the same behaviour as any NATted environment.
+
+pub fn cmd_traceroute(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        err("traceroute: missing host\n");
+        dim("Usage: traceroute [-m max_hops] [-w secs] <host|ip>\n");
+        dim("  Example: traceroute 10.0.2.2\n");
+        return;
+    }
+
+    // ── Argument parsing ─────────────────────────────────────────────────────
+    let mut max_hops: u8  = 30;
+    let mut timeout_us    = 3_000_000u64; // 3 s per hop
+    let mut target        = "";
+    let mut words         = args.split_whitespace().peekable();
+
+    while let Some(w) = words.next() {
+        match w {
+            "-m" => {
+                if let Some(v) = words.next() {
+                    max_hops = v.parse::<u8>().unwrap_or(30).max(1);
+                }
+            }
+            "-w" => {
+                if let Some(v) = words.next() {
+                    if let Ok(secs) = v.parse::<u32>() {
+                        timeout_us = secs as u64 * 1_000_000;
+                    }
+                }
+            }
+            _ if w.starts_with('-') => {
+                err("traceroute: unknown option: "); err(w); err("\n");
+                return;
+            }
+            _ => { target = w; }
+        }
+    }
+    if target.is_empty() {
+        err("traceroute: missing destination\n");
+        return;
+    }
+
+    // ── Resolve destination ───────────────────────────────────────────────────
+    let dst_ip = match crate::net::resolver::parse_ipv4(target) {
+        Some(ip) => ip,
+        None => match crate::net::resolver::resolve_host(target) {
+            Ok(ip) => {
+                ok("Resolved "); puts(target); ok(" -> ");
+                puts(&format!("{}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
+                ip
+            }
+            Err(e) => {
+                err("traceroute: cannot resolve "); err(target);
+                err(": "); err(e.as_str()); err("\n");
+                return;
+            }
+        },
+    };
+
+    if !crate::net::is_up() {
+        err("traceroute: network is down\n");
+        return;
+    }
+
+    // ── Warm up ARP for the destination / gateway ─────────────────────────────
+    crate::net::arp::send_request(dst_ip);
+    let arp_dl = crate::arch::x86_64::idt::timer_ticks() + 30;
+    while crate::arch::x86_64::idt::timer_ticks() < arp_dl {
+        crate::net::poll_rx();
+        crate::core::scheduler::sys_yield();
+        if crate::net::arp::cache_lookup(dst_ip).is_some() { break; }
+    }
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    hl("traceroute to ");
+    puts(target);
+    hl(&format!(" ({}.{}.{}.{})", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]));
+    puts(&format!(", {} hops max\n", max_hops));
+
+    // ── Probe loop ────────────────────────────────────────────────────────────
+    for ttl in 1u8..=max_hops {
+        // Print hop number (right-aligned, 2 chars)
+        if ttl < 10 { puts(" "); }
+        put_usize(ttl as usize);
+        puts("  ");
+
+        // Send 3 probes per hop (classic traceroute behaviour)
+        let mut any_reply = false;
+        let mut reached   = false;
+        let mut last_src  = [0u8; 4];
+
+        for probe in 0u16..3 {
+            let seq = (ttl as u16) * 10 + probe;
+            crate::net::icmp::send_ping_ttl(dst_ip, seq, ttl);
+
+            // Wait for reply with TSC-based timeout
+            let start = crate::arch::x86_64::tsc::tsc_stamp_us();
+            let mut reply = None;
+            loop {
+                reply = crate::net::icmp::poll_reply();
+                if reply.is_some() { break; }
+                let elapsed = crate::arch::x86_64::tsc::tsc_stamp_us()
+                    .saturating_sub(start);
+                if elapsed >= timeout_us {
+                    crate::net::icmp::cancel_wait();
+                    break;
+                }
+                crate::core::scheduler::sys_yield();
+            }
+
+            match reply {
+                Some(r) => {
+                    any_reply = true;
+                    last_src  = r.src_ip;
+                    let rtt_ms = if r.rtt_us < 1000 { 1 } else { r.rtt_us / 1000 };
+                    puts(&format!("{} ms  ", rtt_ms));
+                    if !r.is_ttl_exceeded {
+                        // Echo Reply from destination: we've arrived
+                        reached = true;
+                    }
+                }
+                None => {
+                    puts("*  ");
+                }
+            }
+        }
+
+        // Print replier's IP (nothing for pure timeouts)
+        if any_reply {
+            let ip_s = format!("{}.{}.{}.{}", last_src[0], last_src[1], last_src[2], last_src[3]);
+            ok(&format!(" {}\n", ip_s));
+        } else {
+            puts("(no reply)\n");
+        }
+
+        // Destination reached — stop probing
+        if reached { break; }
+
+        // Ctrl+C bail-out
+        if check_ctrl_c() {
+            puts("^C\n");
+            break;
         }
     }
 }

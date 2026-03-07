@@ -39,6 +39,16 @@ impl GdtEntry {
         self.flags_limit_high = 0xC0; // Granularity 4KB, 32-bit, Limit high 0xF
     }
 
+    pub fn set_user_code_segment(&mut self) {
+        self.access = 0xFA; // Present, Ring 3, Code, Executable, Accessed
+        self.flags_limit_high = 0xA0; // Granularity 4KB, 64-bit, Limit high 0xF
+    }
+
+    pub fn set_user_data_segment(&mut self) {
+        self.access = 0xF2; // Present, Ring 3, Data, Writable, Accessed
+        self.flags_limit_high = 0xC0; // Granularity 4KB, 32-bit, Limit high 0xF
+    }
+
     pub fn set_tss_segment(&mut self) {
         self.access = 0x89; // Present, Ring 0, TSS, Available
         self.flags_limit_high = 0x00; // TSS special case
@@ -52,35 +62,43 @@ pub struct GdtPointer {
     pub base: u64,
 }
 
-pub const GDT_ENTRIES: usize = 5;
+pub const GDT_ENTRIES: usize = 7;
 static mut GDT: [GdtEntry; GDT_ENTRIES] = [
-    GdtEntry::new(), // Null
-    GdtEntry::new(), // Code
-    GdtEntry::new(), // Data
-    GdtEntry::new(), // TSS (low)
-    GdtEntry::new(), // TSS (high)
+    GdtEntry::new(), // 0: Null
+    GdtEntry::new(), // 1: Kernel Code
+    GdtEntry::new(), // 2: Kernel Data
+    GdtEntry::new(), // 3: User Data
+    GdtEntry::new(), // 4: User Code
+    GdtEntry::new(), // 5: TSS (low)
+    GdtEntry::new(), // 6: TSS (high)
 ];
 
 /// Kernel code segment selector (GDT index 1)
 pub const KERNEL_CS: u16 = 0x08;
 /// Kernel data segment selector (GDT index 2)
 pub const KERNEL_DS: u16 = 0x10;
+/// User data segment selector (GDT index 3, RPL 3)
+pub const USER_DS: u16 = 0x18 | 3;
+/// User code segment selector (GDT index 4, RPL 3)
+pub const USER_CS: u16 = 0x20 | 3;
 
 pub fn init() {
     unsafe {
-        // Set up code segment (64-bit long mode)
+        // 1: Kernel Code
         GDT[1].set_code_segment();
         GDT[1].limit_low = 0xFFFF;
-        GDT[1].base_low = 0;
-        GDT[1].base_mid = 0;
-        GDT[1].base_high = 0;
-
-        // Set up data segment
+        
+        // 2: Kernel Data
         GDT[2].set_data_segment();
         GDT[2].limit_low = 0xFFFF;
-        GDT[2].base_low = 0;
-        GDT[2].base_mid = 0;
-        GDT[2].base_high = 0;
+
+        // 3: User Data (Ring 3)
+        GDT[3].set_user_data_segment();
+        GDT[3].limit_low = 0xFFFF;
+
+        // 4: User Code (Ring 3)
+        GDT[4].set_user_code_segment();
+        GDT[4].limit_low = 0xFFFF;
 
         let gdt_ptr = GdtPointer {
             limit: (core::mem::size_of::<[GdtEntry; GDT_ENTRIES]>() - 1) as u16,
@@ -89,19 +107,19 @@ pub fn init() {
 
         asm!("lgdt [{}]", in(reg) &gdt_ptr, options(readonly, nostack));
 
-        // Reload CS via far return (push new CS + return address, then retfq)
+        // Reload CS via far return
         asm!(
             "push {cs}",        // push new CS selector
-            "lea {tmp}, [rip + 2f]", // load address of label 2
-            "push {tmp}",       // push return address
-            "retfq",            // far return: pops RIP and CS
-            "2:",               // landing label
+            "lea {tmp}, [rip + 2f]", 
+            "push {tmp}",       
+            "retfq",            
+            "2:",               
             cs = in(reg) KERNEL_CS as u64,
             tmp = lateout(reg) _,
             options(preserves_flags),
         );
 
-        // Reload all data segment registers with our data selector
+        // Reload all data segment registers
         asm!(
             "mov ds, {0:x}",
             "mov es, {0:x}",

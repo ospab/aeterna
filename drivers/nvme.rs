@@ -187,6 +187,20 @@ static mut DMA_BUF:   DmaBuf       = DmaBuf([0u8; 8192]);
 // ─── Driver state ─────────────────────────────────────────────────────────
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static DETACHED: AtomicBool = AtomicBool::new(false);
+
+/// Detach kernel driver from hardware.
+pub fn detach() {
+    DETACHED.store(true, Ordering::SeqCst);
+    unsafe {
+        if INITIALIZED.load(Ordering::Relaxed) && MMIO_BASE != 0 {
+            // Disable controller
+            let cc = mmio_r32(REG_CC);
+            mmio_w32(REG_CC, cc & !CC_EN);
+            crate::arch::x86_64::serial::write_str("[NVMe] Kernel driver DETACHED\r\n");
+        }
+    }
+}
 
 static mut MMIO_BASE: u64    = 0;  // virtual address of NVMe BAR0
 static mut ADMIN_SQ_TAIL: usize = 0;
@@ -682,7 +696,7 @@ unsafe fn next_cid() -> u16 {
 // ─── Public I/O ───────────────────────────────────────────────────────────
 
 pub fn is_initialized() -> bool {
-    INITIALIZED.load(Ordering::Relaxed)
+    INITIALIZED.load(Ordering::Relaxed) && !DETACHED.load(Ordering::SeqCst)
 }
 
 pub fn sector_count() -> u64 {

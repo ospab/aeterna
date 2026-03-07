@@ -238,6 +238,12 @@ pub fn setenv(name: &str, value: &str) {
     sh.env.insert(String::from(name), String::from(value));
 }
 
+/// Remove an environment variable (no-op if not present)
+pub fn unsetenv(name: &str) {
+    let sh = shell();
+    sh.env.remove(name);
+}
+
 /// Get all environment variables as a Vec of (name, value) pairs
 pub fn get_env() -> Vec<(String, String)> {
     let sh = shell();
@@ -700,6 +706,7 @@ fn builtin_type(args: &str) {
         "lspci", "lsblk", "fdisk", "ping", "ifconfig", "ip", "ntpdate",
         "reboot", "shutdown", "poweroff", "halt", "install", "history",
         "tutor", "grape", "tomato", "sync", "dump_disk", "doom",
+        "changelog", "aai", "bench", "soundtest", "vol", "mute",
     ];
     for c in commands.iter() {
         if *c == name {

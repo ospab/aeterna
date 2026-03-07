@@ -51,19 +51,92 @@ pub struct CapMemHuge;
 pub struct CapSpawn;
 /// Network packet send/receive.
 pub struct CapNet;
+/// Direct access to I/O ports and hardware interrupts.
+pub struct CapDevice;
+/// Permission to register as a VFS filesystem provider.
+pub struct CapVfsServer;
 
 // ─── Grant helpers ───────────────────────────────────────────────────────────
 // In the current single-process kernel, these always succeed.
 // When the scheduler tracks per-task capability sets, these will check
 // against the task's token manifest before returning Ok.
 
-impl CapFsRead  { pub fn grant(_prefix: &str)   -> CapabilityToken { CapabilityToken(()) } }
-impl CapFsWrite { pub fn grant(_prefix: &str)   -> CapabilityToken { CapabilityToken(()) } }
-impl CapFramebuf { pub fn grant()                -> CapabilityToken { CapabilityToken(()) } }
-impl CapSerial  { pub fn grant()                -> CapabilityToken { CapabilityToken(()) } }
-impl CapMemHuge { pub fn grant()                -> CapabilityToken { CapabilityToken(()) } }
-impl CapSpawn   { pub fn grant()                -> CapabilityToken { CapabilityToken(()) } }
-impl CapNet     { pub fn grant()                -> CapabilityToken { CapabilityToken(()) } }
+use crate::core::scheduler::{Capability, has_capability};
+
+impl CapFsRead  { 
+    pub fn grant(_prefix: &str) -> CapabilityToken { 
+        if !has_capability(Capability::FsRead) && !has_capability(Capability::System) {
+            panic!("CapFsRead: access denied to manifest path");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapFsWrite { 
+    pub fn grant(_prefix: &str) -> CapabilityToken { 
+        if !has_capability(Capability::FsWrite) && !has_capability(Capability::System) {
+            panic!("CapFsWrite: access denied to manifest path");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapFramebuf { 
+    pub fn grant() -> CapabilityToken { 
+        if !has_capability(Capability::Framebuf) && !has_capability(Capability::System) {
+            panic!("CapFramebuf: access denied");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapSerial  { 
+    pub fn grant() -> CapabilityToken { 
+        if !has_capability(Capability::Serial) && !has_capability(Capability::System) {
+            panic!("CapSerial: access denied");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapMemHuge { 
+    pub fn grant() -> CapabilityToken { 
+        if !has_capability(Capability::MemHuge) && !has_capability(Capability::System) {
+            panic!("CapMemHuge: access denied");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapSpawn   { 
+    pub fn grant() -> CapabilityToken { 
+        if !has_capability(Capability::Spawn) && !has_capability(Capability::System) {
+            panic!("CapSpawn: access denied");
+        }
+        CapabilityToken(()) 
+    } 
+}
+impl CapNet     { 
+    pub fn grant() -> CapabilityToken { 
+        if !has_capability(Capability::Net) && !has_capability(Capability::System) {
+            panic!("CapNet: access denied");
+        }
+        CapabilityToken(()) 
+    } 
+}
+
+impl CapDevice  {
+    pub fn grant() -> CapabilityToken {
+        if !has_capability(Capability::Device) && !has_capability(Capability::System) {
+            panic!("CapDevice: access denied");
+        }
+        CapabilityToken(())
+    }
+}
+
+impl CapVfsServer {
+    pub fn grant() -> CapabilityToken {
+        if !has_capability(Capability::VfsServer) && !has_capability(Capability::System) {
+            panic!("CapVfsServer: access denied");
+        }
+        CapabilityToken(())
+    }
+}
 
 // ─── Required-capability manifest helper ─────────────────────────────────────
 

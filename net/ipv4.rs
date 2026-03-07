@@ -37,9 +37,14 @@ pub fn handle_ipv4(data: &[u8]) {
     }
 }
 
-/// Build and send an IPv4 packet
-/// protocol: IP protocol number, dst_ip: destination, payload: data above IP
-pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
+/// Check if an IP address points to the local loopback interface or our own NIC.
+pub fn is_local(ip: [u8; 4]) -> bool {
+    ip[0] == 127 || ip == unsafe { super::OUR_IP }
+}
+
+/// Build and send an IPv4 packet with a custom TTL.
+/// protocol: IP protocol number, dst_ip: destination, payload: data above IP, ttl: time-to-live
+pub fn send_ipv4_ttl(protocol: u8, dst_ip: [u8; 4], payload: &[u8], ttl: u8) {
     let total_len = 20 + payload.len();
     if total_len > 1480 { return; }
 
@@ -65,7 +70,7 @@ pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
     pkt[6] = 0x40;
     pkt[7] = 0x00;
     // TTL
-    pkt[8] = 64;
+    pkt[8] = ttl;
     // Protocol
     pkt[9] = protocol;
     // Checksum (0 for now, will compute)
@@ -85,6 +90,13 @@ pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
     // Payload
     pkt[20..20 + payload.len()].copy_from_slice(payload);
 
+    // ── Local Loopback ──────────────────────────────────────────────────────
+    // Deliver locally if destination is 127.0.0.1 or our own IP
+    if is_local(dst_ip) {
+        handle_ipv4(&pkt[..total_len]);
+        return;
+    }
+
     // Determine destination MAC
     let dst_mac = resolve_mac(dst_ip);
 
@@ -92,17 +104,26 @@ pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
     super::ethernet::send_frame(dst_mac, super::ethernet::ETHERTYPE_IPV4, &pkt[..total_len]);
 }
 
+/// Build and send an IPv4 packet with the default TTL of 64.
+pub fn send_ipv4(protocol: u8, dst_ip: [u8; 4], payload: &[u8]) {
+    send_ipv4_ttl(protocol, dst_ip, payload, 64);
+}
+
 /// Resolve MAC for IP: check ARP cache first, then fall back to gateway/broadcast
 fn resolve_mac(dst_ip: [u8; 4]) -> [u8; 6] {
     let our_ip = unsafe { super::OUR_IP };
     let mask   = unsafe { super::SUBNET_MASK };
 
-    // Direct cache look-up — covers both local and remote (via gateway ARP)
+    // 1. Loopback check
+    if dst_ip[0] == 127 { return [0, 0, 0, 0, 0, 0]; }
+    if dst_ip == our_ip { return unsafe { super::OUR_MAC }; }
+
+    // 2. Direct cache look-up — covers both local and remote (via gateway ARP)
     if let Some(mac) = super::arp::cache_lookup(dst_ip) {
         return mac;
     }
 
-    // Check if destination is on our subnet
+    // 3. Check if destination is on our subnet
     let same_subnet = (dst_ip[0] & mask[0]) == (our_ip[0] & mask[0])
         && (dst_ip[1] & mask[1]) == (our_ip[1] & mask[1])
         && (dst_ip[2] & mask[2]) == (our_ip[2] & mask[2])
