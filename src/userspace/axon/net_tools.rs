@@ -395,6 +395,9 @@ pub fn cmd_traceroute(args: &str) {
     puts(&format!(", {} hops max\n", max_hops));
 
     // ── Probe loop ────────────────────────────────────────────────────────────
+    // SLIRP detection: count hops that got all-timeout before destination replies.
+    let mut timeout_hops: u8 = 0;
+
     for ttl in 1u8..=max_hops {
         // Print hop number (right-aligned, 2 chars)
         if ttl < 10 { puts(" "); }
@@ -447,11 +450,38 @@ pub fn cmd_traceroute(args: &str) {
             let ip_s = format!("{}.{}.{}.{}", last_src[0], last_src[1], last_src[2], last_src[3]);
             ok(&format!(" {}\n", ip_s));
         } else {
+            timeout_hops += 1;
             puts("(no reply)\n");
         }
 
         // Destination reached — stop probing
-        if reached { break; }
+        if reached {
+            // SLIRP/NAT detection: destination replied early while all previous
+            // hops timed out.  This is the classic QEMU user-mode network
+            // (SLIRP) signature: it does not forward ICMP Time Exceeded replies
+            // from real routers back to the guest, so every intermediate hop
+            // shows "* * *".  Then, because SLIRP reinjects the ICMP echo with
+            // its own TTL, the destination appears reachable in very few hops.
+            if timeout_hops > 0 && ttl <= 10 {
+                let dst_s = format!("{}.{}.{}.{}",
+                    dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+                puts("\n");
+                dim("[SLIRP/NAT] ");
+                err("WARNING: path above does NOT reflect reality.\n");
+                dim("  QEMU user-mode networking (SLIRP) operates as a NAT on the host.\n");
+                dim("  It does not forward ICMP Time Exceeded replies back to the guest,\n");
+                dim("  so all intermediate routers appear as timeouts.\n");
+                dim("  SLIRP also overwrites the outgoing TTL, making the destination\n");
+                dim("  respond within ");
+                put_usize(ttl as usize);
+                dim(" hop(s) regardless of the real distance.\n");
+                dim("  Actual internet path to ");
+                puts(&dst_s);
+                dim(" has significantly more hops.\n");
+                dim("  Use bare-metal or bridged (TAP) networking for a real traceroute.\n");
+            }
+            break;
+        }
 
         // Ctrl+C bail-out
         if check_ctrl_c() {

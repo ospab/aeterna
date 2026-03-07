@@ -281,6 +281,7 @@ pub fn run(args: &str) {
     let mut received: u64 = 0;
     let mut seq: u16      = 1;
     let mut interrupted   = false;
+    let mut last_ttl: u8  = 0;   // TTL from most recent reply
 
     // RTT statistics (all in µs)
     let mut rtt_min: u64 = u64::MAX;
@@ -325,6 +326,7 @@ pub fn run(args: &str) {
             Some(r) => {
                 received += 1;
                 let rtt = r.rtt_us;
+                last_ttl = r.ttl;
 
                 // Update statistics
                 if rtt < rtt_min { rtt_min = rtt; }
@@ -391,5 +393,35 @@ pub fn run(args: &str) {
 
         puts(&format!("rtt min/avg/max/mdev = {}/{}/{}/{} ms\n",
             s_min, s_avg, s_max, s_mdev));
+    }
+
+    // ── SLIRP / NAT honesty note ─────────────────────────────────────────────
+    // Detect when QEMU SLIRP intercepts ICMP locally and returns a synthetic
+    // reply instead of routing to the real destination:
+    //  • Real Linux hosts (e.g. Google 8.8.8.8) use starting TTL = 64.
+    //    After 10+ real hops the returned TTL should be ≤ 54.
+    //  • SLIRP returns TTL = 64 (Linux host) or 128 (Windows host or SLIRP
+    //    default) from its own network stack, not from the remote host.
+    //  • Real internet RTT to any external host is ≥ 10 ms even on LAN/DC.
+    //    Sub-10 ms RTT to a non-local address strongly suggests local spoofing.
+    if received > 0 {
+        let avg_us = rtt_sum / received;
+        let is_local = cfg.ip[0] == 10 || cfg.ip[0] == 127
+            || (cfg.ip[0] == 172 && cfg.ip[1] >= 16 && cfg.ip[1] <= 31)
+            || (cfg.ip[0] == 192 && cfg.ip[1] == 168);
+        // TTL of 64 or 128 from a host that is not on our local subnet,
+        // combined with suspiciously low RTT, indicates SLIRP interception.
+        let slirp_ttl  = last_ttl == 64 || last_ttl == 128;
+        let slirp_rtt  = avg_us < 15_000; // < 15 ms
+        if !is_local && slirp_ttl && slirp_rtt {
+            puts("\n");
+            dim("[SLIRP/NAT] ");
+            err("WARNING: results may not reflect the real internet path.\n");
+            dim(&format!("  ttl={} is a SLIRP/host-stack value, not from the destination server.\n", last_ttl));
+            dim("  RTT < 15 ms to a non-local host is physically impossible over real internet.\n");
+            dim("  QEMU user-mode NAT (SLIRP) intercepts ICMP and replies on the host\n");
+            dim("  without forwarding to the real destination address.\n");
+            dim("  Use bare-metal or TAP/bridged networking to see real latency.\n");
+        }
     }
 }
