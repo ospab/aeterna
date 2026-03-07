@@ -151,3 +151,88 @@ pub fn decrypt_record(
 
     Some(fragment.to_vec())
 }
+
+// ─── AES-128-GCM record helpers (TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) ────────────────
+
+/// Build an encrypted TLS record using AES-128-GCM.
+///
+/// Record payload: explicit_nonce(8) || ciphertext || tag(16)
+///
+/// AAD = seq_num(8) || ct(1) || version(2) || plaintext_len(2)
+pub fn build_gcm_record(
+    content_type: u8,
+    fragment:     &[u8],
+    seq_num:      u64,
+    key:          &[u8; 16],
+    implicit_iv:  &[u8; 4],   // 4-byte write IV from key block
+) -> Vec<u8> {
+    // 12-byte nonce = implicit_iv(4) || explicit_nonce(8)
+    // explicit_nonce = seq_num as big-endian u64
+    let explicit_nonce = seq_num.to_be_bytes();
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(implicit_iv);
+    nonce[4..12].copy_from_slice(&explicit_nonce);
+
+    // AAD
+    let mut aad = [0u8; 13];
+    aad[..8].copy_from_slice(&seq_num.to_be_bytes());
+    aad[8]  = content_type;
+    aad[9]  = TLS12_MAJOR;
+    aad[10] = TLS12_MINOR;
+    aad[11] = (fragment.len() >> 8) as u8;
+    aad[12] = fragment.len() as u8;
+
+    let (ciphertext, tag) = super::gcm::aes128_gcm_encrypt(key, &nonce, fragment, &aad);
+
+    // payload = explicit_nonce(8) || ciphertext || tag(16)
+    let payload_len = 8 + ciphertext.len() + 16;
+    let mut rec = Vec::with_capacity(5 + payload_len);
+    rec.push(content_type);
+    rec.push(TLS12_MAJOR);
+    rec.push(TLS12_MINOR);
+    rec.push((payload_len >> 8) as u8);
+    rec.push(payload_len as u8);
+    rec.extend_from_slice(&explicit_nonce);
+    rec.extend_from_slice(&ciphertext);
+    rec.extend_from_slice(&tag);
+    rec
+}
+
+/// Decrypt a TLS AES-128-GCM record.
+/// `payload` = explicit_nonce(8) || ciphertext || tag(16)
+/// Returns decrypted fragment or None on auth failure.
+pub fn decrypt_gcm_record(
+    content_type: u8,
+    payload:      &[u8],
+    seq_num:      u64,
+    key:          &[u8; 16],
+    implicit_iv:  &[u8; 4],
+) -> Option<Vec<u8>> {
+    if payload.len() < 8 + 16 { return None; }  // explicit_nonce + min tag
+
+    let explicit_nonce = &payload[..8];
+    let body           = &payload[8..];
+    if body.len() < 16 { return None; }
+    let ciphertext = &body[..body.len() - 16];
+    let tag: [u8; 16] = {
+        let mut t = [0u8; 16];
+        t.copy_from_slice(&body[body.len() - 16..]);
+        t
+    };
+
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(implicit_iv);
+    nonce[4..12].copy_from_slice(explicit_nonce);
+
+    // AAD covers plaintext length (= ciphertext length for AEAD)
+    let plain_len = ciphertext.len();
+    let mut aad = [0u8; 13];
+    aad[..8].copy_from_slice(&seq_num.to_be_bytes());
+    aad[8]  = content_type;
+    aad[9]  = TLS12_MAJOR;
+    aad[10] = TLS12_MINOR;
+    aad[11] = (plain_len >> 8) as u8;
+    aad[12] = plain_len as u8;
+
+    super::gcm::aes128_gcm_decrypt(key, &nonce, ciphertext, &aad, &tag)
+}

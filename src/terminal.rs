@@ -23,6 +23,7 @@ const BUILTINS: &[&str] = &[
     "cat", "mkdir", "touch", "rm", "save", "write", "whoami", "hostname",
     "date", "about", "meminfo", "free", "uptime", "dmesg", "lsmem",
     "lspci", "lsblk", "fdisk", "mkfs", "mount", "ping", "ifconfig", "ip", "ntpdate", "netdiag", "soundtest", "sync",
+    "nslookup", "curl", "traceroute", "netstat",
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
     "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",

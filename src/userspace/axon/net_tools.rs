@@ -590,6 +590,39 @@ fn cmd_ip_show_route() {
     puts("127.0.0.0/8 dev lo scope host\n");
 }
 
+// ─── nslookup ─────────────────────────────────────────────────────────────────
+
+pub fn cmd_nslookup(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        err("nslookup: missing hostname\n");
+        dim("Usage: nslookup <hostname|ip>\n");
+        return;
+    }
+
+    if !crate::net::is_up() {
+        err("nslookup: network is down\n");
+        return;
+    }
+
+    let dns_ip = unsafe { crate::net::DNS_IP };
+    let dns_str = format!("{}.{}.{}.{}", dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]);
+
+    dim(&format!("Server:\t\t{}\n", dns_str));
+    dim(&format!("Address:\t{}#53\n\n", dns_str));
+
+    match crate::net::resolver::resolve_host(args) {
+        Ok(ip) => {
+            dim("Non-authoritative answer:\n");
+            puts(&format!("Name:\t{}\n", args));
+            ok(&format!("Address: {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
+        }
+        Err(e) => {
+            err(&format!("nslookup: can't resolve '{}': {}\n", args, e.as_str()));
+        }
+    }
+}
+
 // ─── curl — HTTP/1.0 over real TCP ───────────────────────────────────────────
 
 pub fn cmd_curl(args: &str) {

@@ -3,11 +3,13 @@
  *
  * Pure no_std Rust implementation — no external crypto crates.
  *
- * Supported cipher suite:
- *   TLS_RSA_WITH_AES_128_CBC_SHA256  (0x003C)
+ * Supported cipher suites:
+ *   TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256    (0xC02B)  ← preferred (AEAD)
+ *   TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256    (0xC027)  ← fallback
+ *   TLS_RSA_WITH_AES_128_CBC_SHA256          (0x003C)  ← last resort
  *
  * Crypto primitives (all in-tree):
- *   SHA-256, HMAC-SHA256, AES-128-CBC, RSA PKCS#1 v1.5, RDRAND RNG
+ *   SHA-256, HMAC-SHA256, AES-128-CBC, AES-128-GCM, P-256 ECDHE, RSA, RDRAND RNG
  *
  * Usage:
  *   let conn_id = tcp::tcp_connect(ip, 443)?;
@@ -22,11 +24,13 @@ extern crate alloc;
 pub mod sha256;
 pub mod hmac;
 pub mod aes;
+pub mod gcm;
 pub mod rng;
 pub mod prf;
 pub mod bignum;
 pub mod x509;
 pub mod record;
+pub(super) mod p256;
 pub mod handshake;
 
 /// Convenience: perform TCP connect + TLS handshake in one call.
