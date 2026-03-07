@@ -106,6 +106,8 @@ pub fn dispatch(command: &str, args: &str) -> bool {
         "df"           => { net_tools::cmd_df(args); true }
         "ping"         => { ping::run(args); true }
         "traceroute"   => { net_tools::cmd_traceroute(args); true }
+        "ip"           => { net_tools::cmd_ip_show(args); true }
+        "curl"         => { net_tools::cmd_curl(args); true }
         "lspci"        => { lspci::run(args); true }
         "fdisk"        => { disk_tools::run_fdisk(args); true }
         "lsblk"        => { disk_tools::run_lsblk(args); true }

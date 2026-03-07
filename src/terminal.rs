@@ -580,7 +580,8 @@ fn execute_command(cmd: &str) {
         "uptime"  => cmd_uptime(),
         "dmesg"   => cmd_dmesg(),
         "lsmem"   => cmd_lsmem(),
-        "ifconfig" | "ip" => cmd_ifconfig(),
+        "ifconfig"  => cmd_ifconfig(),
+        "ip"        => cmd_ip(args),
         "netdiag"  => {
             puts("Running network diagnostics (output to serial COM1)...\n");
             ospab_os::net::diag::run_full_diagnostic();
@@ -1838,6 +1839,158 @@ fn cmd_ifconfig() {
     puts("  bytes:");
     print_u64(tx_b);
     puts("\n");
+}
+
+// ── ip addr / ip link / ip route ──────────────────────────────────────────
+
+fn subnet_prefix_len(mask: [u8; 4]) -> u8 {
+    mask.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+fn ip_broadcast(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
+    [ip[0] | !mask[0], ip[1] | !mask[1], ip[2] | !mask[2], ip[3] | !mask[3]]
+}
+
+fn ip_network(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
+    [ip[0] & mask[0], ip[1] & mask[1], ip[2] & mask[2], ip[3] & mask[3]]
+}
+
+fn cmd_ip(args: &str) {
+    if !ospab_os::net::is_up() {
+        err_print("Network not available. Start QEMU with: -netdev user,id=n0 -device rtl8139,netdev=n0\n");
+        return;
+    }
+    let sub = args.split_whitespace().next().unwrap_or("");
+    match sub {
+        "" | "a" | "addr" | "address" => cmd_ip_addr(),
+        "l" | "link" => cmd_ip_link(),
+        "r" | "route" => cmd_ip_route(),
+        _ => {
+            err_print("ip: unknown subcommand\n");
+            dim_print("Usage: ip {a[ddr] | l[ink] | r[oute]}\n");
+            dim_print("  ip a      — show addresses (ip addr show)\n");
+            dim_print("  ip l      — show links    (ip link show)\n");
+            dim_print("  ip r      — show routes   (ip route show)\n");
+        }
+    }
+}
+
+fn cmd_ip_addr() {
+    let ip   = unsafe { ospab_os::net::OUR_IP };
+    let mask = unsafe { ospab_os::net::SUBNET_MASK };
+    let mac  = unsafe { ospab_os::net::OUR_MAC };
+    let nic  = ospab_os::net::nic_name();
+    let up   = ospab_os::net::link_up();
+    let plen = subnet_prefix_len(mask);
+    let brd  = ip_broadcast(ip, mask);
+    let rx_p = ospab_os::net::rx_packets();
+    let tx_p = ospab_os::net::tx_packets();
+
+    // Loopback
+    dim_print("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
+    dim_print("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
+    dim_print("    inet 127.0.0.1/8 scope host lo\n\n");
+
+    // NIC
+    puts("2: ");
+    framebuffer::draw_string(nic, FG_HL, BG);
+    puts(": <BROADCAST,MULTICAST,");
+    if up {
+        framebuffer::draw_string("UP,LOWER_UP", FG_OK, BG);
+    } else {
+        err_print("NO-CARRIER");
+    }
+    puts("> mtu 1500 state ");
+    if up {
+        framebuffer::draw_string("UP", FG_OK, BG);
+    } else {
+        err_print("DOWN");
+    }
+    puts("\n");
+    puts("    link/ether ");
+    print_mac(mac);
+    puts(" brd ff:ff:ff:ff:ff:ff\n");
+    puts("    inet ");
+    print_ip(ip);
+    puts("/");
+    print_dec(plen as u64);
+    puts(" brd ");
+    print_ip(brd);
+    puts(" scope global ");
+    puts(nic);
+    puts("\n");
+    puts("    RX: ");
+    print_dec(rx_p);
+    puts(" pkts  TX: ");
+    print_dec(tx_p);
+    puts(" pkts\n");
+}
+
+fn cmd_ip_link() {
+    let mac = unsafe { ospab_os::net::OUR_MAC };
+    let nic = ospab_os::net::nic_name();
+    let up  = ospab_os::net::link_up();
+    let rx  = ospab_os::net::rx_packets();
+    let tx  = ospab_os::net::tx_packets();
+    let rxb = ospab_os::net::rx_bytes();
+    let txb = ospab_os::net::tx_bytes();
+
+    dim_print("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
+    dim_print("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\n");
+
+    puts("2: ");
+    framebuffer::draw_string(nic, FG_HL, BG);
+    puts(": <BROADCAST,MULTICAST,");
+    if up {
+        framebuffer::draw_string("UP,LOWER_UP", FG_OK, BG);
+    } else {
+        err_print("NO-CARRIER");
+    }
+    puts("> mtu 1500 state ");
+    if up {
+        framebuffer::draw_string("UP", FG_OK, BG);
+    } else {
+        err_print("DOWN");
+    }
+    puts("\n");
+    puts("    link/ether ");
+    print_mac(mac);
+    puts(" brd ff:ff:ff:ff:ff:ff\n");
+    puts("    RX: packets=");
+    print_dec(rx);
+    puts(" bytes=");
+    print_dec(rxb);
+    puts("\n    TX: packets=");
+    print_dec(tx);
+    puts(" bytes=");
+    print_dec(txb);
+    puts("\n");
+}
+
+fn cmd_ip_route() {
+    let ip   = unsafe { ospab_os::net::OUR_IP };
+    let gw   = unsafe { ospab_os::net::GATEWAY_IP };
+    let mask = unsafe { ospab_os::net::SUBNET_MASK };
+    let nic  = ospab_os::net::nic_name();
+    let plen = subnet_prefix_len(mask);
+    let net  = ip_network(ip, mask);
+
+    puts("default via ");
+    print_ip(gw);
+    puts(" dev ");
+    puts(nic);
+    puts("\n");
+
+    print_ip(net);
+    puts("/");
+    print_dec(plen as u64);
+    puts(" dev ");
+    puts(nic);
+    puts(" proto kernel scope link src ");
+    print_ip(ip);
+    puts("\n");
+
+    puts("127.0.0.0/8 dev lo scope host\n");
 }
 
 fn cmd_ping(args: &str) {

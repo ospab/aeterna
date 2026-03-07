@@ -460,3 +460,260 @@ pub fn cmd_traceroute(args: &str) {
         }
     }
 }
+
+// ─── ip addr / ip link / ip route ────────────────────────────────────────────
+
+fn put_ip(ip: [u8; 4]) {
+    puts(&format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+}
+
+fn subnet_prefix_len(mask: [u8; 4]) -> u8 {
+    mask.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+fn ip_broadcast(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
+    [ip[0] | !mask[0], ip[1] | !mask[1], ip[2] | !mask[2], ip[3] | !mask[3]]
+}
+
+fn ip_network(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
+    [ip[0] & mask[0], ip[1] & mask[1], ip[2] & mask[2], ip[3] & mask[3]]
+}
+
+pub fn cmd_ip_show(args: &str) {
+    use crate::net;
+
+    if !net::is_up() {
+        err("ip: network not available\n");
+        return;
+    }
+    let sub = args.split_whitespace().next().unwrap_or("");
+    match sub {
+        "" | "a" | "addr" | "address" => cmd_ip_show_addr(),
+        "l" | "link" => cmd_ip_show_link(),
+        "r" | "route" => cmd_ip_show_route(),
+        _ => {
+            err("ip: unknown subcommand\n");
+            dim("Usage: ip {a[ddr] | l[ink] | r[oute]}\n");
+        }
+    }
+}
+
+fn cmd_ip_show_addr() {
+    use crate::net;
+    let ip   = unsafe { net::OUR_IP };
+    let mask = unsafe { net::SUBNET_MASK };
+    let mac  = unsafe { net::OUR_MAC };
+    let nic  = net::nic_name();
+    let up   = net::link_up();
+    let plen = subnet_prefix_len(mask);
+    let brd  = ip_broadcast(ip, mask);
+    let rx_p = net::rx_packets();
+    let tx_p = net::tx_packets();
+
+    // Loopback
+    dim("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
+    dim("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
+    dim("    inet 127.0.0.1/8 scope host lo\n\n");
+
+    // NIC
+    puts("2: ");
+    hl(nic);
+    puts(": <BROADCAST,MULTICAST,");
+    if up { ok("UP,LOWER_UP"); } else { err("NO-CARRIER"); }
+    puts("> mtu 1500 state ");
+    if up { ok("UP"); } else { err("DOWN"); }
+    puts("\n");
+    puts("    link/ether ");
+    draw_mac(&mac);
+    puts(" brd ff:ff:ff:ff:ff:ff\n");
+    puts("    inet ");
+    put_ip(ip);
+    puts(&format!("/{} brd ", plen));
+    put_ip(brd);
+    puts(" scope global ");
+    puts(nic);
+    puts("\n");
+    puts("    RX: ");
+    put_usize(rx_p as usize);
+    puts(" pkts  TX: ");
+    put_usize(tx_p as usize);
+    puts(" pkts\n");
+}
+
+fn cmd_ip_show_link() {
+    use crate::net;
+    let mac = unsafe { net::OUR_MAC };
+    let nic = net::nic_name();
+    let up  = net::link_up();
+    let rx  = net::rx_packets();
+    let tx  = net::tx_packets();
+    let rxb = net::rx_bytes();
+    let txb = net::tx_bytes();
+
+    dim("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
+    dim("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\n");
+
+    puts("2: ");
+    hl(nic);
+    puts(": <BROADCAST,MULTICAST,");
+    if up { ok("UP,LOWER_UP"); } else { err("NO-CARRIER"); }
+    puts("> mtu 1500 state ");
+    if up { ok("UP"); } else { err("DOWN"); }
+    puts("\n");
+    puts("    link/ether ");
+    draw_mac(&mac);
+    puts(" brd ff:ff:ff:ff:ff:ff\n");
+    puts(&format!("    RX: packets={} bytes={}\n", rx, rxb));
+    puts(&format!("    TX: packets={} bytes={}\n", tx, txb));
+}
+
+fn cmd_ip_show_route() {
+    use crate::net;
+    let ip   = unsafe { net::OUR_IP };
+    let gw   = unsafe { net::GATEWAY_IP };
+    let mask = unsafe { net::SUBNET_MASK };
+    let nic  = net::nic_name();
+    let plen = subnet_prefix_len(mask);
+    let net_addr = ip_network(ip, mask);
+
+    puts("default via ");
+    put_ip(gw);
+    puts(" dev ");
+    puts(nic);
+    puts("\n");
+    put_ip(net_addr);
+    puts(&format!("/{} dev ", plen));
+    puts(nic);
+    puts(" proto kernel scope link src ");
+    put_ip(ip);
+    puts("\n");
+    puts("127.0.0.0/8 dev lo scope host\n");
+}
+
+// ─── curl — HTTP/1.0 over real TCP ───────────────────────────────────────────
+
+pub fn cmd_curl(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        err("curl: missing URL\n");
+        dim("Usage: curl http://<host>[:port][/path]\n");
+        dim("       curl http://10.0.2.2/\n");
+        return;
+    }
+
+    if !crate::net::is_up() {
+        err("curl: network is down\n");
+        return;
+    }
+
+    // Strip optional "http://"
+    let rest = if args.starts_with("http://") { &args[7..] } else { args };
+
+    // Split hostport from path
+    let (hostport, path) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None        => (rest, "/"),
+    };
+
+    // Split host from optional port
+    let (host_str, port) = match hostport.rfind(':') {
+        Some(c) => {
+            let p = hostport[c+1..].parse::<u16>().unwrap_or(80);
+            (&hostport[..c], p)
+        }
+        None => (hostport, 80u16),
+    };
+
+    // Resolve hostname → IPv4
+    let ip = match crate::net::resolver::resolve_host(host_str) {
+        Ok(ip)  => ip,
+        Err(e)  => {
+            err("curl: cannot resolve '");
+            err(host_str);
+            err("': ");
+            err(e.as_str());
+            err("\n");
+            return;
+        }
+    };
+
+    dim(&format!("Connecting to {}:{} ({})\n", host_str, port,
+        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])));
+
+    // TCP connect
+    let conn = match crate::net::tcp::tcp_connect(ip, port) {
+        Ok(c)  => c,
+        Err(e) => {
+            err("curl: connect failed: ");
+            err(e.as_str());
+            err("\n");
+            return;
+        }
+    };
+
+    ok("Connected.\n");
+
+    // Send HTTP/1.0 GET
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: AETERNA/1.1\r\nConnection: close\r\n\r\n",
+        path, host_str
+    );
+    if let Err(e) = crate::net::tcp::tcp_send(conn, req.as_bytes()) {
+        err("curl: send failed: ");
+        err(e.as_str());
+        err("\n");
+        crate::net::tcp::tcp_close(conn);
+        return;
+    }
+
+    // Receive HTTP response and display it
+    let mut total_bytes = 0usize;
+    let mut buf = [0u8; 512];
+    // Track last 4 received bytes to detect end-of-headers (\r\n\r\n)
+    let mut tail4 = [0u8; 4];
+    let mut headers_done = false;
+
+    loop {
+        if check_ctrl_c() { dim("\n[interrupted]\n"); break; }
+
+        match crate::net::tcp::tcp_recv(conn, &mut buf, 200) {
+            Ok(0) => break, // connection closed
+            Ok(n) => {
+                total_bytes += n;
+                let data = &buf[..n];
+
+                for &b in data {
+                    // Update sliding 4-byte window to detect \r\n\r\n
+                    if !headers_done {
+                        tail4[0] = tail4[1];
+                        tail4[1] = tail4[2];
+                        tail4[2] = tail4[3];
+                        tail4[3] = b;
+                        if &tail4 == b"\r\n\r\n" { headers_done = true; }
+                        // Print header line in dim colour
+                        if b >= 0x20 || b == b'\n' || b == b'\r' {
+                            framebuffer::draw_char(b as char, FG_DIM, BG);
+                        }
+                    } else {
+                        // Print body in normal colour
+                        if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
+                            framebuffer::draw_char(b as char, FG, BG);
+                        }
+                    }
+                }
+            }
+            Err(crate::net::tcp::TcpError::TimedOut)
+            | Err(crate::net::tcp::TcpError::WouldBlock) => break,
+            Err(e) => {
+                err("\ncurl: recv error: ");
+                err(e.as_str());
+                err("\n");
+                break;
+            }
+        }
+    }
+
+    crate::net::tcp::tcp_close(conn);
+    puts("\n");
+    dim(&format!("[{} bytes received]\n", total_bytes));
+}
