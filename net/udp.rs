@@ -1,11 +1,15 @@
 /*
  * UDP — User Datagram Protocol
- * Minimal implementation for SNTP client.
+ *
+ * Dispatches incoming packets to:
+ *   - DHCP client (dst_port 68)
+ *   - DNS resolver (dynamic ephemeral port)
+ *   - Generic listener (SNTP and future protocols)
  */
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// UDP receive buffer for the SNTP response
+// Generic UDP receive buffer (used by SNTP and other one-shot listeners)
 static mut UDP_RX_BUF: [u8; 512] = [0; 512];
 static mut UDP_RX_LEN: usize = 0;
 static mut UDP_RX_PORT: u16 = 0;
@@ -23,7 +27,22 @@ pub fn handle_udp(data: &[u8], _src_ip: [u8; 4]) {
 
     let payload = &data[8..length];
 
-    // Store in RX buffer if we're listening on that port
+    // ── Route to specific protocol handlers ──
+
+    // DHCP client listens on port 68
+    if dst_port == 68 {
+        super::dhcp::handle_dhcp_udp(payload);
+        return;
+    }
+
+    // DNS resolver listens on its current ephemeral source port
+    let dns_port = super::dns::current_src_port();
+    if dns_port != 0 && dst_port == dns_port {
+        super::dns::handle_dns_udp(payload);
+        return;
+    }
+
+    // Generic listener (SNTP, etc.)
     unsafe {
         if dst_port == UDP_RX_PORT || UDP_RX_PORT == 0 {
             let copy_len = payload.len().min(512);

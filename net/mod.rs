@@ -1,7 +1,14 @@
 /*
  * ospab.os Network Stack
- * Minimal IPv4 networking: RTL8139 → Ethernet → ARP → IPv4 → ICMP/UDP
- * Enough for ping and NTP time sync.
+ *
+ * Bare-metal IPv4 networking.  No VM / SLIRP / QEMU assumptions.
+ *
+ * Boot flow:
+ *   1. Probe PCI for supported NIC (RTL8139, e1000, RTL8169)
+ *   2. Read MAC from hardware registers
+ *   3. DHCP handshake → obtain IP / subnet / gateway / DNS
+ *   4. ARP-resolve gateway MAC
+ *   5. Stack is UP — ARP, IPv4, ICMP, UDP, TCP, DNS all functional
  */
 
 pub mod rtl8139;
@@ -14,6 +21,8 @@ pub mod ipv4;
 pub mod icmp;
 pub mod udp;
 pub mod tcp;
+pub mod dhcp;
+pub mod dns;
 pub mod sntp;
 pub mod resolver;
 
@@ -33,11 +42,11 @@ pub trait NetDriver {
     fn link_state(&self) -> LinkState;
 }
 
-// ─── Network configuration (QEMU user-mode defaults) ───
-pub static mut OUR_IP: [u8; 4]       = [10, 0, 2, 15];
-pub static mut GATEWAY_IP: [u8; 4]   = [10, 0, 2, 2];
+// ─── Network configuration (all zeros until DHCP assigns them) ───
+pub static mut OUR_IP: [u8; 4]       = [0; 4];
+pub static mut GATEWAY_IP: [u8; 4]   = [0; 4];
 pub static mut SUBNET_MASK: [u8; 4]  = [255, 255, 255, 0];
-pub static mut DNS_IP: [u8; 4]       = [10, 0, 2, 3];
+pub static mut DNS_IP: [u8; 4]       = [0; 4];
 pub static mut OUR_MAC: [u8; 6]      = [0; 6];
 pub static mut GATEWAY_MAC: [u8; 6]  = [0xFF; 6]; // broadcast until ARP resolve
 
@@ -108,40 +117,62 @@ pub fn init() -> bool {
     }
     crate::arch::x86_64::serial::write_str("\r\n");
 
-    // Step 2: ARP resolve gateway — send 3 requests over 2 seconds
-    crate::arch::x86_64::serial::write_str("[NET] Sending ARP for gateway...\r\n");
-    arp::send_request(unsafe { GATEWAY_IP });
-
-    // Poll for ARP reply using PIT ticks (200 ticks = 2s at 100Hz)
-    let start = crate::arch::x86_64::idt::timer_ticks();
-    let mut arp_sends = 1u32;
-    loop {
-        poll_rx();
-        if unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF } {
-            break;
+    // Step 2: DHCP — obtain IP configuration from the network
+    crate::arch::x86_64::serial::write_str("[NET] Starting DHCP...\r\n");
+    let mac = unsafe { OUR_MAC };
+    match dhcp::discover(mac) {
+        Some(lease) => {
+            unsafe {
+                OUR_IP      = lease.your_ip;
+                SUBNET_MASK = lease.subnet;
+                GATEWAY_IP  = lease.gateway;
+                DNS_IP      = lease.dns;
+            }
+            crate::arch::x86_64::serial::write_str("[NET] DHCP configured: ");
+            serial_ip(lease.your_ip);
+            crate::arch::x86_64::serial::write_str("\r\n");
         }
-        let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
-        if elapsed >= 200 { break; } // 2 second timeout
-        // Re-send ARP every 0.5s (50 ticks)
-        if elapsed >= arp_sends as u64 * 50 {
-            arp::send_request(unsafe { GATEWAY_IP });
-            arp_sends += 1;
+        None => {
+            crate::arch::x86_64::serial::write_str("[NET] DHCP failed — using link-local 169.254.1.1\r\n");
+            unsafe {
+                OUR_IP      = [169, 254, 1, 1];
+                SUBNET_MASK = [255, 255, 0, 0];
+                GATEWAY_IP  = [0; 4];
+                DNS_IP      = [0; 4];
+            }
         }
-        unsafe { core::arch::asm!("hlt"); } // sleep until next IRQ (timer or NIC)
     }
 
-    let gw_resolved = unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF };
-    if gw_resolved {
-        crate::arch::x86_64::serial::write_str("[NET] Gateway MAC resolved\r\n");
-        // Store resolved gateway in ARP cache
-        let gw_ip  = unsafe { GATEWAY_IP };
-        let gw_mac = unsafe { GATEWAY_MAC };
-        arp::cache_update(gw_ip, gw_mac);
-    } else {
-        // QEMU SLIRP doesn't answer ARP normally — set gateway to broadcast
-        // so packets still reach the virtual gateway
-        unsafe { GATEWAY_MAC = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]; }
-        crate::arch::x86_64::serial::write_str("[NET] Gateway ARP timeout (using broadcast)\r\n");
+    // Step 3: ARP resolve gateway (if we have one)
+    let gw = unsafe { GATEWAY_IP };
+    if gw != [0, 0, 0, 0] {
+        crate::arch::x86_64::serial::write_str("[NET] ARP resolving gateway...\r\n");
+        arp::send_request(gw);
+
+        let start = crate::arch::x86_64::idt::timer_ticks();
+        let mut arp_sends = 1u32;
+        loop {
+            poll_rx();
+            if unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF } {
+                break;
+            }
+            let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
+            if elapsed >= 200 { break; }
+            if elapsed >= arp_sends as u64 * 50 {
+                arp::send_request(gw);
+                arp_sends += 1;
+            }
+            unsafe { core::arch::asm!("hlt"); }
+        }
+
+        let gw_resolved = unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF };
+        if gw_resolved {
+            crate::arch::x86_64::serial::write_str("[NET] Gateway MAC resolved\r\n");
+            let gw_mac = unsafe { GATEWAY_MAC };
+            arp::cache_update(gw, gw_mac);
+        } else {
+            crate::arch::x86_64::serial::write_str("[NET] Gateway ARP timeout\r\n");
+        }
     }
 
     NET_UP.store(true, Ordering::Relaxed);
@@ -284,4 +315,14 @@ fn serial_hex_byte(v: u8) {
     let hex = b"0123456789abcdef";
     crate::arch::x86_64::serial::write_byte(hex[(v >> 4) as usize]);
     crate::arch::x86_64::serial::write_byte(hex[(v & 0xF) as usize]);
+}
+
+fn serial_ip(ip: [u8; 4]) {
+    for i in 0..4 {
+        let mut v = ip[i];
+        if v >= 100 { crate::arch::x86_64::serial::write_byte(b'0' + v / 100); v %= 100; crate::arch::x86_64::serial::write_byte(b'0' + v / 10); }
+        else if v >= 10 { crate::arch::x86_64::serial::write_byte(b'0' + v / 10); }
+        crate::arch::x86_64::serial::write_byte(b'0' + v % 10);
+        if i < 3 { crate::arch::x86_64::serial::write_byte(b'.'); }
+    }
 }

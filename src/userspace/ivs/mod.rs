@@ -295,7 +295,7 @@ fn cmd_verify_net(_args: &str) {
             gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]
         ));
     } else {
-        warn("ARP gateway not responding (SLIRP NAT may not answer ARP — TX still works via broadcast)\n");
+        warn("ARP gateway not responding — check cable / DHCP / gateway config\n");
     }
 
     // --- 6. ARP cache state ---

@@ -162,7 +162,6 @@ pub fn parse_ntp_response(response: &[u8]) -> Result<u64, SntpError> {
 
 /// Static NTP server addresses tried in order by `sync_system_time`.
 pub const NTP_FALLBACKS: &[[u8; 4]] = &[
-    [10,  0,   2,   2],  // QEMU SLIRP gateway (typically responds to NTP)
     [216, 239, 35,  0],  // time1.google.com
     [216, 239, 35,  4],  // time4.google.com
     [162, 159, 200, 1],  // time.cloudflare.com

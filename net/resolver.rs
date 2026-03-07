@@ -189,12 +189,11 @@ pub fn hosts_lookup(name: &str) -> Option<[u8; 4]> {
 /// Steps:
 /// 1. If `name` is already a dotted-decimal address, return it immediately.
 /// 2. Search `/etc/hosts`.
-/// 3. Future: DNS query.
+/// 3. DNS query via the configured DNS server (from DHCP).
 ///
 /// # Errors
 /// * `ResolveError::NotFound` — name not resolvable via any available method.
-/// * `ResolveError::HostsUnavailable` — /etc/hosts missing and no other
-///   fallback succeeded.
+/// * `ResolveError::HostsUnavailable` — /etc/hosts missing and DNS also failed.
 pub fn resolve_host(name: &str) -> Result<[u8; 4], ResolveError> {
     // Step 0: Dotted-decimal literal?
     if let Some(ip) = parse_ipv4(name) {
@@ -202,18 +201,17 @@ pub fn resolve_host(name: &str) -> Result<[u8; 4], ResolveError> {
     }
 
     // Step 1: /etc/hosts
-    match crate::fs::read_file("/etc/hosts") {
-        Some(data) => {
-            let entries = parse_hosts_bytes(&data);
-            if let Some(ip) = entries_lookup(&entries, name) {
-                return Ok(ip);
-            }
+    if let Some(data) = crate::fs::read_file("/etc/hosts") {
+        let entries = parse_hosts_bytes(&data);
+        if let Some(ip) = entries_lookup(&entries, name) {
+            return Ok(ip);
         }
-        None => return Err(ResolveError::HostsUnavailable),
     }
 
-    // Step 2: DNS (not yet implemented)
-    // return dns_query(name).map_err(|_| ResolveError::NotFound);
+    // Step 2: DNS query (real UDP to DNS server from DHCP)
+    if let Some(ip) = super::dns::resolve(name) {
+        return Ok(ip);
+    }
 
     Err(ResolveError::NotFound)
 }

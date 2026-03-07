@@ -27,7 +27,11 @@ pub fn handle_ipv4(data: &[u8]) {
 
     // Check if this packet is for us
     let our_ip = unsafe { super::OUR_IP };
-    if dst_ip != our_ip && dst_ip != [255, 255, 255, 255] { return; }
+    // Accept: unicast to our IP, broadcast (255.255.255.255),
+    // or anything when our IP is 0.0.0.0 (DHCP discovery phase)
+    if dst_ip != our_ip && dst_ip != [255, 255, 255, 255] && our_ip != [0, 0, 0, 0] {
+        return;
+    }
 
     let payload = &data[header_len..total_len];
 

@@ -141,7 +141,7 @@ pub fn cmd_ping(args: &str) {
     if args.is_empty() {
         err("ping: missing host\n");
         dim("Usage: ping [-c N] [-i secs] <host|ip>\n");
-        dim("  Example: ping 10.0.2.2\n");
+        dim("  Example: ping 8.8.8.8\n");
         dim("  Example: ping -c 3 localhost\n");
         return;
     }
@@ -321,7 +321,7 @@ pub fn cmd_traceroute(args: &str) {
     if args.is_empty() {
         err("traceroute: missing host\n");
         dim("Usage: traceroute [-m max_hops] [-w secs] <host|ip>\n");
-        dim("  Example: traceroute 10.0.2.2\n");
+        dim("  Example: traceroute 8.8.8.8\n");
         return;
     }
 
@@ -395,9 +395,6 @@ pub fn cmd_traceroute(args: &str) {
     puts(&format!(", {} hops max\n", max_hops));
 
     // ── Probe loop ────────────────────────────────────────────────────────────
-    // SLIRP detection: count hops that got all-timeout before destination replies.
-    let mut timeout_hops: u8 = 0;
-
     for ttl in 1u8..=max_hops {
         // Print hop number (right-aligned, 2 chars)
         if ttl < 10 { puts(" "); }
@@ -450,38 +447,11 @@ pub fn cmd_traceroute(args: &str) {
             let ip_s = format!("{}.{}.{}.{}", last_src[0], last_src[1], last_src[2], last_src[3]);
             ok(&format!(" {}\n", ip_s));
         } else {
-            timeout_hops += 1;
             puts("(no reply)\n");
         }
 
         // Destination reached — stop probing
-        if reached {
-            // SLIRP/NAT detection: destination replied early while all previous
-            // hops timed out.  This is the classic QEMU user-mode network
-            // (SLIRP) signature: it does not forward ICMP Time Exceeded replies
-            // from real routers back to the guest, so every intermediate hop
-            // shows "* * *".  Then, because SLIRP reinjects the ICMP echo with
-            // its own TTL, the destination appears reachable in very few hops.
-            if timeout_hops > 0 && ttl <= 10 {
-                let dst_s = format!("{}.{}.{}.{}",
-                    dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-                puts("\n");
-                dim("[SLIRP/NAT] ");
-                err("WARNING: path above does NOT reflect reality.\n");
-                dim("  QEMU user-mode networking (SLIRP) operates as a NAT on the host.\n");
-                dim("  It does not forward ICMP Time Exceeded replies back to the guest,\n");
-                dim("  so all intermediate routers appear as timeouts.\n");
-                dim("  SLIRP also overwrites the outgoing TTL, making the destination\n");
-                dim("  respond within ");
-                put_usize(ttl as usize);
-                dim(" hop(s) regardless of the real distance.\n");
-                dim("  Actual internet path to ");
-                puts(&dst_s);
-                dim(" has significantly more hops.\n");
-                dim("  Use bare-metal or bridged (TAP) networking for a real traceroute.\n");
-            }
-            break;
-        }
+        if reached { break; }
 
         // Ctrl+C bail-out
         if check_ctrl_c() {
@@ -627,12 +597,19 @@ pub fn cmd_curl(args: &str) {
     if args.is_empty() {
         err("curl: missing URL\n");
         dim("Usage: curl http://<host>[:port][/path]\n");
-        dim("       curl http://10.0.2.2/\n");
+        dim("       curl http://example.com/\n");
         return;
     }
 
     if !crate::net::is_up() {
         err("curl: network is down\n");
+        return;
+    }
+
+    // Handle scheme
+    if args.starts_with("https://") {
+        err("curl: HTTPS (TLS) is not supported — use http://\n");
+        dim("  Example: curl http://example.com/\n");
         return;
     }
 
