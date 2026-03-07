@@ -596,8 +596,8 @@ pub fn cmd_curl(args: &str) {
     let args = args.trim();
     if args.is_empty() {
         err("curl: missing URL\n");
-        dim("Usage: curl http://<host>[:port][/path]\n");
-        dim("       curl http://example.com/\n");
+        dim("Usage: curl [http|https]://<host>[:port][/path]\n");
+        dim("       curl https://example.com/\n");
         return;
     }
 
@@ -606,15 +606,14 @@ pub fn cmd_curl(args: &str) {
         return;
     }
 
-    // Handle scheme
-    if args.starts_with("https://") {
-        err("curl: HTTPS (TLS) is not supported — use http://\n");
-        dim("  Example: curl http://example.com/\n");
-        return;
-    }
-
-    // Strip optional "http://"
-    let rest = if args.starts_with("http://") { &args[7..] } else { args };
+    // Determine scheme
+    let (use_tls, rest, default_port) = if args.starts_with("https://") {
+        (true, &args[8..], 443u16)
+    } else if args.starts_with("http://") {
+        (false, &args[7..], 80u16)
+    } else {
+        (false, args, 80u16)
+    };
 
     // Split hostport from path
     let (hostport, path) = match rest.find('/') {
@@ -625,10 +624,10 @@ pub fn cmd_curl(args: &str) {
     // Split host from optional port
     let (host_str, port) = match hostport.rfind(':') {
         Some(c) => {
-            let p = hostport[c+1..].parse::<u16>().unwrap_or(80);
+            let p = hostport[c+1..].parse::<u16>().unwrap_or(default_port);
             (&hostport[..c], p)
         }
-        None => (hostport, 80u16),
+        None => (hostport, default_port),
     };
 
     // Resolve hostname → IPv4
@@ -644,83 +643,142 @@ pub fn cmd_curl(args: &str) {
         }
     };
 
-    dim(&format!("Connecting to {}:{} ({})\n", host_str, port,
+    dim(&format!("Connecting to {}:{}{} ({})\n", host_str, port,
+        if use_tls { " [TLS]" } else { "" },
         format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])));
 
-    // TCP connect
-    let conn = match crate::net::tcp::tcp_connect(ip, port) {
-        Ok(c)  => c,
-        Err(e) => {
-            err("curl: connect failed: ");
-            err(e.as_str());
-            err("\n");
-            return;
-        }
-    };
+    if use_tls {
+        // ─── HTTPS path: TCP connect → TLS handshake → send/recv encrypted ──
+        match crate::net::tls::connect(ip, port, host_str) {
+            Ok(mut tls) => {
+                ok("TLS connected.\n");
 
-    ok("Connected.\n");
+                let req = format!(
+                    "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: AETERNA/1.1\r\nConnection: close\r\n\r\n",
+                    path, host_str
+                );
+                if let Err(e) = tls.send(req.as_bytes()) {
+                    err("curl: TLS send failed: ");
+                    err(e);
+                    err("\n");
+                    tls.close();
+                    return;
+                }
 
-    // Send HTTP/1.0 GET
-    let req = format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: AETERNA/1.1\r\nConnection: close\r\n\r\n",
-        path, host_str
-    );
-    if let Err(e) = crate::net::tcp::tcp_send(conn, req.as_bytes()) {
-        err("curl: send failed: ");
-        err(e.as_str());
-        err("\n");
-        crate::net::tcp::tcp_close(conn);
-        return;
-    }
+                let mut total_bytes = 0usize;
+                let mut buf = [0u8; 4096];
+                let mut tail4 = [0u8; 4];
+                let mut headers_done = false;
 
-    // Receive HTTP response and display it
-    let mut total_bytes = 0usize;
-    let mut buf = [0u8; 512];
-    // Track last 4 received bytes to detect end-of-headers (\r\n\r\n)
-    let mut tail4 = [0u8; 4];
-    let mut headers_done = false;
+                loop {
+                    if check_ctrl_c() { dim("\n[interrupted]\n"); break; }
 
-    loop {
-        if check_ctrl_c() { dim("\n[interrupted]\n"); break; }
-
-        match crate::net::tcp::tcp_recv(conn, &mut buf, 200) {
-            Ok(0) => break, // connection closed
-            Ok(n) => {
-                total_bytes += n;
-                let data = &buf[..n];
-
-                for &b in data {
-                    // Update sliding 4-byte window to detect \r\n\r\n
-                    if !headers_done {
-                        tail4[0] = tail4[1];
-                        tail4[1] = tail4[2];
-                        tail4[2] = tail4[3];
-                        tail4[3] = b;
-                        if &tail4 == b"\r\n\r\n" { headers_done = true; }
-                        // Print header line in dim colour
-                        if b >= 0x20 || b == b'\n' || b == b'\r' {
-                            framebuffer::draw_char(b as char, FG_DIM, BG);
+                    match tls.recv(&mut buf, 300) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total_bytes += n;
+                            for &b in &buf[..n] {
+                                if !headers_done {
+                                    tail4[0] = tail4[1]; tail4[1] = tail4[2];
+                                    tail4[2] = tail4[3]; tail4[3] = b;
+                                    if &tail4 == b"\r\n\r\n" { headers_done = true; }
+                                    if b >= 0x20 || b == b'\n' || b == b'\r' {
+                                        framebuffer::draw_char(b as char, FG_DIM, BG);
+                                    }
+                                } else {
+                                    if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
+                                        framebuffer::draw_char(b as char, FG, BG);
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        // Print body in normal colour
-                        if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
-                            framebuffer::draw_char(b as char, FG, BG);
+                        Err(e) => {
+                            err("\ncurl: TLS recv error: ");
+                            err(e);
+                            err("\n");
+                            break;
                         }
                     }
                 }
+
+                tls.close();
+                puts("\n");
+                dim(&format!("[{} bytes received, TLS]\n", total_bytes));
             }
-            Err(crate::net::tcp::TcpError::TimedOut)
-            | Err(crate::net::tcp::TcpError::WouldBlock) => break,
             Err(e) => {
-                err("\ncurl: recv error: ");
-                err(e.as_str());
+                err("curl: TLS handshake failed: ");
+                err(e);
                 err("\n");
-                break;
             }
         }
-    }
+    } else {
+        // ─── HTTP path: plain TCP ────────────────────────────────────────────
+        let conn = match crate::net::tcp::tcp_connect(ip, port) {
+            Ok(c)  => c,
+            Err(e) => {
+                err("curl: connect failed: ");
+                err(e.as_str());
+                err("\n");
+                return;
+            }
+        };
 
-    crate::net::tcp::tcp_close(conn);
-    puts("\n");
-    dim(&format!("[{} bytes received]\n", total_bytes));
+        ok("Connected.\n");
+
+        let req = format!(
+            "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: AETERNA/1.1\r\nConnection: close\r\n\r\n",
+            path, host_str
+        );
+        if let Err(e) = crate::net::tcp::tcp_send(conn, req.as_bytes()) {
+            err("curl: send failed: ");
+            err(e.as_str());
+            err("\n");
+            crate::net::tcp::tcp_close(conn);
+            return;
+        }
+
+        let mut total_bytes = 0usize;
+        let mut buf = [0u8; 512];
+        let mut tail4 = [0u8; 4];
+        let mut headers_done = false;
+
+        loop {
+            if check_ctrl_c() { dim("\n[interrupted]\n"); break; }
+
+            match crate::net::tcp::tcp_recv(conn, &mut buf, 200) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total_bytes += n;
+                    let data = &buf[..n];
+
+                    for &b in data {
+                        if !headers_done {
+                            tail4[0] = tail4[1]; tail4[1] = tail4[2];
+                            tail4[2] = tail4[3]; tail4[3] = b;
+                            if &tail4 == b"\r\n\r\n" { headers_done = true; }
+                            if b >= 0x20 || b == b'\n' || b == b'\r' {
+                                framebuffer::draw_char(b as char, FG_DIM, BG);
+                            }
+                        } else {
+                            if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
+                                framebuffer::draw_char(b as char, FG, BG);
+                            }
+                        }
+                    }
+                }
+                Err(crate::net::tcp::TcpError::TimedOut)
+                | Err(crate::net::tcp::TcpError::WouldBlock) => break,
+                Err(e) => {
+                    err("\ncurl: recv error: ");
+                    err(e.as_str());
+                    err("\n");
+                    break;
+                }
+            }
+        }
+
+        crate::net::tcp::tcp_close(conn);
+        puts("\n");
+        dim(&format!("[{} bytes received]\n", total_bytes));
+    }
 }

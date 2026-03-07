@@ -24,6 +24,7 @@ pub mod tcp;
 pub mod dhcp;
 pub mod dns;
 pub mod sntp;
+pub mod tls;
 pub mod resolver;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
