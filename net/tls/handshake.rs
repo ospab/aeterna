@@ -57,9 +57,15 @@ const HS_CLIENT_KEY_EXCH:   u8 = 16;
 const HS_FINISHED:          u8 = 20;
 
 // Cipher suite IDs
-const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02B;
+const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02F;
+const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02B;
 const TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256: u16 = 0xC027;
 const TLS_RSA_WITH_AES_128_CBC_SHA256:       u16 = 0x003C;
+
+fn is_gcm_suite(suite: u16) -> bool {
+    suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        || suite == TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+}
 
 const HS_SERVER_KEY_EXCHANGE: u8 = 12;
 
@@ -123,9 +129,10 @@ fn build_client_hello(client_random: &[u8; 32], hostname: &str) -> Vec<u8> {
     // Session ID length = 0
     hs.push(0);
 
-    // Cipher suites: GCM preferred → CBC ECDHE → CBC RSA; RFC 5746 SCSV mandatory
-    hs.push(0x00); hs.push(0x08); // 8 bytes = 4 entries
-    hs.push(0xC0); hs.push(0x2B); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    // Cipher suites: GCM preferred (RSA/ECDSA) → CBC ECDHE → CBC RSA; RFC 5746 SCSV mandatory
+    hs.push(0x00); hs.push(0x0A); // 10 bytes = 5 entries
+    hs.push(0xC0); hs.push(0x2F); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    hs.push(0xC0); hs.push(0x2B); // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
     hs.push(0xC0); hs.push(0x27); // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
     hs.push(0x00); hs.push(0x3C); // TLS_RSA_WITH_AES_128_CBC_SHA256
     hs.push(0x00); hs.push(0xFF); // TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746)
@@ -169,9 +176,12 @@ fn build_client_hello(client_random: &[u8; 32], hostname: &str) -> Vec<u8> {
     // Signature algorithms extension (type 0x000D)
     {
         let sig_algs: &[u8] = &[
-            0x04, 0x01, // SHA256 + RSA
-            0x05, 0x01, // SHA384 + RSA
-            0x06, 0x01, // SHA512 + RSA
+            0x04, 0x01, // SHA256 + RSA PKCS1v1.5
+            0x04, 0x03, // SHA256 + ECDSA
+            0x05, 0x01, // SHA384 + RSA PKCS1v1.5
+            0x05, 0x03, // SHA384 + ECDSA
+            0x06, 0x01, // SHA512 + RSA PKCS1v1.5
+            0x06, 0x03, // SHA512 + ECDSA
             0x02, 0x01, // SHA1   + RSA (fallback)
         ];
         let algs_len = sig_algs.len();
@@ -193,6 +203,21 @@ fn build_client_hello(client_random: &[u8; 32], hostname: &str) -> Vec<u8> {
     exts.push(0xFF); exts.push(0x01);
     exts.push(0x00); exts.push(0x01); // extension data length = 1
     exts.push(0x00);                  // renegotiated_connection length = 0
+
+    // supported_versions (type 0x002B) — RFC 8446: explicitly advertise TLS 1.2
+    // Required by nginx/OpenSSL 1.1+ even for TLS 1.2 negotiation
+    exts.push(0x00); exts.push(0x2B); // extension type
+    exts.push(0x00); exts.push(0x03); // extension data length = 3
+    exts.push(0x02);                   // versions list length = 2
+    exts.push(0x03); exts.push(0x03); // TLS 1.2 (0x0303)
+
+    // ALPN (type 0x0010) — RFC 7301: http/1.1 protocol negotiation
+    // Required by many HTTPS servers to select application protocol
+    exts.push(0x00); exts.push(0x10); // extension type
+    exts.push(0x00); exts.push(0x0B); // extension data length = 11
+    exts.push(0x00); exts.push(0x09); // protocol list length = 9
+    exts.push(0x08);                   // "http/1.1" length = 8
+    exts.extend_from_slice(b"http/1.1");
 
     // Extensions total length
     hs.push((exts.len() >> 8) as u8);
@@ -297,7 +322,7 @@ fn derive_keys(
     ks_seed[..32].copy_from_slice(server_random);
     ks_seed[32..].copy_from_slice(client_random);
 
-    let (keys, kb_len) = if cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+    let (keys, kb_len) = if is_gcm_suite(cipher_suite) {
         // GCM: no MAC keys, just enc_key(16) + enc_key(16) + implicit_iv(4) + implicit_iv(4) = 40
         let kb = prf::prf(&master_secret, b"key expansion", &ks_seed, 40);
         let mut client_enc_key = [0u8; 16];
@@ -456,7 +481,7 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
     let pre_master_secret_vec: Vec<u8>;
     let cke_hs: Vec<u8>;
 
-    if sh.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    if is_gcm_suite(sh.cipher_suite)
         || sh.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
     {
         // ECDHE path (GCM or CBC)
@@ -529,7 +554,7 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
 
     let finished_hs = wrap_handshake(HS_FINISHED, &client_vd);
     // The Finished message is ENCRYPTED
-    let finished_record = if keys.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+    let finished_record = if is_gcm_suite(keys.cipher_suite) {
         record::build_gcm_record(
             record::CT_HANDSHAKE, &finished_hs, 0,
             &keys.client_enc_key, &keys.client_gcm_iv,
@@ -563,7 +588,7 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
             }
             record::CT_HANDSHAKE if got_server_ccs => {
                 // This is the encrypted Finished
-                let decrypted = if keys.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+                let decrypted = if is_gcm_suite(keys.cipher_suite) {
                     record::decrypt_gcm_record(
                         record::CT_HANDSHAKE, &payload, 0,
                         &keys.server_enc_key, &keys.server_gcm_iv,
@@ -628,7 +653,7 @@ impl TlsConn {
             let chunk_end = core::cmp::min(offset + record::MAX_FRAGMENT, data.len());
             let chunk = &data[offset..chunk_end];
 
-            let enc_record = if keys.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+            let enc_record = if is_gcm_suite(keys.cipher_suite) {
                 record::build_gcm_record(
                     record::CT_APP_DATA,
                     chunk,
@@ -680,7 +705,7 @@ impl TlsConn {
             match ct {
                 record::CT_APP_DATA => {
                     let keys = self.keys.as_ref().ok_or("TLS: no keys")?;
-                    let decrypted = if keys.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+                    let decrypted = if is_gcm_suite(keys.cipher_suite) {
                         record::decrypt_gcm_record(
                             record::CT_APP_DATA,
                             &payload,
@@ -721,7 +746,7 @@ impl TlsConn {
         if let Some(ref keys) = self.keys {
             // close_notify alert: level=warning(1), description=close_notify(0)
             let alert = [1u8, 0];
-            let enc = if keys.cipher_suite == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+            let enc = if is_gcm_suite(keys.cipher_suite) {
                 record::build_gcm_record(
                     record::CT_ALERT,
                     &alert,
