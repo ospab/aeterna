@@ -795,14 +795,27 @@ pub fn tcp_recv_nb(conn: usize, buf: &mut [u8]) -> Result<usize, TcpError> {
     unsafe {
         let c = &mut CONNS[conn];
         let n = c.rx_ring.read(buf);
-        if n > 0 { return Ok(n); }
+        if n == 0 {
+            match c.state {
+                TcpState::Closed | TcpState::CloseWait => return Ok(0),
+                _ => return Err(TcpError::WouldBlock),
+            }
+        }
+        Ok(n)
+    }
+}
 
-        match c.state {
-            TcpState::Established => Err(TcpError::WouldBlock),
-            TcpState::CloseWait | TcpState::Closed => Ok(0),
-            _ => Err(TcpError::NotConnected),
+/// Returns the number of connections in non-Closed state.
+pub fn active_connection_count() -> usize {
+    let mut count = 0;
+    unsafe {
+        for i in 0..MAX_CONNS {
+            if CONNS[i].state != TcpState::Closed {
+                count += 1;
+            }
         }
     }
+    count
 }
 
 /// Close a connection gracefully (sends FIN).

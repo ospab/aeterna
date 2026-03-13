@@ -202,28 +202,43 @@ pub fn dump_pci_nics() {
 pub fn dump_active_nic() {
     s("═══ NETDIAG: ACTIVE NIC STATE ═══\r\n");
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         s("  Network stack is DOWN (net::is_up() == false)\r\n");
         s("  net::init() either failed or was not called.\r\n");
         return;
     }
 
-    let nic = crate::net::nic_name();
+    let nic = crate::userspace::net::nic_name();
     s("  Driver: "); s(nic); nl();
-    s("  MAC: "); mac(unsafe { crate::net::OUR_MAC }); nl();
-    s("  IP:  "); ip(unsafe { crate::net::OUR_IP }); nl();
-    s("  GW:  "); ip(unsafe { crate::net::GATEWAY_IP }); nl();
-    s("  Mask:"); ip(unsafe { crate::net::SUBNET_MASK }); nl();
-    s("  GW MAC: "); mac(unsafe { crate::net::GATEWAY_MAC }); nl();
-    s("  RX packets: "); dec(crate::net::rx_packets()); nl();
-    s("  TX packets: "); dec(crate::net::tx_packets()); nl();
+    s("  MAC: "); mac(unsafe { crate::userspace::net::OUR_MAC }); nl();
+    s("  IP:  "); ip(unsafe { crate::userspace::net::OUR_IP }); nl();
+    s("  GW:  "); ip(unsafe { crate::userspace::net::GATEWAY_IP }); nl();
+    s("  Mask:"); ip(unsafe { crate::userspace::net::SUBNET_MASK }); nl();
+    s("  GW MAC: "); mac(unsafe { crate::userspace::net::GATEWAY_MAC }); nl();
+    s("  RX packets: "); dec(crate::userspace::net::rx_packets()); nl();
+    s("  TX packets: "); dec(crate::userspace::net::tx_packets()); nl();
 
-    match unsafe { crate::net::ACTIVE_NIC } {
+    match unsafe { crate::userspace::net::ACTIVE_NIC } {
         0 => dump_rtl8139_regs(),
         1 => dump_e1000_regs(),
         2 => dump_rtl8169_regs(),
+        3 => dump_virtio_net_active(),
         _ => { s("  Unknown NIC ID\r\n"); }
     }
+
+    dump_tcp_status();
+}
+
+fn dump_virtio_net_active() {
+    s("  ── VirtIO-Net Active State ──\r\n");
+    // This calls the generic probe but for the active device
+    dump_virtio_net(); 
+}
+
+fn dump_tcp_status() {
+    s("  ── TCP Stack Status ──\r\n");
+    let active = crate::userspace::net::tcp::active_connection_count();
+    s("  Active connections: "); dec(active as u64); nl();
 }
 
 fn dump_rtl8139_regs() {
@@ -742,20 +757,20 @@ fn dump_virtio_modern_caps(bus: u8, dev: u8) {
 pub fn tx_self_test() {
     s("═══ NETDIAG: TX SELF-TEST ═══\r\n");
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         s("  SKIP: network not up\r\n");
         return;
     }
 
-    let tx_before = crate::net::tx_packets();
+    let tx_before = crate::userspace::net::tx_packets();
     s("  TX counter before: "); dec(tx_before); nl();
 
     // Send an ARP request to gateway
-    let gw = unsafe { crate::net::GATEWAY_IP };
+    let gw = unsafe { crate::userspace::net::GATEWAY_IP };
     s("  Sending ARP request for "); ip(gw); s("...\r\n");
-    crate::net::arp::send_request(gw);
+    crate::userspace::net::arp::send_request(gw);
 
-    let tx_after = crate::net::tx_packets();
+    let tx_after = crate::userspace::net::tx_packets();
     s("  TX counter after:  "); dec(tx_after); nl();
 
     if tx_after > tx_before {
@@ -766,14 +781,14 @@ pub fn tx_self_test() {
 
     // Wait ~500ms and poll for any RX activity
     s("  Polling RX for 500ms...\r\n");
-    let rx_before = crate::net::rx_packets();
+    let rx_before = crate::userspace::net::rx_packets();
     let deadline = crate::arch::x86_64::idt::timer_ticks() + 50; // 500ms
     loop {
-        crate::net::poll_rx();
+        crate::userspace::net::poll_rx();
         if crate::arch::x86_64::idt::timer_ticks() >= deadline { break; }
         unsafe { asm!("hlt"); }
     }
-    let rx_after = crate::net::rx_packets();
+    let rx_after = crate::userspace::net::rx_packets();
     s("  RX packets during test: "); dec(rx_after - rx_before); nl();
     if rx_after > rx_before {
         s("  RX path OK (packets received)\r\n");
@@ -810,21 +825,21 @@ pub fn run_full_diagnostic() {
 
     s("\r\n");
     s("═══ NETDIAG: SUMMARY ═══\r\n");
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         s("  RESULT: Network stack is DOWN.\r\n");
         s("  ACTION: Check QEMU flags, PCI NIC presence, and driver probe.\r\n");
     } else {
         s("  RESULT: Network stack is UP (");
-        s(crate::net::nic_name());
+        s(crate::userspace::net::nic_name());
         s(")\r\n");
-        let (r0, _, _, _) = crate::net::diag();
-        if crate::net::nic_name() == "Intel e1000" && r0 & 2 == 0 {
+        let (r0, _, _, _) = crate::userspace::net::diag();
+        if crate::userspace::net::nic_name() == "Intel e1000" && r0 & 2 == 0 {
             s("  WARNING: e1000 link is DOWN.\r\n");
         }
-        if crate::net::tx_packets() == 0 {
+        if crate::userspace::net::tx_packets() == 0 {
             s("  WARNING: 0 TX packets — nothing has been transmitted.\r\n");
         }
-        if crate::net::rx_packets() == 0 {
+        if crate::userspace::net::rx_packets() == 0 {
             s("  WARNING: 0 RX packets — nothing has been received.\r\n");
         }
     }
@@ -854,7 +869,7 @@ pub fn run_screen_summary() {
     framebuffer::draw_string("  Network Diagnostics Summary\n", FG_WARN, BG);
     dm("  ──────────────────────────────\n");
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         er("  Status  : DOWN\n");
         er("  No NIC detected or driver probe failed.\n");
         er("  Check QEMU flags (-netdev/-device) and kernel build.\n\n");
@@ -865,11 +880,11 @@ pub fn run_screen_summary() {
 
     // Driver name
     p("  Driver  : ");
-    p(crate::net::nic_name());
+    p(crate::userspace::net::nic_name());
     p("\n");
 
     // MAC address
-    let mac = unsafe { crate::net::OUR_MAC };
+    let mac = unsafe { crate::userspace::net::OUR_MAC };
     {
         let hex = b"0123456789abcdef";
         p("  MAC     : ");
@@ -882,27 +897,32 @@ pub fn run_screen_summary() {
     }
 
     // IP address
-    let ip = unsafe { crate::net::OUR_IP };
+    let ip = unsafe { crate::userspace::net::OUR_IP };
     p("  IP      : ");
     p(&alloc::format!("{}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
 
     // RX / TX packet counts
-    let rx = crate::net::rx_packets();
-    let tx = crate::net::tx_packets();
+    let rx = crate::userspace::net::rx_packets();
+    let tx = crate::userspace::net::tx_packets();
     p("  RX pkts : ");
     p(&alloc::format!("{}\n", rx));
     p("  TX pkts : ");
     p(&alloc::format!("{}\n", tx));
 
     // Link status check for e1000
-    if crate::net::nic_name() == "Intel e1000" {
-        let (r0, _, _, _) = crate::net::diag();
+    if crate::userspace::net::nic_name() == "Intel e1000" {
+        let (r0, _, _, _) = crate::userspace::net::diag();
         if r0 & 2 == 0 {
             wn("  Link    : DOWN (e1000 STATUS.LU=0)\n");
         } else {
             ok("  Link    : Up\n");
         }
     }
+
+    // TCP Connections
+    let tcp_conns = crate::userspace::net::tcp::active_connection_count();
+    p("  TCP     : ");
+    p(&alloc::format!("{} active connections\n", tcp_conns));
 
     // Error rate heuristic: warn if we only ever sent but never received
     if tx > 0 && rx == 0 {

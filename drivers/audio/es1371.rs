@@ -131,6 +131,9 @@ static ES_IRQ:         AtomicU8   = AtomicU8::new(5);
 static DMA_RUNNING:    AtomicBool = AtomicBool::new(false);
 static SAMPLE_RATE_HZ: AtomicU32  = AtomicU32::new(44100);
 
+/// Master volume (0..100)
+static MASTER_VOLUME: AtomicU8 = AtomicU8::new(80);
+
 // ─── I/O port helpers ─────────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -163,6 +166,14 @@ unsafe fn io_w32(off: u16, val: u32) {
 unsafe fn io_delay() {
     let _: u8;
     asm!("in al, dx", in("dx") 0x80u16, out("al") _, options(nomem, nostack));
+}
+
+/// Wait for approximately `ticks` * 10 ms (at 100Hz PIT)
+fn wait_ticks(n: u64) {
+    let start = crate::arch::x86_64::idt::timer_ticks();
+    while crate::arch::x86_64::idt::timer_ticks() < start + n {
+        unsafe { core::arch::asm!("pause"); }
+    }
 }
 
 // ─── AC97 codec read / write (via ES1371 serialiser) ─────────────────────────
@@ -206,30 +217,49 @@ unsafe fn codec_read(reg: u8) -> u16 {
 /// Try to initialise the ES1371/ES1373 driver.  Returns `true` on success.
 pub fn init() -> bool {
     // ── PCI discovery ────────────────────────────────────────────────────────
-    let mut found_pos: Option<(u8, u8, u8)> = None;
-    let known: [(u16, u16); 3] = [
-        (VID_ENSONIQ, DID_ES1371),
-        (VID_ENSONIQ, DID_ES1373),
-        (VID_ENSONIQ, DID_CT5880),
-    ];
-    'scan: for b in 0u8..=255 {
-        for d in 0u8..32 {
-            let vid = crate::pci::vendor_id(b, d, 0);
-            if vid == 0xFFFF { continue; }
-            let did = crate::pci::device_id(b, d, 0);
-            for &(kv, kd) in &known {
-                if vid == kv && did == kd {
-                    found_pos = Some((b, d, 0));
-                    break 'scan;
+    let (bus, dev, func) = {
+        let known: [(u16, u16); 3] = [
+            (VID_ENSONIQ, DID_ES1371),
+            (VID_ENSONIQ, DID_ES1373),
+            (VID_ENSONIQ, DID_CT5880),
+        ];
+
+        let mut found_pos: Option<(u8, u8, u8)> = None;
+        'scan: for b in 0u8..=255 {
+            for d in 0u8..32 {
+                for f in 0..8u8 {
+                    let vid = crate::pci::vendor_id(b, d, f);
+                    if vid == 0xFFFF { continue; }
+                    let did = crate::pci::device_id(b, d, f);
+                    let (class, subclass, _) = crate::pci::class_code(b, d, f);
+
+                    // Check common VID:DIDs
+                    let mut is_known = false;
+                    for &(kv, kd) in &known {
+                        if vid == kv && did == kd {
+                            is_known = true;
+                            break;
+                        }
+                    }
+
+                    // Check class: 0x04:0x01:0x00 is common for AudioPCI
+                    // But we must be careful not to grab Intel AC97 if it also matches.
+                    // Usually Intel is 8086. Ensoniq is 1274.
+                    let is_audiopci_class = class == 0x04 && subclass == 0x01 && vid == VID_ENSONIQ;
+
+                    if is_known || is_audiopci_class {
+                        found_pos = Some((b, d, f));
+                        break 'scan;
+                    }
                 }
             }
         }
-    }
-    let (bus, dev, func) = match found_pos {
-        Some(p) => p,
-        None => {
-            serial::write_str("[ES1371] No AudioPCI device found\r\n");
-            return false;
+        match found_pos {
+            Some(p) => p,
+            None => {
+                serial::write_str("[ES1371] No AudioPCI controller found via class or VID:DID\r\n");
+                return false;
+            }
         }
     };
 
@@ -280,29 +310,36 @@ pub fn init() -> bool {
         // ── AC97 codec init ────────────────────────────────────────────────
         //
         // After SYNC_RES release the chip takes up to 1 ms to settle and
-        // clear the AC-Link bus.  Give it that time before touching CODEC.
-        for _ in 0..1_000u32 { io_delay(); }
+        // clear the AC-Link bus.
+        wait_ticks(2); // 20 ms
 
         // AC97 cold reset: write register 0x00 (powerdown) to kick the codec
-        // out of reset state (value doesn't matter for a cold reset write).
+        // out of reset state.
         codec_write(0x00, 0xFFFF);
+        wait_ticks(5); // 50 ms generous wake-up
 
-        // AC97 cold reset settling time ≥ 1 ms (AC97 spec); use 20 ms to be
-        // generous — covers slow VMware / bare-metal codec wake-up.
-        for _ in 0..20_000u32 { io_delay(); }
-
-        // Poll AC97 register 0x26 (Extended Audio Status/Control) until the
-        // codec responds with something other than 0xFFFF (our timeout flag).
-        // 10 attempts × 2 ms (codec_read cap) = 20 ms worst case.
+        // Poll AC97 register 0x26 (Extended Audio Status/Control)
         let mut ready = false;
-        for _ in 0..10u32 {
+        for _ in 0..50u32 {
             let r = codec_read(0x26);
-            if r != 0xFFFF { ready = true; break; }
-            for _ in 0..1_000u32 { io_delay(); }  // 1 ms between attempts
+            if r != 0xFFFF && r != 0x0000 { 
+                ready = true; 
+                break; 
+            }
+            wait_ticks(1); // 10 ms between attempts
         }
+
         if !ready {
-            serial::write_str("[ES1371] Codec not ready — aborting\r\n");
-            return false;
+            // Warm reset attempt: toggle SYNC_RES again
+            io_w32(REG_CTRL, io_r32(REG_CTRL) | CTRL_SYNC_RES);
+            wait_ticks(1);
+            io_w32(REG_CTRL, io_r32(REG_CTRL) & !CTRL_SYNC_RES);
+            wait_ticks(5);
+            
+            if codec_read(0x26) == 0xFFFF {
+                serial::write_str("[ES1371] Codec not ready after cold+warm reset — aborting\r\n");
+                return false;
+            }
         }
 
         // AC97 volume registers (0=max gain, 0x8000=mute)
@@ -438,6 +475,26 @@ pub fn irq_line() -> u8 {
 /// Returns the sample rate the codec was programmed to (Hz).
 pub fn sample_rate() -> u32 {
     SAMPLE_RATE_HZ.load(Ordering::Relaxed)
+}
+
+/// Returns the current master volume (0..100).
+pub fn volume() -> u8 {
+    MASTER_VOLUME.load(Ordering::Relaxed)
+}
+
+/// Set master volume (0..100).
+pub fn set_volume(pct: u8) {
+    let pct = pct.min(100);
+    MASTER_VOLUME.store(pct, Ordering::Relaxed);
+    if !AUDIO_READY.load(Ordering::Acquire) { return; }
+
+    // ES1371 (AC97) volume: 0 = max gain, 0x1F = -46.5 dB, bit 15 = mute
+    let attn = (0x1F - (pct as u16 * 0x1F / 100)) & 0x1F;
+    let val = attn | (attn << 8); // set both channels
+    unsafe {
+        codec_write(0x02, val); // Master Volume
+        codec_write(0x04, val); // Headphone Volume
+    }
 }
 
 // ─── IRQ handler ─────────────────────────────────────────────────────────────

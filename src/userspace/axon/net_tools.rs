@@ -2,7 +2,7 @@
  * axon/net_tools — Network & disk commands: netstat, ping, df
  *
  * Self-contained logical unit.  Contacts the kernel net stack through
- * crate::net::* and the filesystem through crate::fs::*.
+ * crate::userspace::net::* and the filesystem through crate::fs::*.
  *
  * All timer-based deadlines are calibrated for PIT at 100 Hz (10 ms/tick).
  */
@@ -178,9 +178,9 @@ pub fn cmd_ping(args: &str) {
     }
 
     // Resolve: IPv4 literal first, then /etc/hosts
-    let ip = match crate::net::resolver::parse_ipv4(target) {
+    let ip = match crate::userspace::net::resolver::parse_ipv4(target) {
         Some(ip) => ip,
-        None => match crate::net::resolver::resolve_host(target) {
+        None => match crate::userspace::net::resolver::resolve_host(target) {
             Ok(ip) => {
                 ok("Resolved "); puts(target); ok(" -> ");
                 puts(&alloc::format!("{}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
@@ -194,7 +194,7 @@ pub fn cmd_ping(args: &str) {
         },
     };
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         err("ping: network is down\n");
         return;
     }
@@ -202,37 +202,39 @@ pub fn cmd_ping(args: &str) {
     ok("PING "); puts(target); ok(" 56(84) bytes of data\n");
 
     // Ensure ARP is warm for the target (send a gratuitous ARP first)
-    crate::net::arp::send_request(ip);
+    crate::userspace::net::arp::send_request(ip);
     let arp_deadline = crate::arch::x86_64::idt::timer_ticks() + 30; // 300 ms
     while crate::arch::x86_64::idt::timer_ticks() < arp_deadline {
-        crate::net::poll_rx();
-        if crate::net::arp::cache_lookup(ip).is_some() { break; }
+        crate::userspace::net::poll_rx();
+        if crate::userspace::net::arp::cache_lookup(ip).is_some() { break; }
         crate::core::scheduler::sys_yield();
     }
 
     let mut received = 0usize;
+    let mut total_rtt_us = 0u64;
+    let mut min_rtt_us = u64::MAX;
+    let mut max_rtt_us = 0u64;
     for seq in 1..=count {
-        crate::net::icmp::send_ping(ip, seq as u16);
+        crate::userspace::net::icmp::send_ping(ip, seq as u16);
 
-        // Wait up to 3 s (300 ticks @ 100 Hz) for ICMP echo reply
-        let mut reply = None;
-        let deadline = crate::arch::x86_64::idt::timer_ticks() + 300;
-        while crate::arch::x86_64::idt::timer_ticks() < deadline {
-            reply = crate::net::icmp::poll_reply();
-            if reply.is_some() { break; }
-            unsafe { core::arch::asm!("hlt"); }
-        }
-        if reply.is_none() {
-            crate::net::icmp::cancel_wait();
-        }
+        // Wait up to 3 s for matching echo-reply (seq/src filtering in ICMP layer).
+        let reply = crate::userspace::net::icmp::wait_reply_us(3_000_000);
 
         match reply {
             Some(r) => {
                 received += 1;
                 let rtt_us = r.rtt_us;
                 let display_ms = if rtt_us < 1000 { 1 } else { rtt_us / 1000 };
-                ok("64 bytes from "); puts(target);
-                puts(&format!(": icmp_seq={} ttl={} time={}ms\n", seq, r.ttl, display_ms));
+                min_rtt_us = core::cmp::min(min_rtt_us, rtt_us);
+                max_rtt_us = core::cmp::max(max_rtt_us, rtt_us);
+                total_rtt_us = total_rtt_us.saturating_add(rtt_us);
+
+                ok(&format!("{} bytes from {}.{}.{}.{}: icmp_seq={} ttl={} time={}ms\n",
+                    r.nbytes,
+                    r.src_ip[0], r.src_ip[1], r.src_ip[2], r.src_ip[3],
+                    r.seq,
+                    r.ttl,
+                    display_ms));
             }
             None => {
                 err("Request timeout for icmp_seq=");
@@ -244,7 +246,7 @@ pub fn cmd_ping(args: &str) {
         if seq < count {
             let wait = crate::arch::x86_64::idt::timer_ticks() + iticks;
             while crate::arch::x86_64::idt::timer_ticks() < wait {
-                crate::net::poll_rx();
+                crate::userspace::net::poll_rx();
                 unsafe { core::arch::asm!("hlt"); }
             }
         }
@@ -256,6 +258,15 @@ pub fn cmd_ping(args: &str) {
     let loss_pct = if count > 0 { lost * 100 / count } else { 0 };
     dim(&format!("{} packets transmitted, {} received, {}% packet loss\n",
         count, received, loss_pct));
+    if received > 0 {
+        let avg_rtt_us = total_rtt_us / received as u64;
+        dim(&format!(
+            "rtt min/avg/max = {}/{}/{} ms\n",
+            core::cmp::max(1, min_rtt_us / 1000),
+            core::cmp::max(1, avg_rtt_us / 1000),
+            core::cmp::max(1, max_rtt_us / 1000)
+        ));
+    }
 }
 
 // ─── df ──────────────────────────────────────────────────────────────────────
@@ -358,9 +369,9 @@ pub fn cmd_traceroute(args: &str) {
     }
 
     // ── Resolve destination ───────────────────────────────────────────────────
-    let dst_ip = match crate::net::resolver::parse_ipv4(target) {
+    let dst_ip = match crate::userspace::net::resolver::parse_ipv4(target) {
         Some(ip) => ip,
-        None => match crate::net::resolver::resolve_host(target) {
+        None => match crate::userspace::net::resolver::resolve_host(target) {
             Ok(ip) => {
                 ok("Resolved "); puts(target); ok(" -> ");
                 puts(&format!("{}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
@@ -374,18 +385,18 @@ pub fn cmd_traceroute(args: &str) {
         },
     };
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         err("traceroute: network is down\n");
         return;
     }
 
     // ── Warm up ARP for the destination / gateway ─────────────────────────────
-    crate::net::arp::send_request(dst_ip);
+    crate::userspace::net::arp::send_request(dst_ip);
     let arp_dl = crate::arch::x86_64::idt::timer_ticks() + 30;
     while crate::arch::x86_64::idt::timer_ticks() < arp_dl {
-        crate::net::poll_rx();
+        crate::userspace::net::poll_rx();
         crate::core::scheduler::sys_yield();
-        if crate::net::arp::cache_lookup(dst_ip).is_some() { break; }
+        if crate::userspace::net::arp::cache_lookup(dst_ip).is_some() { break; }
     }
 
     // ── Header ────────────────────────────────────────────────────────────────
@@ -408,18 +419,18 @@ pub fn cmd_traceroute(args: &str) {
 
         for probe in 0u16..3 {
             let seq = (ttl as u16) * 10 + probe;
-            crate::net::icmp::send_ping_ttl(dst_ip, seq, ttl);
+            crate::userspace::net::icmp::send_ping_ttl(dst_ip, seq, ttl);
 
             // Wait for reply with TSC-based timeout
             let start = crate::arch::x86_64::tsc::tsc_stamp_us();
             let mut reply = None;
             loop {
-                reply = crate::net::icmp::poll_reply();
+                reply = crate::userspace::net::icmp::poll_reply();
                 if reply.is_some() { break; }
                 let elapsed = crate::arch::x86_64::tsc::tsc_stamp_us()
                     .saturating_sub(start);
                 if elapsed >= timeout_us {
-                    crate::net::icmp::cancel_wait();
+                    crate::userspace::net::icmp::cancel_wait();
                     break;
                 }
                 crate::core::scheduler::sys_yield();
@@ -600,18 +611,18 @@ pub fn cmd_nslookup(args: &str) {
         return;
     }
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         err("nslookup: network is down\n");
         return;
     }
 
-    let dns_ip = unsafe { crate::net::DNS_IP };
+    let dns_ip = unsafe { crate::userspace::net::DNS_IP };
     let dns_str = format!("{}.{}.{}.{}", dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]);
 
     dim(&format!("Server:\t\t{}\n", dns_str));
     dim(&format!("Address:\t{}#53\n\n", dns_str));
 
-    match crate::net::resolver::resolve_host(args) {
+    match crate::userspace::net::resolver::resolve_host(args) {
         Ok(ip) => {
             dim("Non-authoritative answer:\n");
             puts(&format!("Name:\t{}\n", args));
@@ -675,7 +686,7 @@ pub fn cmd_curl(args: &str) {
         return;
     }
 
-    if !crate::net::is_up() { err("curl: network is down\n"); return; }
+    if !crate::userspace::net::is_up() { err("curl: network is down\n"); return; }
 
     // ── Parse flags ───────────────────────────────────────────────────────────
     let mut head_only   = false; // -I / --head
@@ -739,7 +750,7 @@ pub fn cmd_curl(args: &str) {
         };
 
         // ── Resolve ──────────────────────────────────────────────────────────
-        let ip = match crate::net::resolver::resolve_host(&host) {
+        let ip = match crate::userspace::net::resolver::resolve_host(&host) {
             Ok(ip) => ip,
             Err(e) => {
                 err("curl: cannot resolve '"); err(&host);
@@ -780,7 +791,7 @@ pub fn cmd_curl(args: &str) {
         // ── Connect, send, and receive the full response ─────────────────────
         let raw: Vec<u8> = 'conn: {
             if use_tls {
-                let mut tls = match crate::net::tls::connect(ip, port, &host) {
+                let mut tls = match crate::userspace::net::tls::connect(ip, port, &host) {
                     Ok(c)  => c,
                     Err(e) => { err("curl: TLS failed: "); err(e); err("\n"); return; }
                 };
@@ -802,13 +813,13 @@ pub fn cmd_curl(args: &str) {
                 tls.close();
                 break 'conn acc;
             } else {
-                let conn = match crate::net::tcp::tcp_connect(ip, port) {
+                let conn = match crate::userspace::net::tcp::tcp_connect(ip, port) {
                     Ok(c)  => c,
                     Err(e) => { err("curl: connect failed: "); err(e.as_str()); err("\n"); return; }
                 };
-                if crate::net::tcp::tcp_send(conn, req.as_bytes()).is_err() {
+                if crate::userspace::net::tcp::tcp_send(conn, req.as_bytes()).is_err() {
                     err("curl: send failed\n");
-                    crate::net::tcp::tcp_close(conn);
+                    crate::userspace::net::tcp::tcp_close(conn);
                     return;
                 }
                 let mut acc: Vec<u8> = Vec::with_capacity(8192);
@@ -816,19 +827,19 @@ pub fn cmd_curl(args: &str) {
                 loop {
                     if check_ctrl_c() {
                         dim("\n[interrupted]\n");
-                        crate::net::tcp::tcp_close(conn);
+                        crate::userspace::net::tcp::tcp_close(conn);
                         return;
                     }
-                    match crate::net::tcp::tcp_recv(conn, &mut buf, 400) {
+                    match crate::userspace::net::tcp::tcp_recv(conn, &mut buf, 400) {
                         Ok(0) => break,
                         Ok(n) => acc.extend_from_slice(&buf[..n]),
-                        Err(crate::net::tcp::TcpError::TimedOut)
-                        | Err(crate::net::tcp::TcpError::WouldBlock) => break,
+                        Err(crate::userspace::net::tcp::TcpError::TimedOut)
+                        | Err(crate::userspace::net::tcp::TcpError::WouldBlock) => break,
                         Err(e) => { err("\ncurl: recv: "); err(e.as_str()); err("\n"); break; }
                     }
                     if acc.len() > 512 * 1024 { break; }
                 }
-                crate::net::tcp::tcp_close(conn);
+                crate::userspace::net::tcp::tcp_close(conn);
                 break 'conn acc;
             }
         };

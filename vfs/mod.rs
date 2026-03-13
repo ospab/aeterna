@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod ramfs;
 pub mod disk_sync;
+pub mod cow;
 pub mod aeternafs;
 pub mod procfs;
 

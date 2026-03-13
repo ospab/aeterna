@@ -17,5 +17,7 @@ pub mod keyboard;
 pub mod mem;
 pub mod tsc;
 pub mod apic;
+pub mod ring;
+pub mod io;
 pub use boot::*;
 pub use init::init;

@@ -19,6 +19,8 @@ pub mod gpu;
 pub mod nvme;
 pub mod gpt;
 pub mod block;
+pub mod driver_trait;
+pub mod registry;
 
 /// Unified disk info for terminal/installer
 #[derive(Copy, Clone)]

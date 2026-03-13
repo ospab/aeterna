@@ -571,7 +571,7 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64) {
         }
         9 | 10 | 11 => {
             // Network IRQ — dispatch to the active NIC driver
-            crate::net::handle_net_irq();
+            crate::userspace::net::handle_net_irq();
             unsafe { NET_IRQ_PENDING = true; }
             // Also dispatch to audio if the ES1371 was assigned one of these IRQs
             crate::drivers::audio::handle_es1371_irq();

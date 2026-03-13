@@ -1247,7 +1247,7 @@ fn cmd_axon_ping(args: &str) {
         }
     }
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         err("ping: network is down\n");
         dim("  (start network stack first)\n");
         return;
@@ -1257,13 +1257,13 @@ fn cmd_axon_ping(args: &str) {
 
     let mut received = 0usize;
     for seq in 1..=count {
-        crate::net::icmp::send_ping(ip, seq as u16);
+        crate::userspace::net::icmp::send_ping(ip, seq as u16);
 
         // Poll for reply with 3s timeout (TSC µs)
         let mut reply = None;
         let t0 = crate::arch::x86_64::tsc::tsc_stamp_us();
         while crate::arch::x86_64::tsc::tsc_stamp_us().wrapping_sub(t0) < 3_000_000 {
-            reply = crate::net::icmp::poll_reply();
+            reply = crate::userspace::net::icmp::poll_reply();
             if reply.is_some() { break; }
             unsafe { core::arch::asm!("hlt"); }
         }

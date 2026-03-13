@@ -1,4 +1,4 @@
-﻿/*
+/*
 Business Source License 1.1
 Copyright (c) 2026 ospab
 
@@ -237,11 +237,12 @@ pub fn init_syscall_msr() {
         let efer = rdmsr(MSR_EFER);
         wrmsr(MSR_EFER, efer | 1); // bit 0 = SCE
 
-        // 2. STAR: set kernel CS/SS and user CS/SS
-        // Bits 47:32 = kernel CS (0x08), kernel SS is CS+8 (0x10)
-        // Bits 63:48 = user CS-16 for SYSRET (0x1B - 16 = user CS=0x23, SS=0x1B)
-        // For now, kernel-only: CS=0x08, SS=0x10
-        let star = (0x0008u64 << 32) | (0x0010u64 << 48);
+        // 2. STAR: set kernel/user selectors for SYSCALL/SYSRET.
+        // SYSCALL loads CS from STAR[47:32], SS = CS + 8.
+        // SYSRETQ loads CS from (STAR[63:48] + 16), SS = (STAR[63:48] + 8).
+        // Therefore the upper half stores USER_CS - 16.
+        let star = ((crate::arch::x86_64::gdt_simple::KERNEL_CS as u64) << 32)
+            | (((crate::arch::x86_64::gdt_simple::USER_CS as u64) - 16) << 48);
         wrmsr(MSR_STAR, star);
 
         // 3. LSTAR: entry point for SYSCALL instruction
@@ -252,10 +253,8 @@ pub fn init_syscall_msr() {
         wrmsr(MSR_FMASK, 0x200); // mask IF
 
         // 5. KERNEL_GS_BASE: base for swapgs
-        unsafe {
-            PER_CPU.kernel_stack = (SYSCALL_STACK.as_ptr() as u64) + 16384;
-            wrmsr(MSR_KERNEL_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
-        }
+        PER_CPU.kernel_stack = (SYSCALL_STACK.as_ptr() as u64) + 16384;
+        wrmsr(MSR_KERNEL_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
     }
 
     crate::arch::x86_64::serial::write_str("[SYSCALL] MSR configured (LSTAR, STAR, FMASK, KERN_GS)\r\n");
@@ -336,12 +335,38 @@ fn syscall_exit(code: u64) -> i64 {
     }
 }
 
+#[inline]
+fn has_system_cap() -> bool {
+    crate::core::scheduler::has_capability(crate::core::scheduler::Capability::System)
+}
+
+#[inline]
+fn can_fs_read() -> bool {
+    has_system_cap()
+        || crate::core::scheduler::has_capability(crate::core::scheduler::Capability::FsRead)
+}
+
+#[inline]
+fn can_fs_write() -> bool {
+    has_system_cap()
+        || crate::core::scheduler::has_capability(crate::core::scheduler::Capability::FsWrite)
+}
+
+#[inline]
+fn can_serial_write() -> bool {
+    has_system_cap()
+        || crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Serial)
+}
+
 /// sys_write(fd, buf_ptr, len) — write bytes to a file descriptor.
 /// fd=1 → serial+framebuffer (stdout), fd=2 → serial (stderr).
 /// fd≥3 → VFS file write.
 fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     // stdout/stderr → serial output
     if fd == 1 || fd == 2 {
+        if !can_serial_write() {
+            return SyscallError::PermissionDenied as i64;
+        }
         unsafe {
             let buf = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
             for &b in buf {
@@ -352,6 +377,9 @@ fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     }
 
     // VFS file descriptor
+    if !can_fs_write() {
+        return SyscallError::PermissionDenied as i64;
+    }
     unsafe {
         let buf = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
         crate::fs::sys_write(fd as usize, buf)
@@ -377,6 +405,9 @@ fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     }
 
     // VFS file descriptor
+    if !can_fs_read() {
+        return SyscallError::PermissionDenied as i64;
+    }
     unsafe {
         let buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
         crate::fs::sys_read(fd as usize, buf)
@@ -386,6 +417,25 @@ fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
 /// sys_open(path_ptr, path_len, flags) — open a file, returning fd.
 /// flags: 0=read, 1=write, 2=read+write
 fn syscall_open(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
+    match flags {
+        0 => {
+            if !can_fs_read() {
+                return SyscallError::PermissionDenied as i64;
+            }
+        }
+        1 => {
+            if !can_fs_write() {
+                return SyscallError::PermissionDenied as i64;
+            }
+        }
+        2 => {
+            if !(can_fs_read() && can_fs_write()) {
+                return SyscallError::PermissionDenied as i64;
+            }
+        }
+        _ => return SyscallError::InvalidArgument as i64,
+    }
+
     unsafe {
         let path_bytes = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         let path = match core::str::from_utf8(path_bytes) {
@@ -420,6 +470,11 @@ fn syscall_getpid() -> i64 {
 }
 
 fn syscall_spawn(name_ptr: u64, name_len: u64, priority: u64) -> i64 {
+    if !has_system_cap() &&
+       !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Spawn) {
+        return SyscallError::PermissionDenied as i64;
+    }
+
     let name = unsafe {
         let bytes = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
         match core::str::from_utf8(bytes) {
@@ -436,7 +491,7 @@ fn syscall_spawn(name_ptr: u64, name_len: u64, priority: u64) -> i64 {
         _ => crate::core::scheduler::Priority::Compute,
     };
 
-    match crate::core::scheduler::spawn_named(name, prio, 0, 0, 0) {
+    match crate::core::scheduler::spawn_named(name, prio, 0, 0, 0, &[]) {
         Some(pid) => pid as i64,
         None => SyscallError::Busy as i64,
     }
@@ -491,6 +546,11 @@ fn syscall_mmap(_addr_hint: u64, size: u64, flags: u64) -> i64 {
     let huge = (flags & 1) != 0;
 
     if huge {
+        if !has_system_cap() &&
+           !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::MemHuge) {
+            return SyscallError::PermissionDenied as i64;
+        }
+
         // AI-native path: use the 2MB physical frame allocator
         if let Some(phys) = crate::mm::physical::alloc_huge_frame() {
             let virt = crate::mm::r#virtual::phys_to_virt(phys);
@@ -654,7 +714,7 @@ fn syscall_cap_delegate(target_pid: u64, cap_id: u64) -> i64 {
     }
 }
 
-fn syscall_irq_wait(irq_num: u64) -> i64 {
+fn syscall_irq_wait(_irq_num: u64) -> i64 {
     if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) {
         return SyscallError::PermissionDenied as i64;
     }
@@ -714,7 +774,7 @@ fn syscall_dev_detach(dev_id: u64) -> i64 {
         return SyscallError::PermissionDenied as i64;
     }
     if dev_id == 0 {
-        crate::net::rtl8139::detach();
+        crate::userspace::net::rtl8139::detach();
     } else if dev_id == 1 {
         crate::drivers::nvme::detach();
     }

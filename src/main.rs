@@ -168,10 +168,18 @@ pub extern "C" fn _start() -> ! {
     boot_pending("Virtual filesystem");
     ospab_os::fs::init();
     ospab_os::fs::ramfs::init();
-    ospab_os::fs::mount("/", ospab_os::fs::ramfs::instance());
+    // Mount CoW root filesystem
+    // For now, base = ramfs (read-only), upper = ramfs (read-write overlay).
+    // In Phase 6, base will be AeternaFS (NVMe).
+    let cow_root = ospab_os::fs::cow::init(
+        ospab_os::fs::ramfs::instance(), // Base
+        ospab_os::fs::ramfs::instance()  // Upper (RamFS handles multiple paths fine)
+    );
+    ospab_os::fs::mount("/", cow_root);
     ospab_os::fs::mount("/proc", ospab_os::fs::procfs::instance());
+
     let node_count = ospab_os::fs::ramfs::node_count();
-    boot_ok("VFS + RamFS mounted at /");
+    boot_ok("VFS + CowFS (RamFS+RamFS overlay) mounted at /");
     boot_ok("ProcFs mounted at /proc");
     klog::boot("VFS ready");
     serial::write_str("  RamFS: ");
@@ -264,9 +272,12 @@ pub extern "C" fn _start() -> ! {
 
     // ══════════════════════════════════════════════
     // Phase 3.4: GPU / Display acceleration
+    //   Wrapped in driver registry for fault isolation.
     // ══════════════════════════════════════════════
     boot_pending("GPU / Display acceleration");
-    if ospab_os::drivers::gpu::init() {
+    if ospab_os::drivers::registry::try_init_driver("GPU (VMware SVGA II)", || {
+        ospab_os::drivers::gpu::init()
+    }) {
         boot_ok("GPU: VMware SVGA II + VMMouse initialized");
         klog::boot("GPU ready");
     } else {
@@ -276,9 +287,12 @@ pub extern "C" fn _start() -> ! {
 
     // ══════════════════════════════════════════════
     // Phase 3.5: Audio subsystem (Intel HDA)
+    //   Wrapped in driver registry for fault isolation.
     // ══════════════════════════════════════════════
     boot_pending("Audio subsystem");
-    if ospab_os::drivers::audio::init() {
+    if ospab_os::drivers::registry::try_init_driver("Audio (Intel HDA)", || {
+        ospab_os::drivers::audio::init()
+    }) {
         boot_ok("Audio subsystem (Intel HDA, 44100Hz/16-bit/2ch)");
         klog::boot("HDA audio initialized");
     } else {
@@ -288,9 +302,12 @@ pub extern "C" fn _start() -> ! {
 
     // ══════════════════════════════════════════════
     // Phase 3.6: NVMe SSD + GPT + DevFS + AeternaFS
+    //   Wrapped in driver registry for fault isolation.
     // ══════════════════════════════════════════════
     boot_pending("NVMe storage");
-    if ospab_os::drivers::nvme::probe_and_init() {
+    if ospab_os::drivers::registry::try_init_driver("NVMe SSD", || {
+        ospab_os::drivers::nvme::probe_and_init()
+    }) {
         // Build a NvmeDisk wrapper and try to parse GPT
         let mut nvme_disk = ospab_os::drivers::block::NvmeDisk::new();
         let gpt_parts = ospab_os::drivers::gpt::parse(&mut nvme_disk).unwrap_or(0);
@@ -369,60 +386,10 @@ pub extern "C" fn _start() -> ! {
         }
         klog::boot("Network initialized");
 
-        // ── Quick self-test: send one ping to gateway and log result ──
-        serial::write_str("[NET-TEST] Sending ICMP ping to 10.0.2.2 ...\r\n");
-        ospab_os::net::icmp::send_ping([10, 0, 2, 2], 0);
-        // Poll for reply: up to ~3 seconds (300 ticks at 100 Hz)
-        let mut got_reply = false;
-        let deadline = ospab_os::arch::x86_64::idt::timer_ticks() + 300; // 3 s @ 100 Hz
-        let mut diag_ticks = 0u32;
-        loop {
-            ospab_os::net::poll_rx();
-            if let Some(r) = ospab_os::net::icmp::poll_reply() {
-                serial::write_str("[NET-TEST] PING REPLY! seq=");
-                serial_u32(r.seq as u32);
-                serial::write_str(" rtt=");
-                serial_u32((r.rtt_us / 1000) as u32);
-                serial::write_str("ms ttl=");
-                serial_u32(r.ttl as u32);
-                serial::write_str("\r\n");
-                got_reply = true;
-                break;
-            }
-            // Print NIC register state every ~0.5s (9 ticks)
-            diag_ticks += 1;
-            if diag_ticks % 9 == 1 {
-                let (r0, r1, r2, r3) = ospab_os::net::diag();
-                let nic_name = ospab_os::net::nic_name();
-                serial::write_str("[NET-DIAG] ");
-                serial::write_str(nic_name);
-                if nic_name == "Intel e1000" {
-                    serial::write_str(" STATUS=0x"); serial_hex32(r0);
-                    serial::write_str(" ICR=0x"); serial_hex32(r1);
-                    serial::write_str(" RDH="); serial_u32(r2);
-                    serial::write_str(" RDT="); serial_u32(r3);
-                } else {
-                    serial::write_str(" ISR=0x"); serial_hex16(r0 as u16);
-                    serial::write_str(" CMD=0x"); serial_hex8(r1 as u8);
-                    serial::write_str(" CBR="); serial_u32(r2);
-                    serial::write_str(" CAPR="); serial_u32(r3);
-                }
-                serial::write_str("\r\n");
-            }
-            if ospab_os::arch::x86_64::idt::timer_ticks() >= deadline {
-                break;
-            }
-            unsafe { core::arch::asm!("hlt"); }
-        }
-        if !got_reply {
-            serial::write_str("[NET-TEST] No reply (timeout)\r\n");
-            // Dump RTL8139 RX buffer for DMA debugging
-            if ospab_os::net::nic_name() == "RTL8139" {
-                ospab_os::net::rtl8139::rx_buffer_dump(64);
-            }
-            // Run full network diagnostic on failure
-            ospab_os::net::diag::run_full_diagnostic();
-        }
+        klog::boot("Network initialized");
+
+        // ── Init system ──
+        boot_step("Init system (seed)");
     } else {
         boot_warn("Network: no supported NIC found");
         klog::boot("Network not available");
@@ -434,7 +401,7 @@ pub extern "C" fn _start() -> ! {
     // Phase 4.5: Userland initialization
     // ══════════════════════════════════════════════
     boot_pending("Init system (seed)");
-    ospab_os::seed::init();
+    ospab_os::userspace::seed::init();
     boot_ok("Init system (seed) — services registered");
     klog::boot("seed init ready");
 
@@ -549,9 +516,9 @@ fn boot_warn(msg: &str) {
     serial::write_str("\r\n");
 
     if framebuffer::is_initialized() {
-        framebuffer::draw_string("[", COLOR_GRAY, COLOR_BG);
+        framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
         framebuffer::draw_string("WARN", COLOR_WARN, COLOR_BG);
-        framebuffer::draw_string("] ", COLOR_GRAY, COLOR_BG);
+        framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
         framebuffer::draw_string(msg, COLOR_WARN, COLOR_BG);
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
     }
@@ -563,9 +530,9 @@ fn boot_fail(msg: &str) {
     serial::write_str("\r\n");
 
     if framebuffer::is_initialized() {
-        framebuffer::draw_string("[", COLOR_GRAY, COLOR_BG);
+        framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
         framebuffer::draw_string("FAIL", COLOR_FAIL, COLOR_BG);
-        framebuffer::draw_string("] ", COLOR_GRAY, COLOR_BG);
+        framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
         framebuffer::draw_string(msg, COLOR_FAIL, COLOR_BG);
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
     }
@@ -576,9 +543,9 @@ fn boot_info_recovery(node_count: usize, byte_count: usize) {
     if !framebuffer::is_initialized() { return; }
 
     // Format: [INFO] Root filesystem mounted from disk. N nodes, B bytes recovered.
-    framebuffer::draw_string("[", COLOR_GRAY, COLOR_BG);
-    framebuffer::draw_string("INFO", COLOR_OK, COLOR_BG);
-    framebuffer::draw_string("] ", COLOR_GRAY, COLOR_BG);
+    framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
+    framebuffer::draw_string("INFO", COLOR_OK, COLOR_BG); // Not OK, but maybe cyan? Using OK color for now to preserve semantics.
+    framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
     framebuffer::draw_string("Root filesystem mounted from disk. ", COLOR_WHITE, COLOR_BG);
     framebuffer::draw_string(&dec_str(node_count as u64), COLOR_OK, COLOR_BG);
     framebuffer::draw_string(" nodes, ", COLOR_WHITE, COLOR_BG);
@@ -592,9 +559,9 @@ fn boot_warn_new_fs() {
     serial::write_str("[ WARN ] No filesystem found on disk. Creating new.\r\n");
     if !framebuffer::is_initialized() { return; }
 
-    framebuffer::draw_string("[", COLOR_GRAY, COLOR_BG);
+    framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
     framebuffer::draw_string("WARN", COLOR_WARN, COLOR_BG);
-    framebuffer::draw_string("] ", COLOR_GRAY, COLOR_BG);
+    framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
     framebuffer::draw_string("No filesystem found on disk. Creating new.", COLOR_WARN, COLOR_BG);
     framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
 }

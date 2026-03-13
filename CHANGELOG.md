@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to ospab.os / AETERNA are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
@@ -41,12 +41,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - `net/mod.rs` — added `pub mod tcp`, `link_up()`, `rx_bytes()`, `tx_bytes()`
-- Version bump: 1.0.0 → 1.1.0
+# AETERNA Microkernel OS — Changelog
 
----
+## v1.1.0 — Architecture Refinement & Installer Revamp
+- **Microkernel Separation**: Moved monolithic subsystems (network, drivers, virtual filesystem) entirely out of Ring 0 into userspace domains.
+- **VirtIO-Net Driver**: Replaced architectural stub with a fully functioning VirtIO 1.0 driver including PCI probing, BAR parsing, and device feature negotiation.
+- **Copy-on-Write (CoW) VFS**: Fully implemented the `FileSystem` trait for CoW (overlay) filesystem logic with strict write separation between base and upper.
+- **Visuals & UX**: Radically redesigned the `aeterna-install` disk installer with a truthful, transparent, and minimalist user interface and accurate progress bars.
+- **Bootloader Configuration**: Changed Limine bootloader configuration to auto-detect and use native display resolution.
 
-## [1.0.0] — 2026-03-05 — First Public Release
-
+## v1.0.0 — Initial Release
 The first stable release of the AETERNA microkernel. Boots from a hybrid BIOS/UEFI Live ISO via
 Limine, provides a complete interactive shell environment with 30+ commands, a working UEFI disk
 installer, a DOOM port, and full userland tooling.

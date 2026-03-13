@@ -735,7 +735,11 @@ fn builtin_bash(args: &str) {
     if file_or_code == "-c" {
         bash::execute_code(remaining);
     } else {
-        let exit_code = bash::execute_script(file_or_code);
+        let mut script_path = resolve_path(file_or_code);
+        while script_path.contains("/./") {
+            script_path = script_path.replace("/./", "/");
+        }
+        let exit_code = bash::execute_script(&script_path);
         set_exit_code(exit_code);
     }
 }

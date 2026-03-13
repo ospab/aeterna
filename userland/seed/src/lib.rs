@@ -109,6 +109,15 @@ pub fn init() {
             0,
             0,
             0,
+            &[
+                crate::core::scheduler::Capability::System,
+                crate::core::scheduler::Capability::Spawn,
+                crate::core::scheduler::Capability::FsRead,
+                crate::core::scheduler::Capability::FsWrite,
+                crate::core::scheduler::Capability::Framebuf,
+                crate::core::scheduler::Capability::Serial,
+                crate::core::scheduler::Capability::Revoke,
+            ],
         ).unwrap_or(1);
 
         services.push(Service {
@@ -257,6 +266,7 @@ pub fn init() {
                         0,
                         0,
                         0,
+                        &caps_for_service(svc.name.as_str()),
                     ) {
                         svc.pid = pid;
                         svc.status = ServiceStatus::Running;
@@ -313,6 +323,7 @@ pub fn start_service(name: &str) -> bool {
                         0,
                         0,
                         0,
+                        &caps_for_service(svc.name.as_str()),
                     ) {
                         svc.pid = pid;
                         svc.status = ServiceStatus::Running;
@@ -563,6 +574,23 @@ fn cmd_help() {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Per-service capability manifest.
+/// Determines the minimum set of capabilities each system service needs.
+fn caps_for_service(name: &str) -> Vec<crate::core::scheduler::Capability> {
+    use crate::core::scheduler::Capability;
+    match name {
+        "plum" => alloc::vec![Capability::Serial, Capability::Framebuf, Capability::FsRead, Capability::FsWrite, Capability::Spawn],
+        "console" => alloc::vec![Capability::Serial, Capability::Framebuf],
+        "serial" => alloc::vec![Capability::Serial],
+        "keyboard" => alloc::vec![Capability::Serial, Capability::Device],
+        "network" => alloc::vec![Capability::Serial, Capability::Net, Capability::Device],
+        "storage" => alloc::vec![Capability::Serial, Capability::Device, Capability::FsRead, Capability::FsWrite],
+        "vfs" => alloc::vec![Capability::Serial, Capability::FsRead, Capability::FsWrite, Capability::VfsServer],
+        "scheduler" => alloc::vec![Capability::Serial, Capability::System],
+        _ => alloc::vec![Capability::Serial],
+    }
+}
 
 fn serial_u32(mut n: u32) {
     if n == 0 { serial::write_byte(b'0'); return; }

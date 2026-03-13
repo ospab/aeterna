@@ -1,4 +1,4 @@
-﻿/*
+/*
 Business Source License 1.1
 Copyright (c) 2026 ospab
 Preemptive Task Scheduler for AETERNA microkernel.
@@ -39,6 +39,8 @@ pub enum Capability {
     Device,
     VfsServer,
     IoPort,
+    /// Permission to revoke capabilities from child processes.
+    Revoke,
 }
 
 pub type TaskId = u32;
@@ -141,15 +143,25 @@ pub fn is_initialized() -> bool {
 }
 
 pub fn create_task(priority: Priority, entry_point: u64, stack_pointer: u64) -> Option<TaskId> {
-    spawn_named("task", priority, entry_point, stack_pointer, 0)
+    spawn_named("task", priority, entry_point, stack_pointer, 0, &[])
 }
 
+/// Spawn a new task with an explicit capability manifest.
+///
+/// **Least-privilege enforcement**: the new task receives only those
+/// capabilities that appear in BOTH `manifest` AND the parent task's
+/// capability set (intersection). If `manifest` is empty, the task
+/// gets only `Capability::Serial` (minimum for debug output).
+///
+/// This prevents privilege escalation: a parent cannot grant caps
+/// it does not itself possess.
 pub fn spawn_named(
     name: &str,
     priority: Priority,
     entry_point: u64,
     stack_pointer: u64,
     memory_bytes: u64,
+    manifest: &[Capability],
 ) -> Option<TaskId> {
     use crate::arch::x86_64::gdt_simple;
     unsafe {
@@ -180,12 +192,31 @@ pub fn spawn_named(
                     frame[20] = gdt_simple::KERNEL_DS as u64; // SS
                 }
 
-                // Grant basic capabilities to new tasks. 
-                // In Phase 3, this is expanded to match the task's manifest.
+                // Capability manifest enforcement (least-privilege intersection).
+                // Base: every task gets Serial for debug output.
                 let mut caps = alloc::vec![Capability::Serial];
-                if priority == Priority::System || priority == Priority::Compute {
-                    caps.push(Capability::Spawn);
-                    caps.push(Capability::MemHuge);
+
+                if manifest.is_empty() {
+                    // Empty manifest = minimal rights (Serial only).
+                    // This is the backwards-compatible path for placeholder tasks.
+                } else {
+                    // Intersection: grant only caps that are in manifest AND
+                    // possessed by the current (parent) task.
+                    let parent_caps = TASKS[CURRENT_SLOT]
+                        .as_ref()
+                        .map(|t| t.capabilities.as_slice())
+                        .unwrap_or(&[]);
+
+                    for &requested_cap in manifest {
+                        // Skip Serial — already granted above.
+                        if requested_cap == Capability::Serial { continue; }
+                        // Parent must possess the cap (or System which grants all).
+                        let parent_has = parent_caps.contains(&requested_cap)
+                            || parent_caps.contains(&Capability::System);
+                        if parent_has && !caps.contains(&requested_cap) {
+                            caps.push(requested_cap);
+                        }
+                    }
                 }
 
                 // Allocate a fresh address space for this task.

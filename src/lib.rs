@@ -26,29 +26,19 @@ pub mod core;
 // Kernel event log — used by panic handler and terminal
 pub mod klog;
 
-// Network stack (lives at repo root net/)
-#[path = "../net/mod.rs"]
-pub mod net;
-
-// Storage drivers (ATA PIO, AHCI SATA — lives at repo root drivers/)
-#[path = "../drivers/mod.rs"]
-pub mod drivers;
+// Network and Storage moved to userspace (microkernel separation)
 
 // ACPI tables, PCI config, and XHCI USB
 pub mod acpi;
 pub mod pci;
 pub mod xhci;
 
-// Virtual filesystem layer + RamFS (lives at repo root vfs/)
-#[path = "../vfs/mod.rs"]
-pub mod fs;
+// VFS moved to userspace (microkernel separation)
 
-// Userland tools (integrated as kernel modules until userspace is ready)
-#[path = "../userland/grape/src/lib.rs"]
-pub mod grape;
-
-#[path = "../userland/tomato/src/lib.rs"]
-pub mod tomato;
+// Compatibility proxies for the monolith-to-microkernel transition
+pub use userspace::fs;
+pub use userspace::net;
+pub use userspace::drivers_core as drivers;
 
 // Userspace modules (kernel-integrated, VFS-only access)
 pub mod userspace;
@@ -59,8 +49,6 @@ pub use userspace::axon;
 // Re-export plum for backward compatibility
 pub use userspace::plum;
 
-#[path = "../userland/seed/src/lib.rs"]
-pub mod seed;
 // DOOM engine (bare-metal port)
 pub mod doom;
 
@@ -71,10 +59,6 @@ pub mod aam;
 // ─── ANE — Aeterna Neural Engine (no_std PyTorch replacement) ───────────────
 #[path = "../lib/ane/mod.rs"]
 pub mod ane;
-
-// aai — Aeterna AI utility (model loader + chat + bench)
-#[path = "../userland/aai/src/lib.rs"]
-pub mod aai;
 
 // bench — System Latency Tax benchmark (RDTSC FMA workload)
 pub mod bench;

@@ -27,7 +27,7 @@ const BUILTINS: &[&str] = &[
     "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
     "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
     "unalias", "env", "set", "unset", "type", "source", "plum",
-    "ps", "top", "bench", "vol", "mute",
+    "ps", "top", "bench", "vol", "mute", "ring3test",
 ];
 
 extern crate alloc;
@@ -574,7 +574,7 @@ fn execute_command(cmd: &str) {
         "ver" | "version" => cmd_version(),
         "uname"   => cmd_uname(args),
         "whoami"  => cmd_whoami(),
-        "hostname"=> cmd_hostname(),
+        "hostname"=> cmd_hostname(args),
         "date"    => cmd_date(),
         "about"   => cmd_about(),
         "meminfo" | "free" => cmd_meminfo(),
@@ -608,19 +608,30 @@ fn execute_command(cmd: &str) {
         "ping"    => cmd_ping(args),
         "aai"     => cmd_aai(args),
         "bench"   => cmd_bench(args),
+        "ring3test" => cmd_ring3test(),
         _ => {
             // Check for bash script or binary execution
             if command.starts_with("./") || command.starts_with("/") {
-                if command.ends_with(".sh") {
-                    cmd_bash(command);
-                    return;
-                } else {
-                    dim_print("[SYS] Executing binary: ");
-                    puts(command);
-                    puts("\n");
-                    // In a full implementation, this would invoke the ELF loader (sys_spawn)
+                let resolved = ospab_os::plum::resolve_path(command);
+                if resolved.ends_with(".sh") {
+                    cmd_bash(&resolved);
                     return;
                 }
+
+                // Extensionless path-like command: route through AXON by basename.
+                // Example: ./ls, /bin/cat
+                let basename = resolved.rsplit('/').next().unwrap_or("");
+                if !basename.is_empty() && !basename.contains('.') {
+                    if axon::dispatch(basename, args) {
+                        return;
+                    }
+                }
+
+                dim_print("[SYS] Executing binary: ");
+                puts(&resolved);
+                puts("\n");
+                // In a full implementation, this would invoke the ELF loader (sys_spawn)
+                return;
             }
 
             // AXON coreutils
@@ -1104,18 +1115,61 @@ fn cmd_whoami() {
     puts("root\n");
 }
 
-fn cmd_hostname() {
-    // Read from VFS
-    match ospab_os::fs::read_file("/etc/hostname") {
-        Some(data) => {
-            if let Ok(text) = core::str::from_utf8(&data) {
-                puts(text.trim());
-                puts("\n");
-            } else {
-                puts("ospab\n");
+fn cmd_hostname(args: &str) {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        match ospab_os::fs::read_file("/etc/hostname") {
+            Some(data) => {
+                if let Ok(text) = core::str::from_utf8(&data) {
+                    puts(text.trim());
+                    puts("\n");
+                } else {
+                    puts("ospab\n");
+                }
             }
+            None => puts("ospab\n"),
         }
-        None => puts("ospab\n"),
+        return;
+    }
+
+    if trimmed == "-h" || trimmed == "--help" {
+        puts("Usage: hostname [NEW_NAME]\n");
+        return;
+    }
+
+    let mut out = [0u8; 64];
+    let mut n = 0usize;
+    for &b in trimmed.as_bytes() {
+        if n >= 63 { break; }
+        let valid = (b as char).is_ascii_alphanumeric() || b == b'-' || b == b'.';
+        if !valid {
+            puts("hostname: invalid character (allowed: a-z A-Z 0-9 . -)\n");
+            return;
+        }
+        out[n] = b;
+        n += 1;
+    }
+    if n == 0 {
+        puts("hostname: empty name\n");
+        return;
+    }
+
+    if !ospab_os::fs::write_file("/etc/hostname", &out[..n]) {
+        puts("hostname: failed to write /etc/hostname\n");
+        return;
+    }
+
+    puts("hostname set to ");
+    puts(trimmed);
+    puts("\n");
+
+    if ospab_os::net::is_up() {
+        puts("renewing DHCP with updated hostname...\n");
+        if ospab_os::net::dhcp_renew() {
+            puts("network updated\n");
+        } else {
+            puts("warning: DHCP renew failed (hostname saved locally)\n");
+        }
     }
 }
 
@@ -1729,7 +1783,13 @@ fn cmd_soundtest() {
     serial::write_str("[SOUND] === End Diagnostics ===\r\n");
 
     puts("Bytes submitted : "); print_dec(total_bytes as u64); puts("\n");
-    framebuffer::draw_string("Test tone queued to audio driver.\n", FG_OK, BG);
+    
+    // Silence flush: Write 32 KiB of zeroes to fill the hardware ring buffer
+    // and stop the test tone from looping.
+    let silence = alloc::vec![0u8; 32768];
+    audio::write_pcm(&silence);
+
+    framebuffer::draw_string("Test tone queued and flushed with silence.\n", FG_OK, BG);
     puts("Tip: use 'vol <0-100>' to adjust volume.\n");
 }
 
@@ -2153,7 +2213,7 @@ fn cmd_ping(args: &str) {
         ospab_os::net::icmp::send_ping_sized(ip, seq, payload);
         sent += 1;
 
-        // Wait for reply (TSC-based)
+        // Wait for reply (TSC-based, low-latency polling path)
         let mut reply = None;
         let wait_start = ospab_os::arch::x86_64::tsc::tsc_stamp_us();
         loop {
@@ -2168,7 +2228,12 @@ fn cmd_ping(args: &str) {
                 ospab_os::net::icmp::cancel_wait();
                 break;
             }
-            ospab_os::core::scheduler::sys_yield();
+            if elapsed > 20_000 {
+                // after 20ms, allow scheduler to run to avoid busy-spinning forever
+                ospab_os::core::scheduler::sys_yield();
+            } else {
+                core::hint::spin_loop();
+            }
         }
         if interrupted { break; }
 
@@ -2185,9 +2250,9 @@ fn cmd_ping(args: &str) {
                 // "64 bytes from 10.0.2.2: icmp_seq=1 ttl=64 time=1.23 ms"
                 print_dec(r.nbytes);
                 puts(" bytes from ");
-                print_ip(ip);
+                print_ip(r.src_ip);
                 puts(": icmp_seq=");
-                print_dec(seq as u64);
+                print_dec(r.seq as u64);
                 puts(" ttl=");
                 print_dec(r.ttl as u64);
                 puts(" time=");
@@ -2428,11 +2493,11 @@ fn cmd_grape(args: &str) {
     let path = args.trim();
     if path.is_empty() {
         // Open empty buffer
-        ospab_os::grape::edit("");
+        ospab_os::userspace::grape::edit("");
     } else {
         // Resolve path relative to CWD
         let abs = resolve_path(path);
-        ospab_os::grape::edit(&abs);
+        ospab_os::userspace::grape::edit(&abs);
     }
     // After editor exits, redraw prompt area
     framebuffer::set_cursor_pos(0, 0);
@@ -2450,9 +2515,9 @@ fn cmd_grape(args: &str) {
 fn cmd_tomato(args: &str) {
     // `tomato --tmt <subcmd>` routes to the binary package (.tmt) subsystem
     if let Some(tmt_args) = args.strip_prefix("--tmt") {
-        ospab_os::tomato::tmt_dispatch(tmt_args.trim());
+        ospab_os::userspace::tomato::tmt_dispatch(tmt_args.trim());
     } else {
-        ospab_os::tomato::run(args);
+        ospab_os::userspace::tomato::run(args);
     }
 }
 
@@ -2461,7 +2526,7 @@ fn cmd_tomato(args: &str) {
 // ══════════════════════════════════════════════════════════════
 
 fn cmd_seed(args: &str) {
-    ospab_os::seed::run(args);
+    ospab_os::userspace::seed::run(args);
 }
 
 fn cmd_bash(args: &str) {
@@ -2493,7 +2558,15 @@ fn cmd_aai(args: &str) {
     let parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
     let mut dispatch_args: alloc::vec::Vec<&str> = alloc::vec!["aai"];
     for p in &parts { dispatch_args.push(p); }
-    ospab_os::aai::aai_dispatch(&dispatch_args, &mut row);
+    ospab_os::userspace::aai::aai_dispatch(&dispatch_args, &mut row);
+}
+
+fn cmd_ring3test() {
+    puts("Launching Ring 3 smoke test...\n");
+    dim_print("This transfers execution to CPL3 via iretq and does not return on success.\n");
+    if !ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
+        err_print("ring3test: failed to prepare Ring 3 task\n");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════

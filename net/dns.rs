@@ -220,7 +220,7 @@ fn parse_nameserver_line(line: &[u8]) -> Option<[u8; 4]> {
     if i <= start { return None; }
 
     let ip_str = core::str::from_utf8(&line[start..i]).ok()?;
-    crate::net::resolver::parse_ipv4(ip_str)
+    crate::userspace::net::resolver::parse_ipv4(ip_str)
 }
 
 fn collect_dns_servers(out: &mut [[u8; 4]; 6]) -> usize {

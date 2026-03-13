@@ -143,24 +143,29 @@ pub fn irq_line() -> u8 {
 /// Returns the PCM sample rate used by the active driver (Hz).
 pub fn sample_rate() -> u32 {
     match ACTIVE_DRIVER.load(Ordering::Relaxed) {
-        2 => hda::sample_rate(),    // actual rate programmed into the HDA stream
-        3 => es1371::sample_rate(), // actual rate programmed into the ES1371 codec
-        _ => 44100,                 // AC97 default
+        1 => ac97::sample_rate(),
+        2 => hda::sample_rate(),
+        3 => es1371::sample_rate(),
+        _ => 44100,
     }
 }
 
 /// Returns the current master volume (0..100).
 pub fn volume() -> u8 {
     match ACTIVE_DRIVER.load(Ordering::Relaxed) {
+        1 => ac97::volume(),
         2 => hda::volume(),
-        _ => 80, // fixed for drivers without volume control
+        3 => es1371::volume(),
+        _ => 0,
     }
 }
 
 /// Set master volume (0..100).
 pub fn set_volume(pct: u8) {
     match ACTIVE_DRIVER.load(Ordering::Relaxed) {
+        1 => ac97::set_volume(pct),
         2 => hda::set_volume(pct),
-        _ => {} // not yet implemented for AC97/ES1371
+        3 => es1371::set_volume(pct),
+        _ => {}
     }
 }

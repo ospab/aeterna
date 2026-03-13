@@ -256,18 +256,18 @@ pub fn run(args: &str) {
         None => return,
     };
 
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         err("ping: network is down\n");
         return;
     }
 
     // ARP warm-up: resolve gateway/target MAC before first ICMP packet
-    if crate::net::arp::cache_lookup(cfg.ip).is_none() {
-        crate::net::arp::send_request(cfg.ip);
+    if crate::userspace::net::arp::cache_lookup(cfg.ip).is_none() {
+        crate::userspace::net::arp::send_request(cfg.ip);
         let arp_deadline = crate::arch::x86_64::tsc::tsc_stamp_us() + 500_000; // 500 ms
         while crate::arch::x86_64::tsc::tsc_stamp_us() < arp_deadline {
-            crate::net::poll_rx();
-            if crate::net::arp::cache_lookup(cfg.ip).is_some() { break; }
+            crate::userspace::net::poll_rx();
+            if crate::userspace::net::arp::cache_lookup(cfg.ip).is_some() { break; }
             crate::core::scheduler::sys_yield();
         }
     }
@@ -298,7 +298,7 @@ pub fn run(args: &str) {
         if check_ctrl_c() { interrupted = true; break; }
 
         // Send ICMP echo request
-        crate::net::icmp::send_ping_sized(cfg.ip, seq, cfg.payload);
+        crate::userspace::net::icmp::send_ping_sized(cfg.ip, seq, cfg.payload);
         sent += 1;
 
         // Wait for reply (TSC-based timeout)
@@ -306,14 +306,14 @@ pub fn run(args: &str) {
         let wait_start = crate::arch::x86_64::tsc::tsc_stamp_us();
         loop {
             if check_ctrl_c() { interrupted = true; break; }
-            crate::net::poll_rx();
-            if let Some(r) = crate::net::icmp::poll_reply() {
+            crate::userspace::net::poll_rx();
+            if let Some(r) = crate::userspace::net::icmp::poll_reply() {
                 reply = Some(r);
                 break;
             }
             let elapsed = crate::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(wait_start);
             if elapsed >= cfg.timeout_us {
-                crate::net::icmp::cancel_wait();
+                crate::userspace::net::icmp::cancel_wait();
                 break;
             }
             crate::core::scheduler::sys_yield();
@@ -353,7 +353,7 @@ pub fn run(args: &str) {
         let delay_start = crate::arch::x86_64::tsc::tsc_stamp_us();
         while crate::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(delay_start) < cfg.interval_us {
             if check_ctrl_c() { interrupted = true; break; }
-            crate::net::poll_rx();
+            crate::userspace::net::poll_rx();
             crate::core::scheduler::sys_yield();
         }
         if interrupted { break; }

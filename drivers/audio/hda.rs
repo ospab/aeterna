@@ -785,6 +785,18 @@ pub fn write_pcm(pcm: &[u8]) {
     }
 }
 
+/// Zero out the entire DMA ring buffer.
+pub fn clear_buffer() {
+    if !AUDIO_READY.load(Ordering::Relaxed) { return; }
+    unsafe {
+        for i in 0..DMA_ENTRIES {
+            let dst = DMA_BUF_VIRT[i] as *mut u8;
+            core::ptr::write_bytes(dst, 0, DMA_BUF_SIZE);
+        }
+        WRITE_POS = 0;
+    }
+}
+
 /// Returns true if HDA is initialized and the stream is running.
 pub fn is_ready() -> bool {
     AUDIO_READY.load(Ordering::Relaxed)

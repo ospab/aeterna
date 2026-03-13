@@ -160,6 +160,9 @@ static NABM_BASE: AtomicU32 = AtomicU32::new(0);
 /// PCI IRQ line for AC97 (default 5 on QEMU, read from PCI config at init)
 static AC97_IRQ: AtomicU8 = AtomicU8::new(5);
 
+/// Negotiated sample rate (Hz)
+static SAMPLE_RATE_HZ: AtomicU32 = AtomicU32::new(44100);
+
 /// Index of the next BDL entry the CPU should fill (producer cursor, wraps mod 32)
 static FILL_IDX: AtomicU8 = AtomicU8::new(0);
 
@@ -168,6 +171,9 @@ static BUFFER_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Whether the AC97 DMA engine is currently running
 static DMA_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Master volume (0..100)
+static MASTER_VOLUME: AtomicU8 = AtomicU8::new(80);
 
 // Per-entry physical addresses (32-bit — AC97 is ISA-DMA-compatible, max 4 GiB)
 static mut BUF_PHYS: [u32; BDL_ENTRIES] = [0u32; BDL_ENTRIES];
@@ -467,12 +473,29 @@ pub fn init() -> bool {
         let mut found: Option<(u8, u8, u8)> = None;
         'scan: for b in 0..=255u8 {
             for d in 0..32u8 {
-                let vid = crate::pci::vendor_id(b, d, 0);
-                if vid == 0xFFFF { continue; }
-                let did = crate::pci::device_id(b, d, 0);
-                for &(kv, kd) in &known_ids {
-                    if vid == kv && did == kd {
-                        found = Some((b, d, 0));
+                for f in 0..8u8 {
+                    let vid = crate::pci::vendor_id(b, d, f);
+                    if vid == 0xFFFF { continue; }
+                    let did = crate::pci::device_id(b, d, f);
+
+                    // Skip Ensoniq ES1371/1373 — they match the class but need es1371.rs
+                    if vid == 0x1274 { continue; }
+
+                    let (class, subclass, _) = crate::pci::class_code(b, d, f);
+
+                    // Check class: 0x04 (Multimedia), 0x01 (Audio Device / AC97)
+                    let is_ac97_class = class == 0x04 && subclass == 0x01;
+                    
+                    let mut is_known = false;
+                    for &(kv, kd) in &known_ids {
+                        if vid == kv && did == kd {
+                            is_known = true;
+                            break;
+                        }
+                    }
+
+                    if is_ac97_class || is_known {
+                        found = Some((b, d, f));
                         break 'scan;
                     }
                 }
@@ -482,7 +505,7 @@ pub fn init() -> bool {
         match found {
             Some(p) => p,
             None => {
-                serial::write_str("[AC97] No Intel/VIA AC97 controller found\r\n");
+                serial::write_str("[AC97] No AC97 controller found via class or VID:DID\r\n");
                 return false;
             }
         }
@@ -542,7 +565,8 @@ pub fn init() -> bool {
     }
 
     // ── Step 5: Initialize codec (NAM) ─────────────────────────────────────────
-    let _sample_rate = unsafe { init_codec() };
+    let rate = unsafe { init_codec() };
+    SAMPLE_RATE_HZ.store(rate, Ordering::Relaxed);
 
     // ── Step 6: Allocate DMA memory ────────────────────────────────────────────
     if !unsafe { alloc_dma_memory() } {
@@ -722,6 +746,32 @@ pub fn dma_status() -> (u8, u8, u8) {
     let fill = FILL_IDX.load(Ordering::Relaxed);
     let in_flight = fill.wrapping_sub(civ) & 0x1F;
     (civ, fill, in_flight)
+}
+
+/// Returns the negotiated sample rate (Hz).
+pub fn sample_rate() -> u32 {
+    SAMPLE_RATE_HZ.load(Ordering::Relaxed)
+}
+
+/// Returns the current master volume (0..100).
+pub fn volume() -> u8 {
+    MASTER_VOLUME.load(Ordering::Relaxed)
+}
+
+/// Set master volume (0..100).
+pub fn set_volume(pct: u8) {
+    let pct = pct.min(100);
+    MASTER_VOLUME.store(pct, Ordering::Relaxed);
+    if !AUDIO_READY.load(Ordering::Acquire) { return; }
+
+    // AC97 volume: 0 = max gain, 0x1F = -46.5 dB, bit 15 = mute
+    // Convert 0..100 to 0x1F..0 (inverted)
+    let attn = (0x1F - (pct as u16 * 0x1F / 100)) & 0x1F;
+    let val = attn | (attn << 8); // set both channels
+    unsafe {
+        nam_write16(NAM_MASTER_VOL, val);
+        nam_write16(NAM_HEADPHONE_VOL, val);
+    }
 }
 
 // ─── Diagnostic: dump AC97 register state to serial ──────────────────────────

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * AETERNA Installer — aeterna-install
  *
  * Interactive, step-by-step disk installer for AETERNA Microkernel.
@@ -315,24 +315,22 @@ fn w64(buf: &mut [u8], o: usize, v: u64) { buf[o..o+8].copy_from_slice(&v.to_le_
 // ── UI ────────────────────────────────────────────────────────────────────────
 fn draw_header() {
     framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0);
-    hl( "+================================================+\n");
-    hl( "|"); puts("  AETERNA Installer"); dim("  --  ospab.os  Microkernel  "); hl("|\n");
-    hl( "|"); dim("       x86_64   |   UEFI + BIOS   |   GPT+FAT32  "); hl("|\n");
-    hl( "+================================================+\n\n");
+    puts("\n");
+    hl("    AETERNA Microkernel OS  —  System Installer\n");
+    dim("    arch: x86_64    boot: UEFI/Legacy    fs: aeternafs\n");
+    dim("    _______________________________________________________________\n\n");
 }
 
-/// ASCII progress bar: [=====>    ] N%  (done/total)
+/// Truthful, minimalist progress bar: [########...........] N%  (done/total)
 fn draw_progress_bar(done: u32, total: u32) {
-    const W: usize = 36;
+    const W: usize = 40;
     let filled = if total > 0 { ((done as usize) * W) / (total as usize) } else { 0 };
-    puts("  [");
+    puts("    [");
     for i in 0..W {
         if i < filled {
-            framebuffer::draw_string("=", FG_OK, BG);
-        } else if i == filled && done < total {
-            framebuffer::draw_string(">", FG_WARN, BG);
+            framebuffer::draw_string("#", FG_OK, BG);
         } else {
-            puts(" ");
+            framebuffer::draw_string(".", FG_DIM, BG);
         }
     }
     puts("] ");
@@ -377,15 +375,11 @@ pub fn run() {
 
         draw_header();
 
-        // ── Configuration table ──────────────────────────────────────────
-        hl( "  +---------------------------------------------------+\n");
-        hl( "  |"); puts(" Configure installation options");
-        dim("                     "); hl("|\n");
-        hl( "  +---------------------------------------------------+\n");
+        puts("    Installation Configuration\n\n");
 
         let mut draw_item = |idx: usize, label: &str, val_str: &str, warn_flag: bool| {
-            if cursor == idx { hl("  > "); hl(label); } else { puts("    "); dim(label); }
-            if warn_flag { warn(val_str); } else { ok(val_str); }
+            if cursor == idx { hl("  ▶ "); hl(label); } else { puts("    "); dim(label); }
+            if warn_flag { warn(val_str); } else { puts(val_str); }
             puts("\n");
         };
 
@@ -414,22 +408,21 @@ pub fn run() {
         // [4] Locale
         draw_item(MI_LOCALE, "Locale          :  ", LOCALES[locale_idx], false);
 
-        hl( "  +---------------------------------------------------+\n\n");
+        puts("\n");
+        dim("    _______________________________________________________________\n\n");
         
         // Disk scan info
-        puts("  Detected disks: "); put_u64(all_disks.len() as u64);
-        if all_disks.is_empty() { warn("  -- no disk found, attach virtual disk"); }
-        else if ospab_os::drivers::nvme::is_initialized() { dim("  (includes NVMe)"); }
+        puts("    Disks detected: "); put_u64(all_disks.len() as u64);
+        if all_disks.is_empty() { warn("    (No physical media found)"); }
+        else if ospab_os::drivers::nvme::is_initialized() { dim("  (Includes NVMe subsystems)"); }
         puts("\n\n");
 
-        hl( "  +---------------------------------------------------+\n");
         // Install action
-        if cursor == MI_INSTALL { hl("  > Install\n"); } else { puts("    Install\n"); }
+        if cursor == MI_INSTALL { hl("  ▶ Install System\n"); } else { puts("    Install System\n"); }
         // Quit action
-        if cursor == MI_QUIT { hl("  > Quit installer\n"); } else { puts("    Quit installer\n"); }
-        hl( "  +---------------------------------------------------+\n");
+        if cursor == MI_QUIT { hl("  ▶ Exit Installer\n"); } else { puts("    Exit Installer\n"); }
 
-        puts("\n  "); dim("Use Up/Down arrows to navigate, Enter to select."); puts("\n");
+        puts("\n    "); dim("[Up/Down] Navigate    [Enter] Select"); puts("\n");
 
         let ch = loop { match keyboard::poll_key() { Some(c) => break c, None => unsafe { core::arch::asm!("hlt"); } } };
 
@@ -579,37 +572,29 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
     draw_header();
     // ── Installation plan ─────────────────────────────────────────────────
     draw_header();
-    hl( "  +---------------------------------------------------+\n");
-    hl( "  |"); step("  Installation Plan"); dim("  --  please review carefully  "); hl("|\n");
-    hl( "  +---------------------------------------------------+\n\n");
+    puts("    Installation Plan  "); dim("—  please review carefully\n\n");
 
-    puts("  Target:  /dev/"); ok(disk.name());
+    puts("    Target:  /dev/"); ok(disk.name());
     puts("  ("); put_size(disk.size_mb); puts(")\n\n");
 
-    puts("  Partition plan:\n");
-    dim("  +---------+------------+------------+-----------+---------+\n");
-    dim("  | Device  | Start LBA  | End LBA    | Size      | Type    |\n");
-    dim("  +---------+------------+------------+-----------+---------+\n");
-    puts("  | /dev/"); puts(disk.name()); puts(disk.part_sep()); hl("1 ");
-    puts("|  "); put_u64(esp_start); puts("   |  "); put_u64(esp_end);
-    puts("  |  "); put_size(esp_size_mb); dim("  | ESP FAT32 |\n");
-    puts("  | /dev/"); puts(disk.name()); puts(disk.part_sep()); hl("2 ");
-    puts("|  "); put_u64(root_start); puts("   |  "); put_u64(root_end);
-    puts("  |  "); put_size(root_mb); dim("  | ospab.os  |\n");
-    dim("  +---------+------------+------------+-----------+---------+\n\n");
+    puts("    Partition Plan:\n");
+    dim("      START LBA    END LBA      SIZE          TYPE\n");
+    dim("      ---------    -------      ----          ----\n");
+    puts("      "); put_u64(esp_start); puts("         "); put_u64(esp_end);
+    puts("       "); put_size(esp_size_mb); dim("       ESP (FAT32)\n");
+    puts("      "); put_u64(root_start); puts("         "); put_u64(root_end);
+    puts("       "); put_size(root_mb); dim("       ospab.os\n\n");
 
-    puts("  ESP contents:\n");
-    dim("    /EFI/BOOT/BOOTX64.EFI   Limine UEFI bootloader\n");
-    dim("    /boot/KERNEL            AETERNA kernel  (this system)\n");
-    dim("    /limine.conf            Boot configuration\n\n");
+    puts("    ESP Contents:\n");
+    dim("      /EFI/BOOT/BOOTX64.EFI   Limine UEFI bootloader\n");
+    dim("      /boot/KERNEL            AETERNA kernel  (this system)\n");
+    dim("      /limine.conf            Boot configuration\n\n");
 
-    puts("  Hostname : "); for &b in hostname { putc(b as char); } puts("\n");
-    puts("  Locale   : "); puts(locale); puts("\n\n");
+    puts("    Hostname :  "); for &b in hostname { putc(b as char); } puts("\n");
+    puts("    Locale   :  "); puts(locale); puts("\n\n");
 
-    hl( "  +---------------------------------------------------+\n");
-    warn("  |  ALL DATA ON THIS DISK WILL BE PERMANENTLY ERASED  |\n");
-    hl( "  +---------------------------------------------------+\n\n");
-    puts("  Press ENTER to begin installation, Ctrl+C to abort.\n  > ");
+    warn("    WARNING:  ALL DATA ON THIS DISK WILL BE PERMANENTLY ERASED.\n\n");
+    dim("    [Enter] Begin Installation    [Ctrl+C] Abort\n    > ");
     if !wait_enter() || ABORT.load(Ordering::Relaxed) { abort_screen(); return; }
 
     // Fetch binaries first (fail-early if Limine is missing)
@@ -622,9 +607,9 @@ fn do_install(disk: VDisk, esp_size_mb: u64, hostname: &[u8], _password: &[u8], 
 
     // ── Installation phase header ─────────────────────────────────────────
     framebuffer::clear(BG); framebuffer::set_cursor_pos(0, 0);
-    hl( "+================================================+\n");
-    hl( "|"); puts("  AETERNA Installer"); dim("  --  Writing to disk...         "); hl("|\n");
-    hl( "+================================================+\n\n");
+    puts("\n");
+    hl("    Installing AETERNA...\n");
+    dim("    _______________________________________________________________\n\n");
 
     puts("  Target: /dev/"); ok(disk.name()); puts("  ("); put_size(disk.size_mb); puts(")\n\n");
 

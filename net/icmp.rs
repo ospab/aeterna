@@ -30,6 +30,10 @@ static PING_REPLY_BYTES: AtomicU64 = AtomicU64::new(0);
 static PING_SRC_IP: AtomicU32 = AtomicU32::new(0);
 // True when reply was ICMP Time Exceeded (type 11) rather than Echo Reply.
 static PING_IS_TTL_EXCEEDED: AtomicBool = AtomicBool::new(false);
+// Expected echo-reply sequence and destination source-IP for active probe.
+// EXPECT_SRC_IP=0 means "any source" (used by traceroute TTL-exceeded mode).
+static PING_EXPECT_SEQ: AtomicU32 = AtomicU32::new(0);
+static PING_EXPECT_SRC_IP: AtomicU32 = AtomicU32::new(0);
 
 /// Ping reply data returned by `poll_reply()` / `wait_reply()`.
 #[derive(Clone, Copy, Debug)]
@@ -56,7 +60,20 @@ pub fn handle_icmp(data: &[u8], src_ip: [u8; 4], ttl: u8) {
         ICMP_ECHO_REPLY => {
             crate::arch::x86_64::serial::write_str("[ICMP] Echo Reply received\r\n");
             if PING_WAITING.load(Ordering::Acquire) {
+                // Match our identifier (0xAE01) and expected seq/src.
+                if data[4] != 0xAE || data[5] != 0x01 {
+                    return;
+                }
                 let seq = u16::from_be_bytes([data[6], data[7]]);
+                let expected_seq = PING_EXPECT_SEQ.load(Ordering::Relaxed) as u16;
+                if seq != expected_seq {
+                    return;
+                }
+                let packed_ip = u32::from_be_bytes(src_ip);
+                let expected_src = PING_EXPECT_SRC_IP.load(Ordering::Relaxed);
+                if expected_src != 0 && packed_ip != expected_src {
+                    return;
+                }
                 // TSC-based RTT: now_us - send_us  (sub-millisecond precision)
                 let now_us  = crate::arch::x86_64::tsc::tsc_stamp_us();
                 let sent_us = PING_SEND_US.load(Ordering::Relaxed);
@@ -67,7 +84,6 @@ pub fn handle_icmp(data: &[u8], src_ip: [u8; 4], ttl: u8) {
                 // Total reply bytes = 20 (IP header) + ICMP data length
                 PING_REPLY_BYTES.store((20 + data.len()) as u64, Ordering::Relaxed);
                 // Store replier's IP and mark as echo reply
-                let packed_ip = u32::from_be_bytes(src_ip);
                 PING_SRC_IP.store(packed_ip, Ordering::Relaxed);
                 PING_IS_TTL_EXCEEDED.store(false, Ordering::Relaxed);
                 PING_RECEIVED.store(true, Ordering::Release);
@@ -82,8 +98,16 @@ pub fn handle_icmp(data: &[u8], src_ip: [u8; 4], ttl: u8) {
             //         [8..28]=original IP hdr, [28..36]=original ICMP hdr
             crate::arch::x86_64::serial::write_str("[ICMP] Time Exceeded received\r\n");
             if PING_WAITING.load(Ordering::Acquire) && data.len() >= 36 {
+                // Validate inner ICMP echo identifier and expected sequence.
+                if data[32] != 0xAE || data[33] != 0x01 {
+                    return;
+                }
                 // Extract original ICMP seq from inner datagram (offset 28+6 = 34)
                 let _seq = u16::from_be_bytes([data[34], data[35]]);
+                let expected_seq = PING_EXPECT_SEQ.load(Ordering::Relaxed) as u16;
+                if _seq != expected_seq {
+                    return;
+                }
                 let now_us  = crate::arch::x86_64::tsc::tsc_stamp_us();
                 let sent_us = PING_SEND_US.load(Ordering::Relaxed);
                 let rtt_us  = now_us.saturating_sub(sent_us);
@@ -139,6 +163,8 @@ pub fn send_ping_sized(dst_ip: [u8; 4], seq: u16, payload_size: usize) {
     // Mark waiting — TSC µs timestamp for sub-millisecond RTT measurement
     PING_RECEIVED.store(false, Ordering::Relaxed);
     PING_WAITING.store(true, Ordering::Release);
+    PING_EXPECT_SEQ.store(seq as u32, Ordering::Relaxed);
+    PING_EXPECT_SRC_IP.store(u32::from_be_bytes(dst_ip), Ordering::Relaxed);
     PING_SEND_US.store(crate::arch::x86_64::tsc::tsc_stamp_us(), Ordering::Relaxed);
 
     super::ipv4::send_ipv4(1, dst_ip, &pkt[..icmp_len]);
@@ -177,6 +203,8 @@ pub fn send_ping_ttl(dst_ip: [u8; 4], seq: u16, ttl: u8) {
 
     PING_RECEIVED.store(false, Ordering::Relaxed);
     PING_WAITING.store(true, Ordering::Release);
+    PING_EXPECT_SEQ.store(seq as u32, Ordering::Relaxed);
+    PING_EXPECT_SRC_IP.store(0, Ordering::Relaxed);
     PING_SEND_US.store(crate::arch::x86_64::tsc::tsc_stamp_us(), Ordering::Relaxed);
 
     super::ipv4::send_ipv4_ttl(1, dst_ip, &pkt[..icmp_len], ttl);
@@ -220,8 +248,12 @@ pub fn wait_reply_us(timeout_us: u64) -> Option<PingReply> {
             return None;
         }
 
-        // Sleep until next interrupt (NIC IRQ / APIC 1 ms timer).
-        crate::core::scheduler::sys_yield();
+        // Keep latency low for first 20ms, then yield to avoid burning CPU.
+        if elapsed_us > 20_000 {
+            crate::core::scheduler::sys_yield();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 

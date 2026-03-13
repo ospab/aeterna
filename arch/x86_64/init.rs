@@ -148,7 +148,7 @@ pub fn init() {
         framebuffer::draw_string_at(10, 66, "Serial: OK", 0x00FFFFFF, 0x00000000);
         framebuffer::draw_string_at(10, 82, "GDT: OK", 0x00FFFFFF, 0x00000000);
         framebuffer::draw_string_at(10, 98, "IDT: OK", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 114, "PIC: OK", 0x00FFFFFF, 0x00000000);
+        framebuffer::draw_string_at(10, 114, "PIC: OK\n", 0x00FFFFFF, 0x00000000);
     } else {
         serial::write_str("[AETERNA] No framebuffer available\r\n");
     }

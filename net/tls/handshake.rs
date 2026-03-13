@@ -72,7 +72,7 @@ const HS_SERVER_KEY_EXCHANGE: u8 = 12;
 // ─── TCP I/O helpers ─────────────────────────────────────────────────────────
 
 fn tcp_send_all(conn: usize, data: &[u8]) -> bool {
-    match crate::net::tcp::tcp_send(conn, data) {
+    match crate::userspace::net::tcp::tcp_send(conn, data) {
         Ok(_) => true,
         Err(_) => false,
     }
@@ -86,10 +86,10 @@ fn tcp_read_into(conn: usize, buf: &mut Vec<u8>, min_bytes: usize, timeout: u64)
     while buf.len() < min_bytes {
         let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
         if elapsed > timeout { return false; }
-        match crate::net::tcp::tcp_recv(conn, &mut tmp, 50) {
+        match crate::userspace::net::tcp::tcp_recv(conn, &mut tmp, 50) {
             Ok(0) => return false, // connection closed
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(crate::net::tcp::TcpError::WouldBlock) => continue,
+            Err(crate::userspace::net::tcp::TcpError::WouldBlock) => continue,
             Err(_) => return false,
         }
     }
@@ -765,7 +765,7 @@ impl TlsConn {
             };
             let _ = tcp_send_all(self.tcp_conn, &enc);
         }
-        crate::net::tcp::tcp_close(self.tcp_conn);
+        crate::userspace::net::tcp::tcp_close(self.tcp_conn);
     }
 
     /// Get the underlying TCP connection ID.
@@ -773,3 +773,4 @@ impl TlsConn {
         self.tcp_conn
     }
 }
+

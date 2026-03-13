@@ -310,8 +310,8 @@ impl<'a> JsonScanner<'a> {
 ///
 /// Requires: CapFsRead("/models"), CapMemHuge — both provided via `caps`.
 pub fn cmd_load(path: &str, caps: &AaiCaps) -> Result<(), &'static str> {
-    let _fs  = caps.fs_read;  // prove we hold CapFsRead before any VFS access
-    let _mem = caps.mem_huge; // prove we hold CapMemHuge before any mmap
+    let _fs  = &caps.fs_read;  // prove we hold CapFsRead before any VFS access
+    let _mem = &caps.mem_huge; // prove we hold CapMemHuge before any mmap
     serial::write_str("[AAI] Loading model: ");
     serial::write_str(path);
     serial::write_str("\r\n");

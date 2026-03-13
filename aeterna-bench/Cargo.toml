@@ -1,6 +1,6 @@
 [package]
 name       = "aeterna-bench"
-version    = "1.0.0"
+version    = "1.1.0"
 authors    = ["ospab"]
 edition    = "2021"
 description = "aeterna-bench — System Latency Tax benchmark (Linux companion binary)"

@@ -79,6 +79,7 @@ fn build_dhcp(
     msg_type: u8,
     xid: u32,
     mac: [u8; 6],
+    hostname: Option<&[u8]>,
     requested_ip: Option<[u8; 4]>,
     server_ip: Option<[u8; 4]>,
     buf: &mut [u8; 576],
@@ -110,6 +111,24 @@ fn build_dhcp(
     // Option 53: DHCP Message Type
     buf[pos] = 53; buf[pos+1] = 1; buf[pos+2] = msg_type;
     pos += 3;
+
+    // Option 12: Host Name
+    if let Some(name) = hostname {
+        let name_len = name.len().min(63);
+        if name_len > 0 {
+            buf[pos] = 12;
+            buf[pos + 1] = name_len as u8;
+            buf[pos + 2..pos + 2 + name_len].copy_from_slice(&name[..name_len]);
+            pos += 2 + name_len;
+        }
+    }
+
+    // Option 61: Client Identifier (type 1 = ethernet, then MAC)
+    buf[pos] = 61;
+    buf[pos + 1] = 7;
+    buf[pos + 2] = 1;
+    buf[pos + 3..pos + 9].copy_from_slice(&mac);
+    pos += 9;
 
     // Option 50: Requested IP Address (in REQUEST)
     if let Some(ip) = requested_ip {
@@ -279,6 +298,9 @@ pub fn discover(mac: [u8; 6]) -> Option<DhcpLease> {
     let serial = crate::arch::x86_64::serial::write_str;
     let xid = xid_from_mac(mac);
     let mut pkt = [0u8; 576];
+    let mut host_buf = [0u8; 63];
+    let host_len = current_hostname_bytes(&mut host_buf);
+    let host_opt = if host_len > 0 { Some(&host_buf[..host_len]) } else { None };
 
     for attempt in 0u8..3 {
         let timeout = 200u64 << attempt; // 2s, 4s, 8s at 100Hz
@@ -287,7 +309,7 @@ pub fn discover(mac: [u8; 6]) -> Option<DhcpLease> {
         serial_dec(attempt as u64 + 1);
         serial("/3)...\r\n");
 
-        let len = build_dhcp(DHCPDISCOVER, xid, mac, None, None, &mut pkt);
+        let len = build_dhcp(DHCPDISCOVER, xid, mac, host_opt, None, None, &mut pkt);
         send_dhcp_raw(mac, &pkt, len);
 
         // Wait for OFFER
@@ -318,6 +340,7 @@ pub fn discover(mac: [u8; 6]) -> Option<DhcpLease> {
         // Send REQUEST
         let len = build_dhcp(
             DHCPREQUEST, xid, mac,
+            host_opt,
             Some(offer.your_ip),
             Some(offer.server_ip),
             &mut pkt,
@@ -351,6 +374,25 @@ pub fn discover(mac: [u8; 6]) -> Option<DhcpLease> {
 
     serial("[DHCP] Failed after 3 attempts\r\n");
     None
+}
+
+fn current_hostname_bytes(out: &mut [u8; 63]) -> usize {
+    let data = match crate::fs::read_file("/etc/hostname") {
+        Some(d) => d,
+        None => return 0,
+    };
+
+    let mut n = 0usize;
+    for &b in &data {
+        if b == b'\r' || b == b'\n' { break; }
+        if n >= out.len() { break; }
+        let is_valid = (b as char).is_ascii_alphanumeric() || b == b'-' || b == b'.';
+        if is_valid {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    n
 }
 
 // ─── Serial helpers ──────────────────────────────────────────────────────

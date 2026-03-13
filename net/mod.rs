@@ -11,6 +11,7 @@
  *   5. Stack is UP — ARP, IPv4, ICMP, UDP, TCP, DNS all functional
  */
 
+pub mod virtio_net;
 pub mod rtl8139;
 pub mod e1000;
 pub mod rtl8169;
@@ -52,7 +53,7 @@ pub static mut OUR_MAC: [u8; 6]      = [0; 6];
 pub static mut GATEWAY_MAC: [u8; 6]  = [0xFF; 6]; // broadcast until ARP resolve
 
 static NET_UP: AtomicBool = AtomicBool::new(false);
-// 0=RTL8139  1=e1000  2=RTL8169
+// 0=RTL8139  1=e1000  2=RTL8169  3=VirtIO
 static mut ACTIVE_NIC: u8 = 0;
 // Packet counters
 static RX_PKTS: AtomicU64 = AtomicU64::new(0);
@@ -71,9 +72,50 @@ pub fn tx_bytes() -> u64 { TX_BYTES.load(Ordering::Relaxed) }
 pub fn link_up() -> bool {
     if !is_up() { return false; }
     match unsafe { ACTIVE_NIC } {
-        0 => rtl8139::link_up(),
-        1 => e1000::link_up(),
+        0 => virtio_net::link_up(),
+        1 => rtl8139::link_up(),
+        2 => e1000::link_up(),
         _ => rtl8169::link_up(),
+    }
+}
+
+/// Renew DHCP lease and re-apply network settings at runtime.
+///
+/// Useful after changing hostname so DHCP option 12 is advertised immediately.
+pub fn dhcp_renew() -> bool {
+    if !is_up() {
+        return false;
+    }
+
+    crate::arch::x86_64::serial::write_str("[NET] DHCP renew requested\r\n");
+    let mac = unsafe { OUR_MAC };
+    match dhcp::discover(mac) {
+        Some(lease) => {
+            unsafe {
+                OUR_IP      = lease.your_ip;
+                SUBNET_MASK = lease.subnet;
+                GATEWAY_IP  = lease.gateway;
+                DNS_IP      = lease.dns;
+                GATEWAY_MAC = [0xFF; 6];
+            }
+
+            let gw = unsafe { GATEWAY_IP };
+            if gw != [0, 0, 0, 0] {
+                arp::send_request(gw);
+                let start = crate::arch::x86_64::idt::timer_ticks();
+                loop {
+                    poll_rx();
+                    let done = unsafe { GATEWAY_MAC[0] != 0xFF || GATEWAY_MAC[1] != 0xFF };
+                    if done { break; }
+                    if crate::arch::x86_64::idt::timer_ticks().saturating_sub(start) > 200 {
+                        break;
+                    }
+                    unsafe { core::arch::asm!("hlt"); }
+                }
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -81,8 +123,8 @@ pub fn link_up() -> bool {
 pub fn init() -> bool {
     crate::arch::x86_64::serial::write_str("[NET] Initializing network stack...\r\n");
 
-    // Step 1: Find and init NIC — try RTL8139, e1000, RTL8169 in order
-    enum NicKind { Rtl8139, E1000, Rtl8169 }
+    // Step 1: Find and init NIC — try VirtIO, RTL8139, e1000, RTL8169 in order
+    enum NicKind { Rtl8139, E1000, Rtl8169, VirtIo }
     let nic: NicKind;
     if rtl8139::probe_and_init() {
         crate::arch::x86_64::serial::write_str("[NET] RTL8139 found\r\n");
@@ -93,6 +135,9 @@ pub fn init() -> bool {
     } else if rtl8169::probe_and_init() {
         crate::arch::x86_64::serial::write_str("[NET] RTL8169/8111 found\r\n");
         nic = NicKind::Rtl8169;
+    } else if virtio_net::probe_and_init() {
+        crate::arch::x86_64::serial::write_str("[NET] VirtIO-Net found\r\n");
+        nic = NicKind::VirtIo;
     } else {
         crate::arch::x86_64::serial::write_str("[NET] No supported NIC found\r\n");
         return false;
@@ -105,7 +150,8 @@ pub fn init() -> bool {
     let mac = match unsafe { ACTIVE_NIC } {
         0 => rtl8139::mac_address(),
         1 => e1000::mac_address(),
-        _ => rtl8169::mac_address(),
+        2 => rtl8169::mac_address(),
+        _ => virtio_net::mac_address(),
     };
     unsafe {
         OUR_MAC = mac;
@@ -185,7 +231,7 @@ pub fn init() -> bool {
 pub fn poll_rx() {
     match unsafe { ACTIVE_NIC } {
         0 => {
-            while let Some((buf, len)) = rtl8139::receive_packet() {
+            while let Some((buf, len)) = virtio_net::receive_packet() {
                 if len < 14 { continue; }
                 RX_PKTS.fetch_add(1, Ordering::Relaxed);
                 RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
@@ -193,6 +239,14 @@ pub fn poll_rx() {
             }
         }
         1 => {
+            while let Some((buf, len)) = rtl8139::receive_packet() {
+                if len < 14 { continue; }
+                RX_PKTS.fetch_add(1, Ordering::Relaxed);
+                RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                ethernet::handle_frame(&buf[..len]);
+            }
+        }
+        2 => {
             while let Some((buf, len)) = e1000::receive_packet() {
                 if len < 14 { continue; }
                 RX_PKTS.fetch_add(1, Ordering::Relaxed);
@@ -216,8 +270,9 @@ pub fn send_raw(buf: &[u8], len: usize) {
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
     match unsafe { ACTIVE_NIC } {
-        0 => rtl8139::send_packet(buf, len),
-        1 => e1000::send_packet(buf, len),
+        0 => virtio_net::send_packet(buf, len),
+        1 => rtl8139::send_packet(buf, len),
+        2 => e1000::send_packet(buf, len),
         _ => rtl8169::send_packet(buf, len),
     }
 }
@@ -238,8 +293,9 @@ pub fn send_raw(buf: &[u8], len: usize) {
 pub fn handle_net_irq() {
     // Step 1: ack NIC interrupt register
     match unsafe { ACTIVE_NIC } {
-        0 => rtl8139::handle_irq(),
-        1 => e1000::handle_irq(),
+        0 => virtio_net::handle_irq(),
+        1 => rtl8139::handle_irq(),
+        2 => e1000::handle_irq(),
         _ => rtl8169::handle_irq(),
     }
     // Step 2: drain all pending RX frames immediately (interrupt-driven poll)
@@ -251,11 +307,11 @@ pub fn handle_net_irq() {
 /// For RTL8139: (ISR as u32, CMD as u32, CBR as u32, CAPR as u32)
 pub fn diag() -> (u32, u32, u32, u32) {
     match unsafe { ACTIVE_NIC } {
-        0 => {
+        1 => {
             let (isr, cmd, cbr, capr) = rtl8139::diag();
             (isr as u32, cmd as u32, cbr as u32, capr as u32)
         }
-        1 => e1000::diag_regs(),
+        2 => e1000::diag_regs(),
         _ => (0, 0, 0, 0),
     }
 }
@@ -263,8 +319,9 @@ pub fn diag() -> (u32, u32, u32, u32) {
 /// Report which NIC is active (for terminal ifconfig)
 pub fn nic_name() -> &'static str {
     match unsafe { ACTIVE_NIC } {
-        0 => "RTL8139",
-        1 => "Intel e1000",
+        0 => "VirtIO-Net",
+        1 => "RTL8139",
+        2 => "Intel e1000",
         _ => "RTL8169/8111",
     }
 }

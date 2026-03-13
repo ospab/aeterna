@@ -694,11 +694,11 @@ pub fn refresh_proc_files() {
             }
 
             // /proc/net (if network is up)
-            if crate::net::is_up() {
-                let ip = crate::net::OUR_IP;
+            if crate::userspace::net::is_up() {
+                let ip = crate::userspace::net::OUR_IP;
                 let mut buf = Vec::with_capacity(128);
                 buf.extend_from_slice(b"Interface: eth0\nDriver: ");
-                buf.extend_from_slice(crate::net::nic_name().as_bytes());
+                buf.extend_from_slice(crate::userspace::net::nic_name().as_bytes());
                 buf.extend_from_slice(b"\nIP: ");
                 push_ip(&mut buf, ip);
                 buf.extend_from_slice(b"\nStatus: UP\n");

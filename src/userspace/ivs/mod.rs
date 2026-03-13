@@ -144,7 +144,7 @@ fn cmd_verify_sched(_args: &str) {
     let mut pids = [0u32; N];
     let mut spawned = 0usize;
     for i in 0..N {
-        match spawn_named(task_names[i], Priority::Normal, 0, 0, 0) {
+        match spawn_named(task_names[i], Priority::Normal, 0, 0, 0, &[]) {
             Some(pid) => { pids[spawned] = pid; spawned += 1; }
             None => { warn(&format!("could only spawn {} tasks (max reached)\n", spawned)); break; }
         }
@@ -209,14 +209,14 @@ fn cmd_verify_net(_args: &str) {
     puts("network stack integrity test\n");
 
     // --- 1. NIC up? ---
-    if !crate::net::is_up() {
+    if !crate::userspace::net::is_up() {
         fail("NIC not initialized — start QEMU with -device e1000 or rtl8139\n");
         return;
     }
-    pass(&format!("NIC detected: {}\n", crate::net::nic_name()));
+    pass(&format!("NIC detected: {}\n", crate::userspace::net::nic_name()));
 
     // --- 2. MAC address ---
-    let mac = unsafe { crate::net::OUR_MAC };
+    let mac = unsafe { crate::userspace::net::OUR_MAC };
     let mac_valid = mac.iter().any(|&b| b != 0) && mac != [0xFF; 6];
     if mac_valid {
         pass(&format!(
@@ -228,7 +228,7 @@ fn cmd_verify_net(_args: &str) {
     }
 
     // --- 3. IP address ---
-    let ip = unsafe { crate::net::OUR_IP };
+    let ip = unsafe { crate::userspace::net::OUR_IP };
     if ip != [0, 0, 0, 0] {
         pass(&format!("IP address: {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
     } else {
@@ -242,7 +242,7 @@ fn cmd_verify_net(_args: &str) {
     //   ~sum = 0x49FE
     let test_pkt = [0x08u8, 0x00, 0x00, 0x00, 0xAE, 0x01, 0x00, 0x00];
     let expected_cksum: u16 = 0x49FE;
-    let got_cksum = crate::net::ipv4::checksum(&test_pkt);
+    let got_cksum = crate::userspace::net::ipv4::checksum(&test_pkt);
     if got_cksum == expected_cksum {
         pass(&format!("ICMP checksum: 0x{:04X} (correct)\n", got_cksum));
     } else {
@@ -260,7 +260,7 @@ fn cmd_verify_net(_args: &str) {
                               0x00, 0x00, 0x00, 0x00,
                               0x00, 0x00, 0x00, 0x00];
     let expected_ip_cksum: u16 = 0xBAFF;
-    let got_ip_cksum = crate::net::ipv4::checksum(&ip_hdr);
+    let got_ip_cksum = crate::userspace::net::ipv4::checksum(&ip_hdr);
     if got_ip_cksum == expected_ip_cksum {
         pass(&format!("IPv4 header checksum: 0x{:04X} (correct)\n", got_ip_cksum));
     } else {
@@ -271,25 +271,25 @@ fn cmd_verify_net(_args: &str) {
     }
 
     // --- 5. ARP gateway resolution ---
-    let gw = unsafe { crate::net::GATEWAY_IP };
+    let gw = unsafe { crate::userspace::net::GATEWAY_IP };
     step(&format!(
         "sending ARP for gateway {}.{}.{}.{}\n",
         gw[0], gw[1], gw[2], gw[3]
     ));
 
     // Attempt to resolve; allow 500 ms (50 ticks @ 100 Hz)
-    let already_cached = crate::net::arp::cache_lookup(gw).is_some();
+    let already_cached = crate::userspace::net::arp::cache_lookup(gw).is_some();
     if !already_cached {
-        crate::net::arp::send_request(gw);
+        crate::userspace::net::arp::send_request(gw);
         let deadline = crate::arch::x86_64::idt::timer_ticks() + 50;
         while crate::arch::x86_64::idt::timer_ticks() < deadline {
-            crate::net::poll_rx();
-            if crate::net::arp::cache_lookup(gw).is_some() { break; }
+            crate::userspace::net::poll_rx();
+            if crate::userspace::net::arp::cache_lookup(gw).is_some() { break; }
             crate::core::scheduler::sys_yield();
         }
     }
 
-    if let Some(gw_mac) = crate::net::arp::cache_lookup(gw) {
+    if let Some(gw_mac) = crate::userspace::net::arp::cache_lookup(gw) {
         pass(&format!(
             "ARP gateway resolved: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
             gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]
@@ -300,7 +300,7 @@ fn cmd_verify_net(_args: &str) {
 
     // --- 6. ARP cache state ---
     let mut cache = [([0u8; 4], [0u8; 6]); 16];
-    let n = crate::net::arp::cache_entries(&mut cache);
+    let n = crate::userspace::net::arp::cache_entries(&mut cache);
     step(&format!("ARP cache: {} entries\n", n));
 
     puts("\n");

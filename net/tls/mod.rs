@@ -35,13 +35,13 @@ pub mod handshake;
 
 /// Convenience: perform TCP connect + TLS handshake in one call.
 pub fn connect(ip: [u8; 4], port: u16, hostname: &str) -> Result<handshake::TlsConn, &'static str> {
-    let tcp_conn = crate::net::tcp::tcp_connect(ip, port)
+    let tcp_conn = crate::userspace::net::tcp::tcp_connect(ip, port)
         .map_err(|_| "TLS: TCP connect failed")?;
 
     match handshake::tls_connect(tcp_conn, hostname) {
         Ok(tls) => Ok(tls),
         Err(e) => {
-            crate::net::tcp::tcp_close(tcp_conn);
+            crate::userspace::net::tcp::tcp_close(tcp_conn);
             Err(e)
         }
     }
