@@ -169,3 +169,22 @@ pub fn serial_hex(mut val: u64) {
         serial::write_byte(b);
     }
 }
+
+/// Print an unsigned integer to the serial port in decimal.
+pub fn serial_dec(mut val: u64) {
+    if val == 0 {
+        serial::write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while val > 0 {
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        serial::write_byte(buf[i]);
+    }
+}

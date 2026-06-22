@@ -330,8 +330,22 @@ fn syscall_exit(code: u64) -> i64 {
     serial_dec(code);
     crate::arch::x86_64::serial::write_str(")\r\n");
     crate::core::scheduler::exit_current(code);
-    loop {
-        unsafe { core::arch::asm!("hlt"); }
+
+    // We arrived here via the SYSCALL instruction, so `syscall_entry_stub`
+    // already executed `swapgs` (GS now points at the per-CPU kernel area).
+    // Crucially, we will NOT return to the caller via `sysretq` — the process
+    // is dead. Instead we re-enable interrupts and halt; the next timer IRQ
+    // drives `on_timer_irq`, which sees this task as Dead and context-switches
+    // (via iretq) into the next ready task, never returning here.
+    //
+    // Because we skip the stub's closing `swapgs`, we must restore the GS-base
+    // invariant ourselves first — otherwise the *next* SYSCALL from ring 3
+    // would swapgs into the wrong base and fault in the kernel handler.
+    unsafe {
+        core::arch::asm!("swapgs", options(nomem, nostack));
+        loop {
+            core::arch::asm!("sti; hlt", options(nomem, nostack));
+        }
     }
 }
 

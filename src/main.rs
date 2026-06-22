@@ -426,6 +426,19 @@ pub extern "C" fn _start() -> ! {
         crate::installer::run();
         loop { unsafe { core::arch::asm!("hlt"); } }
     } else {
+        // ── Milestone 1: ring-3 smoke test ──
+        // Spawn a tiny ring-3 task (getpid → exit(pid)). It runs on the next
+        // preemption tick; success is observable on serial as `[SYSCALL] exit(<pid>)`
+        // followed by the terminal coming up normally — proving the full
+        // ring0→ring3→syscall→ring0 round trip.
+        serial::write_str("[BOOT] Launching ring-3 smoke test\r\n");
+        if let Some(pid) = ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
+            // Block until the ring-3 task exits, then confirm the kernel regained
+            // control — this proves the full round trip resumed cleanly.
+            ospab_os::core::scheduler::wait_pid(pid);
+            serial::write_str("[BOOT] Ring-3 smoke test completed; kernel alive and resumed\r\n");
+        }
+
         boot_ok("Console ready");
         klog::boot("Entering terminal");
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);

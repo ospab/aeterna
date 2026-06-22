@@ -251,6 +251,71 @@ pub fn spawn_named(
     None
 }
 
+/// Spawn a Ring 3 user task from a *pre-built* address space.
+///
+/// Unlike [`spawn_named`], this does NOT allocate a fresh address space — the
+/// caller has already created `cr3` and mapped the user code + stack pages with
+/// `FLAG_USER` into it (see `arch::x86_64::ring`). We only build the iretq frame
+/// (with USER_CS/USER_DS so the first scheduler context-switch drops to ring 3)
+/// and register the TCB as `Ready`.
+///
+/// The task starts with the given `capabilities` manifest verbatim (no parent
+/// intersection) — callers are kernel code setting up trusted bootstrap tasks.
+pub fn spawn_user_task(
+    name: &str,
+    priority: Priority,
+    cr3: u64,
+    entry: u64,
+    user_stack: u64,
+    capabilities: alloc::vec::Vec<Capability>,
+) -> Option<TaskId> {
+    use crate::arch::x86_64::gdt_simple;
+    unsafe {
+        if !SCHEDULER_INITIALIZED {
+            return None;
+        }
+        for i in 1..MAX_TASKS {
+            if TASKS[i].is_none() {
+                let pid = NEXT_PID;
+                NEXT_PID = NEXT_PID.wrapping_add(1);
+
+                let mut task_name = EMPTY_NAME;
+                let name_len = fill_name(&mut task_name, name);
+
+                // Build the iretq frame the scheduler restores on first switch-in.
+                // Frame layout: [0..14]=r15..rax, 15=err, 16=rip, 17=cs,
+                // 18=rflags, 19=rsp, 20=ss.
+                let mut frame = [0u64; FRAME_WORDS];
+                frame[16] = entry;                       // RIP → user entry
+                frame[17] = gdt_simple::USER_CS as u64;  // CS  (RPL 3 → ring 3)
+                frame[18] = 0x202;                       // RFLAGS (IF=1)
+                frame[19] = user_stack;                  // RSP → user stack
+                frame[20] = gdt_simple::USER_DS as u64;  // SS  (RPL 3)
+
+                TASKS[i] = Some(TaskControlBlock {
+                    pid,
+                    priority,
+                    state: TaskState::Ready,
+                    cr3,
+                    cpu_ticks: 0,
+                    memory_bytes: 0,
+                    stack_pointer: user_stack,
+                    instruction_pointer: entry,
+                    frame,
+                    has_frame: true,
+                    name: task_name,
+                    name_len,
+                    capabilities,
+                    preemption_disabled: false,
+                    med_id: None,
+                });
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
 pub fn has_capability(cap: Capability) -> bool {
     unsafe {
         if let Some(ref tcb) = TASKS[CURRENT_SLOT] {
@@ -451,6 +516,17 @@ fn next_ready_slot() -> Option<usize> {
                     if idx != 0 && idx != CURRENT_SLOT {
                         TASKS[idx] = None;
                     }
+                    continue;
+                }
+
+                // Skip "phantom" bookkeeping tasks: ones that have never run
+                // (`!has_frame`) and carry no entry point (`instruction_pointer == 0`),
+                // such as the seed service placeholders. They have no code to
+                // execute, so switching to them is a no-op that would instead
+                // resume whatever context was last interrupted — breaking a clean
+                // return to the kernel after a real task exits. They remain in the
+                // table for `ps`/IPC bookkeeping; we just never schedule them.
+                if !task.has_frame && task.instruction_pointer == 0 {
                     continue;
                 }
 

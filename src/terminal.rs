@@ -2563,9 +2563,16 @@ fn cmd_aai(args: &str) {
 
 fn cmd_ring3test() {
     puts("Launching Ring 3 smoke test...\n");
-    dim_print("This transfers execution to CPL3 via iretq and does not return on success.\n");
-    if !ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
-        err_print("ring3test: failed to prepare Ring 3 task\n");
+    dim_print("Spawns a CPL3 task (getpid -> exit) that runs on the next scheduler tick.\n");
+    match ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
+        Some(pid) => {
+            puts("Ring 3 task spawned, pid ");
+            print_dec(pid as u64);
+            puts(" — watch the serial log for [SYSCALL] exit(");
+            print_dec(pid as u64);
+            puts(").\n");
+        }
+        None => err_print("ring3test: failed to prepare Ring 3 task\n"),
     }
 }
 
