@@ -41,15 +41,28 @@ BUILD_IMAGE=false
 
 # --- Auto-increment ISO number ---
 mkdir -p "$ISOS_DIR"
-LAST_NUM=$(ls -1 "$ISOS_DIR"/ospab-os-v2-*.iso 2>/dev/null | sed 's/.*ospab-os-v2-\([0-9]*\)\.iso/\1/' | sort -n | tail -1)
+# Images share the numbering, so a build number is never reused between .iso and .img
+LAST_NUM=$(ls -1 "$ISOS_DIR"/ospab-os-v2-*.iso "$ISOS_DIR"/ospab-os-v2-*.img 2>/dev/null | sed 's/.*ospab-os-v2-\([0-9]*\)\.[a-z]*$/\1/' | sort -n | tail -1)
 if [ -z "$LAST_NUM" ]; then
     NEXT_NUM=1
 else
     NEXT_NUM=$((LAST_NUM + 1))
 fi
 ISO_NAME="ospab-os-v2-${NEXT_NUM}.iso"
+ISO_PATH_OVERRIDE="${ISO_PATH:-}"
 # ISO_PATH may be overridden so parallel builds do not race for the same number
 ISO_PATH="${ISO_PATH:-$ISOS_DIR/$ISO_NAME}"
+
+# Build number shown by `uname -a`: the ISO/image number for numbered builds, "dev" for
+# kernel-only builds and test builds written to a custom ISO_PATH.
+if [ -z "${OSPAB_BUILD:-}" ]; then
+    if [ -n "$ISO_PATH_OVERRIDE" ] || { [ "$BUILD_ISO" = false ] && [ "$BUILD_IMAGE" = false ]; }; then
+        OSPAB_BUILD=dev
+    else
+        OSPAB_BUILD=$NEXT_NUM
+    fi
+fi
+export OSPAB_BUILD
 
 echo "=== Building ospab.os v2 (AETERNA) — ISO #$NEXT_NUM ==="
 cd "$PROJECT_ROOT"

@@ -14,12 +14,21 @@ pub const OS_VERSION: &str = concat!("ospab.os v", env!("CARGO_PKG_VERSION"));
 /// "AETERNA 1.1.0"
 pub const KERNEL_VERSION: &str = concat!("AETERNA ", env!("CARGO_PKG_VERSION"));
 
-/// uname -a style string: kernel name, hostname placeholder, release, machine.
-pub const UNAME_FULL: &str = concat!("AETERNA ospab ", env!("CARGO_PKG_VERSION"), " x86_64");
+/// Build number: the ISO/image number from build.sh, or "dev" (see build.rs).
+pub const BUILD: &str = env!("OSPAB_BUILD");
 
-/// Date the version number was last set by hand (not the build time;
-/// the build does not stamp a date).
-pub const BUILD_DATE: &str = "2026-03-07";
+/// Short git commit the kernel was built from; "+" means uncommitted changes.
+pub const COMMIT: &str = env!("OSPAB_COMMIT");
+
+/// UTC date of the build.
+pub const BUILD_DATE: &str = env!("OSPAB_BUILD_DATE");
+
+/// `uname -v` style: "#181 a956bbf 2026-10-10"
+pub const KERNEL_BUILD: &str = concat!("#", env!("OSPAB_BUILD"), " ", env!("OSPAB_COMMIT"), " ", env!("OSPAB_BUILD_DATE"));
+
+/// uname -a style string: kernel name, hostname placeholder, release, build, machine.
+pub const UNAME_FULL: &str = concat!("AETERNA ospab ", env!("CARGO_PKG_VERSION"), " #", env!("OSPAB_BUILD"),
+    " ", env!("OSPAB_COMMIT"), " ", env!("OSPAB_BUILD_DATE"), " x86_64");
 
 /// Architecture
 pub const ARCH: &str = "x86_64";

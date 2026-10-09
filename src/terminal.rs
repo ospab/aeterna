@@ -138,6 +138,8 @@ fn print_banner() {
     framebuffer::draw_string(crate::version::OS_VERSION, FG_OK, BG);
     dim_print("  AETERNA kernel ");
     dim_print(crate::version::VERSION_STR);
+    dim_print(" ");
+    dim_print(crate::version::KERNEL_BUILD);
     dim_print(" (");
     dim_print(crate::version::ARCH);
     dim_print(")\n");
@@ -1041,8 +1043,13 @@ fn cmd_uname(args: &str) {
         puts(" ");
         puts(crate::version::VERSION_STR);
         puts(" ");
+        puts(crate::version::KERNEL_BUILD);
+        puts(" ");
         puts(crate::version::ARCH);
         puts(" ospab.os\n");
+    } else if a == "-v" {
+        puts(crate::version::KERNEL_BUILD);
+        puts("\n");
     } else if a == "-n" {
         puts(&host);
         puts("\n");
