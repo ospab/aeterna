@@ -1,859 +1,273 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
-tomato — Package manager for ospab.os (AETERNA)
+tomato — package manager for ospab.os (AETERNA)
 
-A pacman-inspired package manager operating on local binary packages.
-Packages are stored in the VFS under /var/lib/tomato/.
-Each package is a metadata record + file list.
+Honest current state:
+  - There is NO remote package repository or package server yet, so
+    `-Sy`, `-Syu` and installing by name from the network are not
+    possible; tomato says so instead of pretending.
+  - What works: local binary packages in the .tmt format (see below).
+    Create one from files in the VFS, install it, query it, remove it:
 
-Usage from terminal:
-  tomato -S <name>          Install a package
-  tomato -R <name>          Remove a package
-  tomato -Ss <query>        Search available packages
-  tomato -Q                 List installed packages
-  tomato -Qi <name>         Show package info
-  tomato -Sy                Sync package database
-  tomato -Syu               Full system upgrade
-  tomato --help             Show help
+      tomato --tmt pack hello 1.0 /tmp/hello.tmt /etc/hello.txt
+      tomato -U /tmp/hello.tmt          install a package file
+      tomato -S hello                   install from the local cache
+                                        (.tmt files in /var/cache/tomato/pkg)
+      tomato -Q / -Qi hello / -Ql hello query installed packages
+      tomato -Ss text                   search the local cache
+      tomato -R hello                   remove (only files it installed)
 
-Package database is stored at /var/lib/tomato/db/
-Installed files tracked at /var/lib/tomato/local/
-Repository config at /etc/tomato/repos.conf
+  - Package contents are plain files.  ospab.os cannot execute programs
+    from packages yet (no ELF loader), so packages carry data/scripts.
+
+Installed package records: /var/lib/tomato/local/<name>
+  (name=, version=, installed_from=, file=<path> per installed file)
 */
 
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
-// ─── Package metadata ───────────────────────────────────────────────────────
+use crate::userspace::plum::io;
 
-/// A package in the database
-#[derive(Clone)]
-pub struct Package {
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub size: usize,
-    pub files: Vec<String>,
-    pub depends: Vec<String>,
-    pub installed: bool,
-}
-
-/// Repository entry
-#[allow(dead_code)]
-struct Repo {
-    name: String,
-    url: String,
-}
-
-/// Early network transport holder for future HTTP package downloads.
-/// This keeps parsing and session state outside command handlers so it can
-/// later map to a real socket syscall API without changing tomato UX.
-#[allow(dead_code)]
-pub struct HttpSession {
-    pub host: String,
-    pub port: u16,
-    pub path: String,
-    pub connected: bool,
-}
-
-#[allow(dead_code)]
-impl HttpSession {
-    pub fn new(url: &str) -> Option<Self> {
-        // Very small parser: expects http://host[:port]/path
-        let trimmed = url.trim();
-        let no_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
-            rest
-        } else {
-            return None;
-        };
-
-        let mut parts = no_scheme.splitn(2, '/');
-        let host_port = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
-        if host_port.is_empty() {
-            return None;
-        }
-
-        let mut hp = host_port.splitn(2, ':');
-        let host = hp.next().unwrap_or("");
-        let port = hp.next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(80);
-
-        Some(Self {
-            host: String::from(host),
-            port,
-            path: alloc::format!("/{}", path),
-            connected: false,
-        })
-    }
-
-    pub fn connect(&mut self) -> bool {
-        // Socket syscalls are not wired yet; keep deterministic state machine.
-        self.connected = true;
-        true
-    }
-
-    pub fn build_get_request(&self) -> String {
-        alloc::format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: tomato/0.1\r\nConnection: close\r\n\r\n",
-            self.path,
-            self.host
-        )
-    }
-}
-
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-#[allow(dead_code)] const DB_PATH: &str = "/var/lib/tomato/db";
 const LOCAL_PATH: &str = "/var/lib/tomato/local";
-#[allow(dead_code)] const CACHE_PATH: &str = "/var/cache/tomato/pkg";
-#[allow(dead_code)] const REPO_CONF: &str = "/etc/tomato/repos.conf";
-
-// ─── Framebuffer output helpers ─────────────────────────────────────────────
-
-use crate::arch::x86_64::framebuffer;
-
-const FG: u32      = 0x00FFFFFF;
-const FG_OK: u32   = 0x0000FF00;
-const FG_ERR: u32  = 0x000000FF;
-const FG_WARN: u32 = 0x0000FFFF;
-const FG_DIM: u32  = 0x00AAAAAA;
-const FG_NAME: u32 = 0x0000FF00;
-const FG_VER: u32  = 0x0000FFFF;
-const BG: u32      = 0x00000000;
-
-fn puts(s: &str) { framebuffer::draw_string(s, FG, BG); }
-fn ok(s: &str)   { framebuffer::draw_string(s, FG_OK, BG); }
-fn err(s: &str)  { framebuffer::draw_string(s, FG_ERR, BG); }
-fn warn(s: &str) { framebuffer::draw_string(s, FG_WARN, BG); }
-fn dim(s: &str)  { framebuffer::draw_string(s, FG_DIM, BG); }
-
-// ─── Built-in package database ──────────────────────────────────────────────
-
-/// Built-in repository of available packages.
-/// In a real system these would come from a remote repo; here they're
-/// bundled so `tomato -S` always works in the live environment.
-fn builtin_packages() -> Vec<Package> {
-    let mut pkgs = Vec::new();
-
-    pkgs.push(Package {
-        name: String::from("coreutils"),
-        version: String::from("1.0.0"),
-        description: String::from("Essential system utilities (ls, cp, mv, pwd, cat)"),
-        size: 2048,
-        files: vec![
-            String::from("/bin/ls"),
-            String::from("/bin/cp"),
-            String::from("/bin/mv"),
-            String::from("/bin/pwd"),
-            String::from("/bin/cat"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("grape"),
-        version: String::from("1.0.0"),
-        description: String::from("Terminal text editor (nano-like)"),
-        size: 4096,
-        files: vec![
-            String::from("/bin/grape"),
-            String::from("/etc/grape/graperc"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("plum"),
-        version: String::from("1.0.0"),
-        description: String::from("System shell for AETERNA"),
-        size: 3072,
-        files: vec![
-            String::from("/bin/plum"),
-            String::from("/etc/plum/plumrc"),
-        ],
-        depends: vec![String::from("coreutils")],
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("net-tools"),
-        version: String::from("1.0.0"),
-        description: String::from("Network utilities (ping, ifconfig, ntpdate)"),
-        size: 1536,
-        files: vec![
-            String::from("/bin/ping"),
-            String::from("/bin/ifconfig"),
-            String::from("/bin/ntpdate"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("tutor"),
-        version: String::from("1.0.0"),
-        description: String::from("Interactive system tutorial"),
-        size: 1024,
-        files: vec![
-            String::from("/bin/tutor"),
-            String::from("/usr/share/tutor/lessons.dat"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("kernel-headers"),
-        version: String::from("2.0.3"),
-        description: String::from("AETERNA kernel headers for module development"),
-        size: 8192,
-        files: vec![
-            String::from("/usr/include/aeterna/types.h"),
-            String::from("/usr/include/aeterna/syscall.h"),
-            String::from("/usr/include/aeterna/ipc.h"),
-            String::from("/usr/include/aeterna/capability.h"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("ospab-libc"),
-        version: String::from("0.1.0"),
-        description: String::from("Optimized C library for AETERNA microkernel"),
-        size: 16384,
-        files: vec![
-            String::from("/lib/libc.so"),
-            String::from("/usr/include/stdio.h"),
-            String::from("/usr/include/stdlib.h"),
-            String::from("/usr/include/string.h"),
-        ],
-        depends: vec![String::from("kernel-headers")],
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("base"),
-        version: String::from("1.0.0"),
-        description: String::from("Base meta-package for ospab.os"),
-        size: 256,
-        files: Vec::new(),
-        depends: vec![
-            String::from("coreutils"),
-            String::from("plum"),
-            String::from("grape"),
-            String::from("net-tools"),
-        ],
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("man-pages"),
-        version: String::from("1.0.0"),
-        description: String::from("Manual pages for system commands"),
-        size: 5120,
-        files: vec![
-            String::from("/usr/share/man/man1/ls.1"),
-            String::from("/usr/share/man/man1/cat.1"),
-            String::from("/usr/share/man/man1/grape.1"),
-            String::from("/usr/share/man/man1/tomato.1"),
-        ],
-        depends: Vec::new(),
-        installed: false,
-    });
-
-    pkgs.push(Package {
-        name: String::from("seed"),
-        version: String::from("1.0.0"),
-        description: String::from("Init system for AETERNA (PID 1)"),
-        size: 2048,
-        files: vec![
-            String::from("/sbin/seed"),
-            String::from("/etc/seed/init.conf"),
-        ],
-        depends: vec![String::from("plum")],
-        installed: false,
-    });
-
-    pkgs
-}
-
-// ─── Installed packages tracking (in VFS) ───────────────────────────────────
+const CACHE_PATH: &str = "/var/cache/tomato/pkg";
 
 fn ensure_dirs() {
-    crate::fs::mkdir("/var");
-    crate::fs::mkdir("/var/lib");
-    crate::fs::mkdir("/var/lib/tomato");
-    crate::fs::mkdir("/var/lib/tomato/db");
-    crate::fs::mkdir("/var/lib/tomato/local");
-    crate::fs::mkdir("/var/cache");
-    crate::fs::mkdir("/var/cache/tomato");
-    crate::fs::mkdir("/var/cache/tomato/pkg");
-    crate::fs::mkdir("/etc/tomato");
-    crate::fs::mkdir("/bin");
-    crate::fs::mkdir("/sbin");
-    crate::fs::mkdir("/lib");
-    crate::fs::mkdir("/usr");
-    crate::fs::mkdir("/usr/include");
-    crate::fs::mkdir("/usr/include/aeterna");
-    crate::fs::mkdir("/usr/share");
-    crate::fs::mkdir("/usr/share/man");
-    crate::fs::mkdir("/usr/share/man/man1");
-    crate::fs::mkdir("/usr/share/tutor");
-}
-
-/// Check if a package is installed by looking in /var/lib/tomato/local/<name>
-fn is_installed(name: &str) -> bool {
-    let mut path = String::from(LOCAL_PATH);
-    path.push('/');
-    path.push_str(name);
-    crate::fs::exists(&path)
-}
-
-/// Mark a package as installed: create /var/lib/tomato/local/<name> with version info
-fn mark_installed(pkg: &Package) {
-    let mut path = String::from(LOCAL_PATH);
-    path.push('/');
-    path.push_str(&pkg.name);
-
-    let mut meta = String::from("name=");
-    meta.push_str(&pkg.name);
-    meta.push_str("\nversion=");
-    meta.push_str(&pkg.version);
-    meta.push_str("\nsize=");
-    meta.push_str(&usize_to_string(pkg.size));
-    meta.push_str("\ndesc=");
-    meta.push_str(&pkg.description);
-    meta.push('\n');
-
-    // Files list
-    for f in &pkg.files {
-        meta.push_str("file=");
-        meta.push_str(f);
-        meta.push('\n');
-    }
-
-    crate::fs::write_file(&path, meta.as_bytes());
-
-    // Create stub files in VFS
-    for f in &pkg.files {
-        // Ensure parent dirs exist
-        if let Some(slash) = f.rfind('/') {
-            if slash > 0 {
-                crate::fs::mkdir(&f[..slash]);
-            }
-        }
-        if !crate::fs::exists(f) {
-            // Create placeholder file with a package attribution comment
-            let mut content = String::from("# Installed by tomato: ");
-            content.push_str(&pkg.name);
-            content.push_str(" ");
-            content.push_str(&pkg.version);
-            content.push('\n');
-            crate::fs::write_file(f, content.as_bytes());
-        }
+    for d in ["/var", "/var/lib", "/var/lib/tomato", LOCAL_PATH, "/var/cache", "/var/cache/tomato", CACHE_PATH] {
+        if !crate::fs::exists(d) { crate::fs::mkdir(d); }
     }
 }
 
-/// Remove installation record
-fn mark_removed(name: &str) -> Option<Vec<String>> {
-    let mut path = String::from(LOCAL_PATH);
-    path.push('/');
-    path.push_str(name);
-
-    // Read the file list before removing
-    let mut files = Vec::new();
-    if let Some(data) = crate::fs::read_file(&path) {
-        if let Ok(text) = core::str::from_utf8(&data) {
-            for line in text.lines() {
-                if let Some(stripped) = line.strip_prefix("file=") {
-                    files.push(String::from(stripped));
-                }
-            }
-        }
-    }
-
-    crate::fs::remove(&path);
-    Some(files)
+fn usage() {
+    io::out_c("tomato", io::FG_OK);
+    io::out(" - package manager for ospab.os (local .tmt packages)\n\n");
+    io::out("  tomato -U <file.tmt>...     install package files\n");
+    io::out("  tomato -S <name>...         install from the local cache (/var/cache/tomato/pkg)\n");
+    io::out("  tomato -R <name>...         remove packages (only the files they installed)\n");
+    io::out("  tomato -Q                   list installed packages\n");
+    io::out("  tomato -Qi <name>           package info      -Ql <name>  list its files\n");
+    io::out("  tomato -Ss [text]           search the local cache\n");
+    io::out("  tomato -Sy | -Syu           (not available: there is no package repository yet)\n");
+    io::out("  tomato --tmt pack <name> <version> <out.tmt> [-d desc] <file>...  build a package\n");
+    io::out("  tomato --tmt list|verify|install <file.tmt>\n");
 }
 
-// ─── Public entry point ─────────────────────────────────────────────────────
+fn record_path(name: &str) -> String {
+    alloc::format!("{}/{}", LOCAL_PATH, name)
+}
 
-/// Execute tomato with the given command-line arguments.
-/// Called from the terminal as: tomato <args>
+fn valid_pkg_name(n: &str) -> bool {
+    !n.is_empty() && !n.starts_with('.')
+        && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn read_record(name: &str) -> Option<String> {
+    if !valid_pkg_name(name) { return None; }
+    crate::fs::read_file(&record_path(name)).map(|d| String::from_utf8_lossy(&d).into_owned())
+}
+
+fn record_field<'a>(rec: &'a str, key: &str) -> Option<&'a str> {
+    rec.lines().find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+}
+
+/// Execute tomato with the given arguments.
 pub fn run(args: &str) {
-    ensure_dirs();
-
     let args = args.trim();
-
-    if args.is_empty() || args == "--help" || args == "-h" {
-        show_help();
+    if let Some(rest) = args.strip_prefix("--tmt") {
+        tmt_dispatch(rest.trim());
         return;
     }
-
-    // Parse operation
-    if args.starts_with("-Syu") {
-        cmd_upgrade();
-    } else if args.starts_with("-Sy") {
-        cmd_sync();
-    } else if args.starts_with("-Ss ") {
-        cmd_search(&args[4..].trim());
-    } else if args.starts_with("-S ") {
-        cmd_install(&args[3..].trim());
-    } else if args.starts_with("-Qi ") {
-        cmd_info(&args[4..].trim());
-    } else if args.starts_with("-Q") {
-        cmd_list();
-    } else if args.starts_with("-R ") {
-        cmd_remove(&args[3..].trim());
-    } else {
-        err("error: ");
-        puts("invalid operation '");
-        puts(args);
-        puts("'\n");
-        dim("Try 'tomato --help' for usage.\n");
-    }
-}
-
-// ─── Commands ───────────────────────────────────────────────────────────────
-
-fn show_help() {
-    puts("\n");
-    framebuffer::draw_string("tomato", FG_NAME, BG);
-    puts(" — package manager for ospab.os\n\n");
-
-    framebuffer::draw_string("  Usage:\n", FG_WARN, BG);
-    puts("    tomato <operation> [options] [targets]\n\n");
-
-    framebuffer::draw_string("  Operations:\n", FG_WARN, BG);
-    puts("    -S <pkg>     Install a package\n");
-    puts("    -R <pkg>     Remove a package\n");
-    puts("    -Q           List all installed packages\n");
-    puts("    -Qi <pkg>    Show info about installed package\n");
-    puts("    -Ss <query>  Search for packages\n");
-    puts("    -Sy          Synchronize package database\n");
-    puts("    -Syu         Full system upgrade\n");
-    puts("    --help       Show this help\n\n");
-
-    framebuffer::draw_string("  Examples:\n", FG_WARN, BG);
-    dim("    tomato -S grape        Install grape text editor\n");
-    dim("    tomato -S base         Install base system packages\n");
-    dim("    tomato -R man-pages    Remove man-pages package\n");
-    dim("    tomato -Ss net         Search for network packages\n");
-    dim("    tomato -Q              List all installed packages\n\n");
-}
-
-fn cmd_sync() {
-    warn("  [SIMULATION MODE] Package operations run against a built-in local database.\n");
-    warn("  No network access; no real binaries are installed.\n\n");
-    puts(":: Synchronizing package databases...\n");
-    // Simulate sync — write DB index to VFS
-    let pkgs = builtin_packages();
-    let mut index = String::new();
-    for pkg in &pkgs {
-        index.push_str(&pkg.name);
-        index.push(' ');
-        index.push_str(&pkg.version);
-        index.push('\n');
-    }
-    crate::fs::write_file("/var/lib/tomato/db/core.db", index.as_bytes());
-
-    puts(" core                    ");
-    ok("done\n");
-    puts(":: Package database synchronized (");
-    puts(&usize_to_string(pkgs.len()));
-    puts(" packages available)\n");
-}
-
-fn cmd_upgrade() {
-    warn("  [SIMULATION MODE] Package operations run against a built-in local database.\n");
-    warn("  No network access; no real binaries are installed.\n\n");
-    cmd_sync();
-    puts(":: Starting full system upgrade...\n");
-
-    let pkgs = builtin_packages();
-    let mut upgraded = 0usize;
-
-    for pkg in &pkgs {
-        if is_installed(&pkg.name) {
-            // Check for version mismatch (simulated)
-            let mut path = String::from(LOCAL_PATH);
-            path.push('/');
-            path.push_str(&pkg.name);
-            if let Some(data) = crate::fs::read_file(&path) {
-                if let Ok(text) = core::str::from_utf8(&data) {
-                    let current_ver = text.lines()
-                        .find(|l| l.starts_with("version="))
-                        .map(|l| &l[8..])
-                        .unwrap_or("0");
-                    if current_ver != pkg.version.as_str() {
-                        puts(" upgrading ");
-                        framebuffer::draw_string(&pkg.name, FG_NAME, BG);
-                        puts(" ");
-                        dim(current_ver);
-                        puts(" -> ");
-                        framebuffer::draw_string(&pkg.version, FG_VER, BG);
-                        puts("\n");
-                        mark_installed(&pkg);
-                        upgraded += 1;
+    let mut parts = args.split_whitespace();
+    let op = parts.next().unwrap_or("");
+    let targets: Vec<&str> = parts.collect();
+    match op {
+        "" | "-h" | "--help" | "help" => usage(),
+        "-Sy" | "-Syu" | "-Su" | "-Syy" => {
+            io::err("tomato: no package repository is configured: ospab.os has no package server yet.\n");
+            io::err("        Nothing was synchronized or upgraded. Install local packages with: tomato -U <file.tmt>\n");
+        }
+        "-S" => {
+            if targets.is_empty() { io::err("tomato: no targets specified\n"); return; }
+            for t in targets { install_by_name(t); }
+        }
+        "-U" => {
+            if targets.is_empty() { io::err("tomato: no package files specified\n"); return; }
+            for t in targets {
+                let p = crate::userspace::plum::resolve_path(t);
+                tmt_install(&p);
+            }
+        }
+        "-R" | "-Rs" | "-Rns" => {
+            if targets.is_empty() { io::err("tomato: no targets specified\n"); return; }
+            for t in targets { remove(t); }
+        }
+        "-Q" => {
+            if targets.is_empty() {
+                list_installed();
+            } else {
+                for t in targets {
+                    match read_record(t) {
+                        Some(r) => io::out(&alloc::format!("{} {}\n", t, record_field(&r, "version").unwrap_or("?"))),
+                        None => { io::err("tomato: package '"); io::err(t); io::err("' was not found\n"); }
                     }
                 }
             }
         }
-    }
-
-    if upgraded == 0 {
-        puts(" there is nothing to do\n");
-    } else {
-        ok(":: ");
-        puts(&usize_to_string(upgraded));
-        puts(" packages upgraded\n");
+        "-Qi" | "-Ql" => {
+            if targets.is_empty() { io::err("tomato: no targets specified\n"); return; }
+            for t in targets { info(t, op == "-Ql"); }
+        }
+        "-Ss" => search(&targets.join(" ")),
+        _ => {
+            io::err("tomato: invalid operation '");
+            io::err(op);
+            io::err("' (try: tomato --help)\n");
+        }
     }
 }
 
-fn cmd_search(query: &str) {
-    warn("  [SIMULATION MODE] Searching built-in package database (no network).\n\n");
-    let pkgs = builtin_packages();
-    let query_lower = query.as_bytes();
-    let mut found = 0usize;
-
-    for pkg in &pkgs {
-        // Search in name and description (case-insensitive)
-        let name_match = contains_ci(pkg.name.as_bytes(), query_lower);
-        let desc_match = contains_ci(pkg.description.as_bytes(), query_lower);
-
-        if name_match || desc_match {
-            // Show: repo/name version [installed]
-            dim("core/");
-            framebuffer::draw_string(&pkg.name, FG_NAME, BG);
-            puts(" ");
-            framebuffer::draw_string(&pkg.version, FG_VER, BG);
-            if is_installed(&pkg.name) {
-                puts(" ");
-                ok("[installed]");
+/// Packages in the local cache: (path, header, description)
+fn cache_packages() -> Vec<(String, TmtHeader, String)> {
+    let mut v = Vec::new();
+    if let Some(entries) = crate::fs::readdir(CACHE_PATH) {
+        for e in entries {
+            if !e.name.ends_with(".tmt") { continue; }
+            let p = alloc::format!("{}/{}", CACHE_PATH, e.name);
+            if let Some(data) = crate::fs::read_file(&p) {
+                if let Some(h) = tmt_parse_header(&data) {
+                    let start = TMT_HEADER_SIZE.min(data.len());
+                    let end = (TMT_HEADER_SIZE + h.meta_len as usize).min(data.len());
+                    let meta = String::from_utf8_lossy(&data[start..end]).into_owned();
+                    let desc = String::from(record_field(&meta, "description").unwrap_or(""));
+                    v.push((p, h, desc));
+                }
             }
-            puts("\n");
-            puts("    ");
-            dim(&pkg.description);
-            puts("\n");
-            found += 1;
         }
     }
+    v
+}
 
+fn install_by_name(name: &str) {
+    ensure_dirs();
+    match cache_packages().into_iter().find(|(_, h, _)| h.name == name) {
+        Some((path, _, _)) => { tmt_install(&path); }
+        None => {
+            io::err("tomato: target not found: ");
+            io::err(name);
+            io::err("\n        (there is no remote repository yet; tomato only knows packages in ");
+            io::err(CACHE_PATH);
+            io::err(".\n         Use 'tomato -U <file.tmt>' for a package file elsewhere.)\n");
+        }
+    }
+}
+
+fn search(q: &str) {
+    let q = q.to_ascii_lowercase();
+    let mut found = 0;
+    for (path, h, desc) in cache_packages() {
+        if !q.is_empty() && !h.name.to_ascii_lowercase().contains(&q) && !desc.to_ascii_lowercase().contains(&q) {
+            continue;
+        }
+        found += 1;
+        io::out_c(&h.name, io::FG_OK);
+        io::out(" ");
+        io::out_c(&h.pkg_version, io::FG_WARN);
+        if read_record(&h.name).is_some() { io::out_c(" [installed]", io::FG_DIM); }
+        io::out("\n    ");
+        io::out(if desc.is_empty() { "(no description)" } else { &desc });
+        io::out_c(&alloc::format!("  ({})\n", path), io::FG_DIM);
+    }
     if found == 0 {
-        err("error: ");
-        puts("no packages found matching '");
-        puts(query);
-        puts("'\n");
+        io::err("tomato: no matching packages in the local cache ");
+        io::err(CACHE_PATH);
+        io::err(" (there is no remote repository yet)\n");
     }
 }
 
-fn cmd_install(name: &str) {
-    if name.is_empty() {
-        err("error: ");
-        puts("no targets specified\n");
-        return;
-    }
-
-    warn("  [SIMULATION MODE] Files will be created in VFS only — no real binary is executed.\n\n");
-    let pkgs = builtin_packages();
-
-    // Find the package
-    let pkg = match pkgs.iter().find(|p| p.name.as_str() == name) {
-        Some(p) => p.clone(),
-        None => {
-            err("error: ");
-            puts("target not found: ");
-            puts(name);
-            puts("\n");
-            return;
+fn list_installed() {
+    let mut n = 0;
+    if let Some(mut entries) = crate::fs::readdir(LOCAL_PATH) {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for e in entries {
+            let rec = read_record(&e.name).unwrap_or_default();
+            io::out_c(&e.name, io::FG_OK);
+            io::out(" ");
+            io::out(record_field(&rec, "version").unwrap_or("?"));
+            io::out("\n");
+            n += 1;
         }
+    }
+    if n == 0 {
+        io::out_c("No packages installed.\n", io::FG_DIM);
+    }
+}
+
+fn info(name: &str, files_only: bool) {
+    let rec = match read_record(name) {
+        Some(r) => r,
+        None => { io::err("tomato: package '"); io::err(name); io::err("' was not found\n"); return; }
     };
-
-    // Check if already installed
-    if is_installed(name) {
-        warn("warning: ");
-        puts(&pkg.name);
-        puts(" is already installed -- reinstalling\n");
-    }
-
-    // Resolve dependencies
-    let mut to_install: Vec<Package> = Vec::new();
-    resolve_deps(&pkg, &pkgs, &mut to_install);
-
-    // Show what will be installed
-    puts(":: resolving dependencies...\n");
-    puts(":: looking for conflicting packages...\n\n");
-
-    let _new_count = to_install.iter().filter(|p| !is_installed(&p.name)).count();
-    let total_size: usize = to_install.iter().map(|p| p.size).sum();
-
-    puts("Packages (");
-    puts(&usize_to_string(to_install.len()));
-    puts(") ");
-    for p in &to_install {
-        framebuffer::draw_string(&p.name, FG_NAME, BG);
-        puts("-");
-        framebuffer::draw_string(&p.version, FG_VER, BG);
-        puts("  ");
-    }
-    puts("\n\n");
-
-    puts("Total Installed Size:  ");
-    puts(&format_size(total_size));
-    puts("\n\n");
-
-    // Install each package
-    for install_pkg in &to_install {
-        puts("(");
-        let idx = to_install.iter().position(|p| p.name == install_pkg.name).unwrap_or(0) + 1;
-        puts(&usize_to_string(idx));
-        puts("/");
-        puts(&usize_to_string(to_install.len()));
-        puts(") installing ");
-        framebuffer::draw_string(&install_pkg.name, FG_NAME, BG);
-        puts("-");
-        framebuffer::draw_string(&install_pkg.version, FG_VER, BG);
-        puts("...\n");
-
-        // Create files in VFS
-        mark_installed(install_pkg);
-
-        // Simulate extraction progress
-        puts("  -> extracting ");
-        puts(&usize_to_string(install_pkg.files.len()));
-        puts(" files (");
-        puts(&format_size(install_pkg.size));
-        puts(")");
-        ok(" done\n");
-    }
-
-    puts("\n");
-    ok(":: ");
-    puts("Transaction completed successfully.\n");
-    puts("   ");
-    puts(&usize_to_string(to_install.len()));
-    puts(" package(s) installed.\n");
-}
-
-fn cmd_remove(name: &str) {
-    if name.is_empty() {
-        err("error: ");
-        puts("no targets specified\n");
+    if files_only {
+        for l in rec.lines() {
+            if let Some(f) = l.strip_prefix("file=") { io::out(name); io::out(" "); io::out(f); io::out("\n"); }
+        }
         return;
     }
-
-    if !is_installed(name) {
-        err("error: ");
-        puts("target not found: ");
-        puts(name);
-        puts("\n");
-        return;
-    }
-
-    puts(":: Removing ");
-    framebuffer::draw_string(name, FG_NAME, BG);
-    puts("...\n");
-
-    if let Some(files) = mark_removed(name) {
-        for f in &files {
-            crate::fs::remove(f);
-        }
-        puts("  -> removed ");
-        puts(&usize_to_string(files.len()));
-        puts(" files\n");
-    }
-
-    ok(":: ");
-    puts("Package ");
-    puts(name);
-    puts(" removed.\n");
+    let files = rec.lines().filter(|l| l.starts_with("file=")).count();
+    io::out(&alloc::format!("Name           : {}\n", name));
+    io::out(&alloc::format!("Version        : {}\n", record_field(&rec, "version").unwrap_or("?")));
+    io::out(&alloc::format!("Description    : {}\n", record_field(&rec, "description").unwrap_or("")));
+    io::out(&alloc::format!("Installed from : {}\n", record_field(&rec, "installed_from").unwrap_or("?")));
+    io::out(&alloc::format!("Files          : {}\n", files));
 }
 
-fn cmd_list() {
-    let pkgs = builtin_packages();
-    let mut count = 0usize;
-
-    for pkg in &pkgs {
-        if is_installed(&pkg.name) {
-            framebuffer::draw_string(&pkg.name, FG_NAME, BG);
-            puts(" ");
-            framebuffer::draw_string(&pkg.version, FG_VER, BG);
-            puts("\n");
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        dim("No packages installed.\n");
-        dim("Install packages with: tomato -S <name>\n");
-    } else {
-        puts("\n");
-        dim(&usize_to_string(count));
-        dim(" package(s) installed\n");
-    }
-}
-
-fn cmd_info(name: &str) {
-    let pkgs = builtin_packages();
-
-    let pkg = match pkgs.iter().find(|p| p.name.as_str() == name) {
-        Some(p) => p,
-        None => {
-            err("error: ");
-            puts("package not found: ");
-            puts(name);
-            puts("\n");
-            return;
-        }
+fn remove(name: &str) {
+    let rec = match read_record(name) {
+        Some(r) => r,
+        None => { io::err("tomato: target not found: "); io::err(name); io::err("\n"); return; }
     };
-
-    let installed = is_installed(name);
-
-    puts("\n");
-    info_field("Name",         &pkg.name);
-    info_field("Version",      &pkg.version);
-    info_field("Description",  &pkg.description);
-    info_field("Install Size", &format_size(pkg.size));
-    info_field("Status",       if installed { "Installed" } else { "Not Installed" });
-
-    if !pkg.depends.is_empty() {
-        let mut dep_str = String::new();
-        for (i, d) in pkg.depends.iter().enumerate() {
-            if i > 0 { dep_str.push_str("  "); }
-            dep_str.push_str(d);
-        }
-        info_field("Depends On", &dep_str);
-    } else {
-        info_field("Depends On", "None");
-    }
-
-    if !pkg.files.is_empty() {
-        framebuffer::draw_string("Files          : ", FG_WARN, BG);
-        puts("\n");
-        for f in &pkg.files {
-            puts("                 ");
-            puts(f);
-            puts("\n");
-        }
-    }
-    puts("\n");
-}
-
-fn info_field(label: &str, value: &str) {
-    framebuffer::draw_string(label, FG_WARN, BG);
-    // Pad to 16 chars
-    let pad = if label.len() < 15 { 15 - label.len() } else { 0 };
-    for _ in 0..pad { puts(" "); }
-    puts(": ");
-    puts(value);
-    puts("\n");
-}
-
-// ─── Dependency resolution ──────────────────────────────────────────────────
-
-fn resolve_deps(pkg: &Package, all: &[Package], result: &mut Vec<Package>) {
-    // Check if already in result list
-    if result.iter().any(|p| p.name == pkg.name) {
-        return;
-    }
-
-    // Resolve dependencies first
-    for dep_name in &pkg.depends {
-        if let Some(dep_pkg) = all.iter().find(|p| p.name.as_str() == dep_name.as_str()) {
-            resolve_deps(dep_pkg, all, result);
-        }
-    }
-
-    result.push(pkg.clone());
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/// Case-insensitive substring search
-fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() { return true; }
-    if needle.len() > haystack.len() { return false; }
-    for i in 0..=(haystack.len() - needle.len()) {
-        let mut matched = true;
-        for j in 0..needle.len() {
-            if to_lower(haystack[i + j]) != to_lower(needle[j]) {
-                matched = false;
-                break;
+    let mut removed = 0;
+    let mut missing = 0;
+    for l in rec.lines() {
+        if let Some(f) = l.strip_prefix("file=") {
+            if crate::fs::exists(f) {
+                if crate::fs::remove(f) {
+                    removed += 1;
+                } else {
+                    io::err("tomato: could not remove ");
+                    io::err(f);
+                    io::err("\n");
+                }
+            } else {
+                missing += 1;
             }
         }
-        if matched { return true; }
     }
-    false
-}
-
-fn to_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
-}
-
-fn usize_to_string(mut n: usize) -> String {
-    if n == 0 { return String::from("0"); }
-    let mut buf = [0u8; 20];
-    let mut pos = 20;
-    while n > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    String::from(core::str::from_utf8(&buf[pos..]).unwrap_or("0"))
-}
-
-fn format_size(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 {
-        let mib = bytes / (1024 * 1024);
-        let frac = (bytes % (1024 * 1024)) / (1024 * 100);
-        let mut s = usize_to_string(mib);
-        s.push('.');
-        s.push_str(&usize_to_string(frac));
-        s.push_str(" MiB");
-        s
-    } else if bytes >= 1024 {
-        let kib = bytes / 1024;
-        let mut s = usize_to_string(kib);
-        s.push_str(" KiB");
-        s
-    } else {
-        let mut s = usize_to_string(bytes);
-        s.push_str(" B");
-        s
-    }
+    crate::fs::remove(&record_path(name));
+    io::out(&alloc::format!("removed {}: {} file(s) deleted", name, removed));
+    if missing > 0 { io::out(&alloc::format!(", {} were already missing", missing)); }
+    io::out("\n");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  .tmt — AETERNA Binary Package Format
-//  
-//  Tomato Managed Tarball (.tmt) is a self-describing binary package:
+//  .tmt — AETERNA binary package format
 //
 //  Offset  Size  Field
-//  ──────────────────────────────────────────────────────────────────
 //       0     8  Magic: [b'T',b'M',b'T',0x01, 0x00,0x00,0x00,0x00]
 //       8     4  Format version (LE u32 = 1)
 //      12     4  Flags (LE u32; bit 0 = compressed, bit 1 = signed)
 //      16     4  Architecture (LE u32; 0=any, 1=x86_64, 2=aarch64)
 //      20    64  Package name (UTF-8, null-padded, max 63 chars)
 //      84    32  Package version (UTF-8, null-padded, max 31 chars)
-//     116     4  meta_len  — length of metadata section (LE u32)
+//     116     4  meta_len    — length of metadata section (LE u32)
 //     120     4  payload_len — length of payload section (LE u32)
-//     124    32  SHA-256 over bytes [0..124] ++ metadata ++ payload
-//     156    meta_len  metadata: UTF-8 key=value lines (desc, depends…)
-//    156+meta_len  payload: concatenated file entries:
-//         [u32 path_len LE][path bytes][u32 data_len LE][data bytes]
-//
-//  SHA-256 is computed over the entire blob with bytes 124..156 zeroed,
-//  then the digest is stored at offset 124. To verify, zero bytes 124..156,
-//  hash the full blob, compare with stored digest.
+//     124    32  SHA-256 over the blob with bytes 124..156 zeroed
+//     156    meta_len  metadata: UTF-8 key=value lines (description, ...)
+//    156+meta_len  payload: [u32 path_len][path][u32 data_len][data] ...
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Magic bytes for .tmt format
@@ -1015,117 +429,6 @@ pub fn tmt_parse_header(data: &[u8]) -> Option<TmtHeader> {
     Some(TmtHeader { version, flags, arch, name, pkg_version, meta_len, payload_len, checksum })
 }
 
-// ─── Install: extract a .tmt from VFS path ───────────────────────────────
-
-/// Read a `.tmt` file from the VFS, verify its SHA-256, and extract all
-/// embedded files into the VFS. Returns `true` on success.
-pub fn tmt_install(vfs_path: &str) -> bool {
-    puts("tomato: installing from .tmt: ");
-    puts(vfs_path);
-    puts("\n");
-
-    // Read blob from VFS
-    let data = match crate::fs::read_file(vfs_path) {
-        Some(d) => d,
-        None => {
-            err("error: file not found: ");
-            err(vfs_path);
-            puts("\n");
-            return false;
-        }
-    };
-
-    // Verify checksum
-    if !tmt_verify(&data) {
-        err("error: SHA-256 checksum mismatch — package may be corrupted\n");
-        return false;
-    }
-
-    let hdr = match tmt_parse_header(&data) {
-        Some(h) => h,
-        None    => { err("error: invalid .tmt header\n"); return false; }
-    };
-
-    puts("  Name:    "); puts(&hdr.name);    puts("\n");
-    puts("  Version: "); puts(&hdr.pkg_version); puts("\n");
-    let arch_s = match hdr.arch {
-        TMT_ARCH_X64  => "x86_64",
-        TMT_ARCH_AA64 => "aarch64",
-        _             => "any",
-    };
-    puts("  Arch:    "); puts(arch_s); puts("\n");
-
-    // Parse metadata section (key=value pairs)
-    let meta_start = TMT_HEADER_SIZE;
-    let meta_end   = meta_start + hdr.meta_len as usize;
-    if meta_end > data.len() {
-        err("error: metadata section truncated\n");
-        return false;
-    }
-
-    // Parse payload section
-    let payload_start = meta_end;
-    let payload_end   = payload_start + hdr.payload_len as usize;
-    if payload_end > data.len() {
-        err("error: payload section truncated\n");
-        return false;
-    }
-
-    // Extract files from payload
-    let payload = &data[payload_start..payload_end];
-    let mut cursor = 0usize;
-    let mut file_count = 0usize;
-
-    ensure_dirs();
-
-    while cursor + 8 <= payload.len() {
-        let path_len = u32::from_le_bytes(
-            payload[cursor..cursor+4].try_into().unwrap_or([0u8;4])
-        ) as usize;
-        cursor += 4;
-
-        if cursor + path_len > payload.len() { break; }
-        let path = match core::str::from_utf8(&payload[cursor..cursor+path_len]) {
-            Ok(p) => p,
-            Err(_) => { cursor += path_len; continue; }
-        };
-        cursor += path_len;
-
-        if cursor + 4 > payload.len() { break; }
-        let data_len = u32::from_le_bytes(
-            payload[cursor..cursor+4].try_into().unwrap_or([0u8;4])
-        ) as usize;
-        cursor += 4;
-
-        if cursor + data_len > payload.len() { break; }
-        let file_data = &payload[cursor..cursor+data_len];
-        cursor += data_len;
-
-        // Ensure parent directory exists
-        if let Some(slash) = path.rfind('/') {
-            if slash > 0 { crate::fs::mkdir(&path[..slash]); }
-        }
-
-        // Write file into VFS
-        crate::fs::write_file(path, file_data);
-        dim("  -> extracted "); dim(path); dim("\n");
-        file_count += 1;
-    }
-
-    // Record installation in tomato DB
-    let mut inst_path = String::from(LOCAL_PATH);
-    inst_path.push('/');
-    inst_path.push_str(&hdr.name);
-    let record = alloc::format!("name={}\nversion={}\ninstalled_from={}\n",
-        hdr.name, hdr.pkg_version, vfs_path);
-    crate::fs::write_file(&inst_path, record.as_bytes());
-
-    ok("  Installation complete: ");
-    puts(&usize_to_string(file_count));
-    puts(" files extracted.\n");
-    true
-}
-
 // ─── List contents: peek inside a .tmt without extracting ────────────────
 
 /// List all files embedded in a `.tmt` blob without extracting them.
@@ -1255,107 +558,183 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
     digest
 }
 
+// ─── Install: extract a .tmt from a VFS path ─────────────────────────────
+
+fn safe_path(p: &str) -> Option<String> {
+    let p = if p.starts_with('/') { String::from(p) } else { alloc::format!("/{}", p) };
+    if p.split('/').any(|c| c == "..") || p == "/" || p.starts_with("/proc") {
+        return None;
+    }
+    Some(p)
+}
+
+fn le_u32(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+}
+
+/// Read a `.tmt` file, verify its SHA-256 and extract the embedded files.
+pub fn tmt_install(vfs_path: &str) -> bool {
+    ensure_dirs();
+    let data = match crate::fs::read_file(vfs_path) {
+        Some(d) => d,
+        None => { io::err("tomato: "); io::err(vfs_path); io::err(": No such file\n"); return false; }
+    };
+    let hdr = match tmt_parse_header(&data) {
+        Some(h) => h,
+        None => { io::err("tomato: "); io::err(vfs_path); io::err(": not a .tmt package\n"); return false; }
+    };
+    if !tmt_verify(&data) {
+        io::err("tomato: SHA-256 checksum mismatch - package is corrupted; nothing installed\n");
+        return false;
+    }
+    if !valid_pkg_name(&hdr.name) {
+        io::err("tomato: invalid package name in header\n");
+        return false;
+    }
+    let meta_end = TMT_HEADER_SIZE + hdr.meta_len as usize;
+    let payload_end = meta_end + hdr.payload_len as usize;
+    if payload_end > data.len() {
+        io::err("tomato: package truncated\n");
+        return false;
+    }
+    let meta = String::from_utf8_lossy(&data[TMT_HEADER_SIZE..meta_end]).into_owned();
+    let payload = &data[meta_end..payload_end];
+
+    // Parse every entry first; refuse the whole package on any bad entry.
+    let mut entries: Vec<(String, &[u8])> = Vec::new();
+    let mut c = 0usize;
+    while c < payload.len() {
+        if c + 4 > payload.len() { io::err("tomato: corrupt payload\n"); return false; }
+        let pl = le_u32(payload, c);
+        c += 4;
+        if c + pl + 4 > payload.len() { io::err("tomato: corrupt payload\n"); return false; }
+        let path = match core::str::from_utf8(&payload[c..c + pl]).ok().and_then(safe_path) {
+            Some(p) => p,
+            None => { io::err("tomato: package contains an unsafe path; nothing installed\n"); return false; }
+        };
+        c += pl;
+        let dl = le_u32(payload, c);
+        c += 4;
+        if c + dl > payload.len() { io::err("tomato: corrupt payload\n"); return false; }
+        entries.push((path, &payload[c..c + dl]));
+        c += dl;
+    }
+
+    // Conflicts: existing files not owned by an installed version of this package.
+    let old = read_record(&hdr.name);
+    for (p, _) in &entries {
+        let owned = old.as_ref()
+            .map(|r| r.lines().any(|l| l.strip_prefix("file=") == Some(p.as_str())))
+            .unwrap_or(false);
+        if crate::fs::exists(p) && !owned {
+            io::err("tomato: ");
+            io::err(p);
+            io::err(" already exists and is not owned by this package; nothing installed\n");
+            return false;
+        }
+    }
+
+    let mut rec = alloc::format!("name={}\nversion={}\ninstalled_from={}\n", hdr.name, hdr.pkg_version, vfs_path);
+    if let Some(d) = record_field(&meta, "description") {
+        rec.push_str("description=");
+        rec.push_str(d);
+        rec.push('\n');
+    }
+    let mut n = 0;
+    for (p, d) in &entries {
+        if let Some(slash) = p.rfind('/') {
+            if slash > 0 && !crate::fs::exists(&p[..slash]) {
+                crate::fs::mkdir(&p[..slash]);
+            }
+        }
+        if !crate::fs::write_file(p, d) {
+            io::err("tomato: failed to write ");
+            io::err(p);
+            io::err("\n");
+            continue;
+        }
+        rec.push_str("file=");
+        rec.push_str(p);
+        rec.push('\n');
+        n += 1;
+    }
+    crate::fs::write_file(&record_path(&hdr.name), rec.as_bytes());
+    io::out(&alloc::format!("installed {} {} ({} file(s))\n", hdr.name, hdr.pkg_version, n));
+    true
+}
+
 // ─── .tmt command integration ─────────────────────────────────────────────
 
-/// Entry point for `tomato --tmt` sub-commands.
-/// Handles:
-///   `tomato --tmt install <path.tmt>`
-///   `tomato --tmt list    <path.tmt>`
-///   `tomato --tmt pack    <name> <version> <output.tmt>`
-///   `tomato --tmt verify  <path.tmt>`
+/// `tomato --tmt <install|list|verify|pack> ...`
 pub fn tmt_dispatch(args: &str) {
-    let mut toks = args.splitn(4, ' ');
-    let subcmd = toks.next().unwrap_or("").trim();
-    let arg1   = toks.next().unwrap_or("").trim();
-    let arg2   = toks.next().unwrap_or("").trim();
-    let _arg3  = toks.next().unwrap_or("").trim();
-
-    match subcmd {
-        "install" => {
-            if arg1.is_empty() {
-                err("Usage: tomato --tmt install <path.tmt>\n");
-                return;
-            }
-            tmt_install(arg1);
-        }
-        "list" => {
-            if arg1.is_empty() {
-                err("Usage: tomato --tmt list <path.tmt>\n");
-                return;
-            }
-            let data = match crate::fs::read_file(arg1) {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let arg = |i: usize| toks.get(i).copied().unwrap_or("");
+    let sub = arg(0);
+    let resolve = |p: &str| crate::userspace::plum::resolve_path(p);
+    match sub {
+        "install" if !arg(1).is_empty() => { tmt_install(&resolve(arg(1))); }
+        "list" | "verify" if !arg(1).is_empty() => {
+            let data = match crate::fs::read_file(&resolve(arg(1))) {
                 Some(d) => d,
-                None => { err("File not found\n"); return; }
+                None => { io::err("tomato: file not found\n"); return; }
             };
-            if !tmt_verify(&data) {
-                err("warning: checksum invalid (listing anyway)\n");
-            }
             let hdr = match tmt_parse_header(&data) {
                 Some(h) => h,
-                None => { err("Invalid .tmt header\n"); return; }
+                None => { io::err("tomato: not a .tmt package\n"); return; }
             };
-            puts("Package: "); puts(&hdr.name); puts(" ");
-            puts(&hdr.pkg_version); puts("\n");
-            puts("Files:\n");
+            let ok = tmt_verify(&data);
+            if sub == "verify" {
+                if ok { io::out("checksum OK\n"); } else { io::err("checksum FAILED\n"); }
+                return;
+            }
+            if !ok { io::err("warning: checksum invalid\n"); }
+            io::out(&alloc::format!("{} {}\n", hdr.name, hdr.pkg_version));
             for p in tmt_list_contents(&data) {
-                puts("  "); puts(&p); puts("\n");
+                io::out("  ");
+                io::out(&p);
+                io::out("\n");
             }
         }
-        "verify" => {
-            if arg1.is_empty() {
-                err("Usage: tomato --tmt verify <path.tmt>\n");
-                return;
+        "pack" if toks.len() >= 4 => {
+            let (name, ver, out) = (arg(1), arg(2), resolve(arg(3)));
+            if !valid_pkg_name(name) { io::err("tomato: invalid package name\n"); return; }
+            let mut contents: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut desc = String::new();
+            let mut i = 4;
+            while i < toks.len() {
+                if toks[i] == "-d" {
+                    desc = String::from(arg(i + 1));
+                    i += 2;
+                    continue;
+                }
+                let p = resolve(toks[i]);
+                match crate::fs::read_file(&p) {
+                    Some(d) => contents.push((p, d)),
+                    None => {
+                        io::err("tomato: cannot read ");
+                        io::err(toks[i]);
+                        io::err(" (only regular files can be packed)\n");
+                        return;
+                    }
+                }
+                i += 1;
             }
-            let data = match crate::fs::read_file(arg1) {
-                Some(d) => d,
-                None => { err("File not found\n"); return; }
-            };
-            if tmt_verify(&data) {
-                ok("Checksum OK\n");
+            if contents.is_empty() { io::err("tomato: no files given to pack\n"); return; }
+            let files: Vec<(&str, &[u8])> = contents.iter().map(|(p, d)| (p.as_str(), d.as_slice())).collect();
+            let meta = [("description", desc.as_str())];
+            let blob = tmt_pack(name, ver, TMT_ARCH_ANY, &meta, &files);
+            if crate::fs::write_file(&out, &blob) {
+                io::out(&alloc::format!("packed {} {} ({} file(s), {} bytes) -> {}\n", name, ver, files.len(), blob.len(), out));
             } else {
-                err("Checksum FAILED\n");
-            }
-        }
-        "pack" => {
-            // `tomato --tmt pack <name> <version> [output_path]`
-            if arg1.is_empty() {
-                err("Usage: tomato --tmt pack <name> <version> [out.tmt]\n");
-                return;
-            }
-            let pkg_name = arg1;
-            let pkg_ver  = if arg2.is_empty() { "1.0.0" } else { arg2 };
-            let output   = _arg3;
-            let output   = if output.is_empty() {
-                let mut s = String::from("/var/cache/tomato/pkg/");
-                s.push_str(pkg_name);
-                s.push('-');
-                s.push_str(pkg_ver);
-                s.push_str(".tmt");
-                s
-            } else {
-                String::from(output)
-            };
-
-            warn("  [SIMULATION MODE] No source files specified; output contains 0 embedded files.\n");
-            warn("  To bundle real files use the tmt_pack() API directly with a files slice.\n\n");
-
-            // Pack a stub package (header + metadata, no embedded files)
-            let meta = [("description", "AETERNA binary package")];
-            let files: &[(&str, &[u8])] = &[];
-            let blob = tmt_pack(pkg_name, pkg_ver, TMT_ARCH_X64, &meta, files);
-            if crate::fs::write_file(&output, &blob) {
-                ok("Packed: "); puts(&output); puts("\n");
-                puts("Size: "); puts(&usize_to_string(blob.len())); puts(" bytes\n");
-            } else {
-                err("Pack failed (VFS write error)\n");
+                io::err("tomato: cannot write ");
+                io::err(&out);
+                io::err("\n");
             }
         }
         _ => {
-            puts("Usage: tomato --tmt <subcmd> ...\n");
-            dim("  install <path.tmt>              Install from binary package\n");
-            dim("  list    <path.tmt>              List files in package\n");
-            dim("  verify  <path.tmt>              Verify SHA-256 checksum\n");
-            dim("  pack    <name> <ver> [out.tmt]  Create a new .tmt package\n");
+            io::out("Usage: tomato --tmt install <file.tmt>\n");
+            io::out("       tomato --tmt list|verify <file.tmt>\n");
+            io::out("       tomato --tmt pack <name> <version> <out.tmt> [-d description] <file>...\n");
         }
     }
 }

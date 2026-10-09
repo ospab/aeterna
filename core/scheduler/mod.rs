@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Preemptive Task Scheduler for AETERNA microkernel.
 */
@@ -48,6 +48,30 @@ pub type TaskId = u32;
 const MAX_TASKS: usize = 64;
 const FRAME_WORDS: usize = 21; // r15..rax, err, rip, cs, rflags, rsp, ss
 
+/// Kernel stack given to every ring-3 task (syscalls and interrupts from ring 3 run on it).
+const KSTACK_FRAMES: u64 = 4; // 16 KiB
+
+/// FXSAVE image (x87 + SSE state), saved per task on every context switch.
+#[derive(Clone)]
+#[repr(C, align(16))]
+pub struct FxArea([u8; 512]);
+
+impl core::fmt::Debug for FxArea {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FxArea")
+    }
+}
+
+impl FxArea {
+    /// State after FNINIT with default MXCSR: all exceptions masked, round-to-nearest.
+    fn initial() -> alloc::boxed::Box<FxArea> {
+        let mut a = FxArea([0; 512]);
+        a.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+        a.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+        alloc::boxed::Box::new(a)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskControlBlock {
     pub pid: TaskId,
@@ -65,6 +89,14 @@ pub struct TaskControlBlock {
     pub capabilities: alloc::vec::Vec<Capability>,
     pub preemption_disabled: bool,
     pub med_id: Option<u64>,
+    /// Saved x87/SSE state.
+    pub fx: alloc::boxed::Box<FxArea>,
+    /// Physical base of this task's kernel stack (0 = none: a kernel thread on the stack it was given).
+    pub kstack_phys: u64,
+    /// Top of the kernel stack (HHDM address), loaded into TSS.RSP0 and the syscall stack on switch-in.
+    pub kstack_top: u64,
+    /// Next free virtual address for mmap in this task's address space (0 = not started).
+    pub mmap_next: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +162,10 @@ pub fn init() {
             capabilities: alloc::vec![Capability::Serial, Capability::System],
             preemption_disabled: false,
             med_id: None,
+            fx: FxArea::initial(),
+            kstack_phys: 0,
+            kstack_top: 0,
+            mmap_next: 0,
         });
         CURRENT_SLOT = 0;
         NEXT_PID = 1;
@@ -183,14 +219,9 @@ pub fn spawn_named(
                 frame[18] = 0x202;                         // RFLAGS (IF=1)
                 frame[19] = stack_pointer;                 // RSP
 
-                // Select Ring 0 or Ring 3 segments based on priority
-                if priority == Priority::Normal {
-                    frame[17] = gdt_simple::USER_CS as u64;  // CS
-                    frame[20] = gdt_simple::USER_DS as u64;  // SS
-                } else {
-                    frame[17] = gdt_simple::KERNEL_CS as u64; // CS
-                    frame[20] = gdt_simple::KERNEL_DS as u64; // SS
-                }
+                // Always a kernel thread: ring-3 tasks are created only by spawn_user_task.
+                frame[17] = gdt_simple::KERNEL_CS as u64; // CS
+                frame[20] = gdt_simple::KERNEL_DS as u64; // SS
 
                 // Capability manifest enforcement (least-privilege intersection).
                 // Base: every task gets Serial for debug output.
@@ -243,6 +274,10 @@ pub fn spawn_named(
                     capabilities: caps,
                     preemption_disabled: false,
                     med_id: None,
+                    fx: FxArea::initial(),
+                    kstack_phys: 0,
+                    kstack_top: 0,
+                    mmap_next: 0,
                 });
                 return Some(pid);
             }
@@ -274,6 +309,11 @@ pub fn spawn_user_task(
         if !SCHEDULER_INITIALIZED {
             return None;
         }
+        // Own kernel stack: syscalls and interrupts from ring 3 land here, so this task
+        // can block inside the kernel without trampling anyone else's stack.
+        let kstack_phys = crate::mm::physical::alloc_frames(KSTACK_FRAMES)?;
+        let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0);
+        let kstack_top = kstack_phys + hhdm + KSTACK_FRAMES * crate::mm::physical::FRAME_SIZE;
         for i in 1..MAX_TASKS {
             if TASKS[i].is_none() {
                 let pid = NEXT_PID;
@@ -308,10 +348,15 @@ pub fn spawn_user_task(
                     capabilities,
                     preemption_disabled: false,
                     med_id: None,
+                    fx: FxArea::initial(),
+                    kstack_phys,
+                    kstack_top,
+                    mmap_next: 0,
                 });
                 return Some(pid);
             }
         }
+        crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
     }
     None
 }
@@ -371,9 +416,39 @@ pub fn sub_memory_usage(pid: TaskId, bytes: u64) {
     }
 }
 
-pub fn exit_current(_code: u64) {
+/// Exit code recorded for a task killed by the kernel (fault, signal) rather than exit().
+pub const EXIT_KILLED: i64 = -1;
+
+/// Exit codes of recently finished tasks, so `wait_pid` can report them after the
+/// TCB has been reaped. Small ring; oldest entries are overwritten.
+const EXIT_LOG_LEN: usize = 32;
+static mut EXIT_LOG: [(TaskId, i64); EXIT_LOG_LEN] = [(0, 0); EXIT_LOG_LEN];
+static mut EXIT_LOG_NEXT: usize = 0;
+
+fn record_exit(pid: TaskId, code: i64) {
+    unsafe {
+        EXIT_LOG[EXIT_LOG_NEXT] = (pid, code);
+        EXIT_LOG_NEXT = (EXIT_LOG_NEXT + 1) % EXIT_LOG_LEN;
+    }
+}
+
+/// Exit code of a finished task, if it is still remembered.
+pub fn exit_code(pid: TaskId) -> Option<i64> {
+    unsafe {
+        // Newest first, so a recycled pid reports its latest run.
+        (0..EXIT_LOG_LEN)
+            .map(|k| EXIT_LOG[(EXIT_LOG_NEXT + EXIT_LOG_LEN - 1 - k) % EXIT_LOG_LEN])
+            .find(|&(p, _)| p == pid && pid != 0)
+            .map(|(_, c)| c)
+    }
+}
+
+pub fn exit_current(code: u64) {
     unsafe {
         if let Some(ref mut tcb) = TASKS[CURRENT_SLOT] {
+            if tcb.state != TaskState::Dead {
+                record_exit(tcb.pid, code as i64);
+            }
             tcb.state = TaskState::Dead;
         }
     }
@@ -384,6 +459,9 @@ pub fn exit_pid(pid: TaskId) -> bool {
         for i in 0..MAX_TASKS {
             if let Some(ref mut tcb) = TASKS[i] {
                 if tcb.pid == pid {
+                    if tcb.state != TaskState::Dead {
+                        record_exit(pid, EXIT_KILLED);
+                    }
                     tcb.state = TaskState::Dead;
                     return true;
                 }
@@ -395,13 +473,14 @@ pub fn exit_pid(pid: TaskId) -> bool {
 
 /// Block until the task with the given PID exits (its state becomes Dead or it
 /// no longer exists in the table). Yields on each iteration so we don't spin.
-pub fn wait_pid(pid: TaskId) {
+/// Returns its exit code (`EXIT_KILLED` if the kernel killed it), or None if unknown.
+pub fn wait_pid(pid: TaskId) -> Option<i64> {
     loop {
         let alive = unsafe {
             TASKS.iter().flatten().any(|t| t.pid == pid && t.state != TaskState::Dead)
         };
         if !alive {
-            return;
+            return exit_code(pid);
         }
         sys_yield();
     }
@@ -514,6 +593,13 @@ fn next_ready_slot() -> Option<usize> {
                 // Reap dead tasks (except kernel idle task at idx 0, and not the currently running slot)
                 if task.state == TaskState::Dead {
                     if idx != 0 && idx != CURRENT_SLOT {
+                        // Safe to free the kernel stack: only the current task's stack is in use.
+                        if task.kstack_phys != 0 {
+                            crate::mm::physical::free_frames(task.kstack_phys, KSTACK_FRAMES);
+                            // Ring-3 tasks own their address space: page tables and owned
+                            // pages go back to the allocator (the CR3 is no longer active).
+                            crate::mm::r#virtual::destroy_address_space(task.cr3);
+                        }
                         TASKS[idx] = None;
                     }
                     continue;
@@ -531,7 +617,10 @@ fn next_ready_slot() -> Option<usize> {
                 }
 
                 if task.state == TaskState::Ready || task.state == TaskState::Running {
-                    if task.priority >= best_prio {
+                    // Strictly greater: among equal priorities the first one after the
+                    // current slot wins, which gives round-robin. (With >= the current
+                    // task, scanned last, always won ties and nothing else ever ran.)
+                    if best.is_none() || task.priority > best_prio {
                         best_prio = task.priority;
                         best = Some(idx);
                     }
@@ -573,7 +662,12 @@ pub fn sys_yield() {
     }
 }
 
-pub fn on_timer_irq(saved_state: *mut u8) {
+/// Preempt the current task. Called from the timer ISRs and from the ring-3 fault path.
+///
+/// `saved_state` points at the interrupted GPR + iretq frame. `fx_area` points at the
+/// FXSAVE image the ISR stub will FXRSTOR on return, or is null when the stub does not
+/// save FPU state (the exception path), in which case the next task's state is loaded here.
+pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
     unsafe {
         if !SCHEDULER_INITIALIZED {
             return;
@@ -600,6 +694,9 @@ pub fn on_timer_irq(saved_state: *mut u8) {
                 cur.frame[i] = *src.add(i);
             }
             cur.has_frame = true;
+            if !fx_area.is_null() {
+                core::ptr::copy_nonoverlapping(fx_area, cur.fx.0.as_mut_ptr(), 512);
+            }
             if cur.state == TaskState::Running {
                 cur.state = TaskState::Ready;
             }
@@ -622,7 +719,11 @@ pub fn on_timer_irq(saved_state: *mut u8) {
             return;
         }
 
+        let from_user = TASKS[cur_slot].as_ref().map_or(false, |t| t.kstack_phys != 0);
         if let Some(ref mut next) = TASKS[next_slot] {
+            if from_user && next.kstack_phys != 0 {
+                USER_TO_USER_SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             next.state = TaskState::Running;
             CURRENT_SLOT = next_slot;
 
@@ -643,9 +744,57 @@ pub fn on_timer_irq(saved_state: *mut u8) {
                     *dst.add(i) = next.frame[i];
                 }
             }
+
+            if next.kstack_top != 0 {
+                crate::arch::x86_64::gdt_simple::set_tss_rsp0(next.kstack_top);
+                crate::core::syscall::set_kernel_stack(next.kstack_top);
+            }
+
+            if fx_area.is_null() {
+                // The exception stub does no FXRSTOR on the way out: load the state now.
+                core::arch::asm!("fxrstor [{}]", in(reg) next.fx.0.as_ptr(), options(nostack));
+            } else {
+                core::ptr::copy_nonoverlapping(next.fx.0.as_ptr(), fx_area, 512);
+            }
         }
     }
 }
+
+/// Start of the mmap area in every user address space.
+const MMAP_BASE: u64 = 0x0000_1000_0000_0000;
+/// mmap area ends here (well below the top of user space, leaving room for stacks).
+const MMAP_LIMIT: u64 = 0x0000_7000_0000_0000;
+
+/// The current task's address space, if it is a ring-3 task with its own one.
+pub fn current_user_cr3() -> Option<u64> {
+    unsafe {
+        TASKS[CURRENT_SLOT]
+            .as_ref()
+            .filter(|t| t.kstack_phys != 0)
+            .map(|t| t.cr3)
+    }
+}
+
+/// Reserve `pages` pages of virtual address space for mmap in the current ring-3 task.
+/// Leaves an unmapped guard page after each reservation.
+pub fn reserve_user_range(pages: u64) -> Option<u64> {
+    unsafe {
+        let t = TASKS[CURRENT_SLOT].as_mut().filter(|t| t.kstack_phys != 0)?;
+        if t.mmap_next == 0 {
+            t.mmap_next = MMAP_BASE;
+        }
+        let start = t.mmap_next;
+        let end = start.checked_add((pages + 1) * crate::mm::physical::FRAME_SIZE)?;
+        if end > MMAP_LIMIT {
+            return None;
+        }
+        t.mmap_next = end;
+        Some(start)
+    }
+}
+
+/// Context switches directly between two ring-3 tasks (for diagnostics and tests).
+pub static USER_TO_USER_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn set_preemption_disabled(disabled: bool) {
     unsafe {

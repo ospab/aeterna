@@ -6,7 +6,7 @@
  *   - Reports raw numbers
  *   - Exits with [PASS] or [FAIL] and a reason
  *
- * Commands: verify_mem  verify_sched  verify_net
+ * Commands: verify_mem  verify_sched  verify_net  verify_audio
  * All timer deadlines use PIT at 100 Hz (10 ms/tick).
  */
 
@@ -14,20 +14,18 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 
-use crate::arch::x86_64::framebuffer;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
 const FG_ERR: u32 = 0x00FF4444;
 const FG_DIM: u32 = 0x00AAAAAA;
 const FG_HL: u32  = 0x00FFCC00;
-const BG: u32     = 0x00000000;
 
-fn puts(s: &str)  { framebuffer::draw_string(s, FG, BG); }
-fn pass(s: &str)  { framebuffer::draw_string("[PASS] ", FG_OK, BG); framebuffer::draw_string(s, FG, BG); }
-fn fail(s: &str)  { framebuffer::draw_string("[FAIL] ", FG_ERR, BG); framebuffer::draw_string(s, FG, BG); }
-fn warn(s: &str)  { framebuffer::draw_string("[WARN] ", FG_HL, BG); framebuffer::draw_string(s, FG, BG); }
-fn step(s: &str)  { framebuffer::draw_string("  ... ", FG_DIM, BG); framebuffer::draw_string(s, FG, BG); }
+fn puts(s: &str)  { crate::userspace::plum::io::out_c(s, FG); }
+fn pass(s: &str)  { crate::userspace::plum::io::out_c("[PASS] ", FG_OK); crate::userspace::plum::io::out_c(s, FG); }
+fn fail(s: &str)  { crate::userspace::plum::io::set_status(1); crate::userspace::plum::io::out_c("[FAIL] ", FG_ERR); crate::userspace::plum::io::out_c(s, FG); }
+fn warn(s: &str)  { crate::userspace::plum::io::out_c("[WARN] ", FG_HL); crate::userspace::plum::io::out_c(s, FG); }
+fn step(s: &str)  { crate::userspace::plum::io::out_c("  ... ", FG_DIM); crate::userspace::plum::io::out_c(s, FG); }
 
 /// Dispatch IVS commands. Returns true if handled.
 pub fn dispatch(cmd: &str, args: &str) -> bool {
@@ -54,7 +52,7 @@ fn cmd_verify_mem(_args: &str) {
     const PAT_A: u8 = 0xAA;
     const PAT_B: u8 = 0x55;
 
-    framebuffer::draw_string("verify_mem: ", FG_HL, BG);
+    crate::userspace::plum::io::out_c("verify_mem: ", FG_HL);
     puts(&format!("{} KiB heap write/read test\n", TEST_SIZE / 1024));
 
     // --- Pass A: fill with 0xAA ---
@@ -108,92 +106,61 @@ fn cmd_verify_mem(_args: &str) {
 
 // ─── verify_sched ─────────────────────────────────────────────────────────────
 //
-// Spawns N placeholder tasks (no real entry point) and verifies:
-//   1. The scheduler accepted them (get_tasks returns N+1 results)
-//   2. After yielding for 1 second, the current task accumulated CPU ticks
-//      (proves the PIT is firing at the expected rate)
-//   3. Reports actual tick count and Hz estimate
+// What it checks (honestly):
+//   1. the scheduler is initialized and get_tasks() returns the task table;
+//   2. sys_yield() returns to us (cooperative switch path works);
+//   3. the 100 Hz PIT tick counter advances at the expected rate, measured
+//      against the TSC.  Note: the TSC itself was calibrated against the PIT
+//      at boot, so this detects lost/stalled ticks since boot, not an
+//      absolutely wrong PIT frequency.
+// It does NOT spawn tasks: there is no safe kernel-thread API for test
+// code yet (placeholder TCBs without code would only be phantoms).
 
 fn cmd_verify_sched(_args: &str) {
-    use crate::core::scheduler::{
-        get_tasks, spawn_named, exit_pid, sys_yield,
-        TaskSnapshot, TaskState, Priority, is_initialized,
-    };
+    use crate::core::scheduler::{get_tasks, sys_yield, TaskSnapshot, TaskState, Priority, is_initialized};
 
-    framebuffer::draw_string("verify_sched: ", FG_HL, BG);
-    puts("preemptive scheduler & 100 Hz PIT test\n");
+    crate::userspace::plum::io::out_c("verify_sched: ", FG_HL);
+    puts("scheduler and timer check\n");
 
     if !is_initialized() {
         fail("scheduler not initialized\n");
         return;
     }
 
-    // Snapshot before spawning
-    let mut snap0 = [TaskSnapshot {
+    let mut snap = [TaskSnapshot {
         pid: 0, priority: Priority::Idle, state: TaskState::Dead,
         cr3: 0, cpu_ticks: 0, memory_bytes: 0, name: [0; 24], name_len: 0,
     }; 64];
-    let before = get_tasks(&mut snap0);
-
-    // Spawn 10 placeholder tasks (no code, just scheduler entries)
-    const N: usize = 10;
-    let task_names = [
-        "ivs_0", "ivs_1", "ivs_2", "ivs_3", "ivs_4",
-        "ivs_5", "ivs_6", "ivs_7", "ivs_8", "ivs_9",
-    ];
-    let mut pids = [0u32; N];
-    let mut spawned = 0usize;
-    for i in 0..N {
-        match spawn_named(task_names[i], Priority::Normal, 0, 0, 0, &[]) {
-            Some(pid) => { pids[spawned] = pid; spawned += 1; }
-            None => { warn(&format!("could only spawn {} tasks (max reached)\n", spawned)); break; }
-        }
-    }
-    step(&format!("spawned {} placeholder tasks\n", spawned));
-
-    // Snapshot after
-    let mut snap1 = [TaskSnapshot {
-        pid: 0, priority: Priority::Idle, state: TaskState::Dead,
-        cr3: 0, cpu_ticks: 0, memory_bytes: 0, name: [0; 24], name_len: 0,
-    }; 64];
-    let after = get_tasks(&mut snap1);
-
-    if after >= before + spawned {
-        pass(&format!("task table: {} tasks visible ({} added)\n", after, spawned));
+    let n = get_tasks(&mut snap);
+    let running = snap[..n].iter().filter(|t| t.state == TaskState::Running).count();
+    if n > 0 {
+        pass(&format!("task table readable: {} tasks ({} running)\n", n, running));
     } else {
-        fail(&format!("task table: expected >= {}, got {} tasks\n", before + spawned, after));
+        fail("task table is empty\n");
     }
 
-    // Measure PIT frequency: count ticks over ~0.5 s wall clock using rdtsc
-    // We don't have rdtsc exposed, so instead: yield for a fixed tick window
-    // and confirm ticks accumulated at the right rate via TIMER_TICKS.
-    let t0 = crate::arch::x86_64::idt::timer_ticks();
-
-    // Busy-yield for ~100 ticks (should be ~1s at 100Hz)
-    let target = t0 + 100;
+    // yield a number of times; returning at all proves the switch path
     let mut yields = 0u32;
-    while crate::arch::x86_64::idt::timer_ticks() < target {
-        sys_yield();
-        yields += 1;
+    for _ in 0..100 { sys_yield(); yields += 1; }
+    pass(&format!("sys_yield() returned {} times\n", yields));
+
+    // PIT rate against TSC over ~0.5 s
+    let us0 = crate::arch::x86_64::tsc::tsc_stamp_us();
+    let t0 = crate::arch::x86_64::idt::timer_ticks();
+    while crate::arch::x86_64::tsc::tsc_stamp_us().wrapping_sub(us0) < 500_000 {
+        unsafe { core::arch::asm!("hlt"); }
     }
     let t1 = crate::arch::x86_64::idt::timer_ticks();
-    let elapsed = t1.saturating_sub(t0);
-
-    step(&format!("elapsed ticks over ~1s window: {} (target 100)\n", elapsed));
-
-    // Allow ±30% tolerance around 100 Hz
-    if elapsed >= 70 && elapsed <= 130 {
-        pass(&format!("PIT rate ~{}Hz ({}±30% ticks/s window)\n", elapsed, elapsed));
+    let elapsed_us = crate::arch::x86_64::tsc::tsc_stamp_us().wrapping_sub(us0);
+    let ticks = t1.saturating_sub(t0);
+    let hz = if elapsed_us > 0 { ticks * 1_000_000 / elapsed_us } else { 0 };
+    step(&format!("{} PIT ticks in {} us (TSC) = ~{} Hz (expected 100)\n", ticks, elapsed_us, hz));
+    if hz >= 80 && hz <= 120 {
+        pass("PIT tick rate within 20% of 100 Hz\n");
     } else {
-        fail(&format!("PIT rate anomaly: {} ticks/s (expected 100±30)\n", elapsed));
+        fail(&format!("PIT tick rate {} Hz is outside 80..120 Hz\n", hz));
     }
-
-    // Clean up placeholder tasks
-    for i in 0..spawned {
-        exit_pid(pids[i]);
-    }
-    step(&format!("cleaned up {} placeholder tasks\n", spawned));
-    pass("verify_sched: SCHEDULER INTEGRITY OK\n");
+    step("not tested: preemption between multiple kernel threads (no test-thread API yet)\n");
 }
 
 // ─── verify_net ───────────────────────────────────────────────────────────────
@@ -205,7 +172,7 @@ fn cmd_verify_sched(_args: &str) {
 //   4. ARP resolution of gateway (proves TX+RX are wired)
 
 fn cmd_verify_net(_args: &str) {
-    framebuffer::draw_string("verify_net: ", FG_HL, BG);
+    crate::userspace::plum::io::out_c("verify_net: ", FG_HL);
     puts("network stack integrity test\n");
 
     // --- 1. NIC up? ---
@@ -232,7 +199,7 @@ fn cmd_verify_net(_args: &str) {
     if ip != [0, 0, 0, 0] {
         pass(&format!("IP address: {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
     } else {
-        fail("IP address is 0.0.0.0 (DHCP not implemented?)\n");
+        fail("IP address is 0.0.0.0 (no DHCP lease and no static address)\n");
     }
 
     // --- 4. ICMP/IP checksum self-test ---
@@ -340,7 +307,7 @@ fn sine100(k: usize) -> i16 {
 }
 
 fn cmd_verify_audio(_args: &str) {
-    framebuffer::draw_string("verify_audio: ", FG_HL, BG);
+    crate::userspace::plum::io::out_c("verify_audio: ", FG_HL);
     puts("440 Hz sine tone via /dev/audio\n");
 
     if !crate::drivers::audio::is_ready() {

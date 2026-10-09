@@ -17,7 +17,6 @@
 
 extern crate alloc;
 use alloc::format;
-use crate::arch::x86_64::framebuffer;
 
 const FG:      u32 = 0x00FFFFFF;
 const FG_OK:   u32 = 0x0000FF00;
@@ -28,13 +27,13 @@ const FG_CYN:  u32 = 0x0055FFFF;
 const FG_ERR:  u32 = 0x00FF4444;
 const BG:      u32 = 0x00000000;
 
-fn puts(s: &str)   { framebuffer::draw_string(s, FG,     BG); }
-fn dim(s: &str)    { framebuffer::draw_string(s, FG_DIM, BG); }
-fn hl(s: &str)     { framebuffer::draw_string(s, FG_HL,  BG); }
-fn ok(s: &str)     { framebuffer::draw_string(s, FG_OK,  BG); }
-fn cyan(s: &str)   { framebuffer::draw_string(s, FG_CYN, BG); }
-fn blue(s: &str)   { framebuffer::draw_string(s, FG_BLU, BG); }
-fn err(s: &str)    { framebuffer::draw_string(s, FG_ERR, BG); }
+fn puts(s: &str)   { crate::userspace::plum::io::out_c(s, FG); }
+fn dim(s: &str)    { crate::userspace::plum::io::out_c(s, FG_DIM); }
+fn hl(s: &str)     { crate::userspace::plum::io::out_c(s, FG_HL); }
+fn ok(s: &str)     { crate::userspace::plum::io::out_c(s, FG_OK); }
+fn cyan(s: &str)   { crate::userspace::plum::io::out_c(s, FG_CYN); }
+fn blue(s: &str)   { crate::userspace::plum::io::out_c(s, FG_BLU); }
+fn err(s: &str)    { crate::userspace::plum::io::err(s); }
 
 /// Parse "XXXX:YYYY" vendor:device filter from args. Returns (vid, did) or (0xFFFF, 0xFFFF).
 fn parse_filter(args: &str) -> (u16, u16) {

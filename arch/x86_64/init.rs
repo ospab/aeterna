@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Early CPU/board init: SSE, Limine check, GDT, IDT, PIC, serial, framebuffer.
 */
@@ -89,22 +89,21 @@ pub fn init() {
     enable_avx();
 
     serial::init();
-    serial::write_str("[AETERNA] Serial OK\r\n");
+    serial::write_str("[BOOT] Serial COM1 ready\r\n");
 
     if !boot::base_revision_supported() {
-        serial::write_str("[AETERNA] WARN: Limine base revision not 0\r\n");
+        serial::write_str("[BOOT] WARN: Limine base revision not supported\r\n");
     }
     if let Some(off) = boot::hhdm_offset() {
-        serial::write_str("[AETERNA] HHDM offset: 0x");
+        serial::write_str("[MM] HHDM offset: 0x");
         serial_hex(off);
         serial::write_str("\r\n");
     }
 
     gdt_simple::init();
-    serial::write_str("[AETERNA] GDT loaded\r\n");
+    serial::write_str("[CPU] GDT + TSS loaded\r\n");
 
     idt::init();
-    serial::write_str("[AETERNA] IDT loaded\r\n");
 
     // Initialize PIC (remap IRQs to IDT 32-47)
     pic::init();
@@ -112,10 +111,15 @@ pub fn init() {
     // Program PIT channel 0 to fire at 100 Hz (preemptive scheduling fallback)
     pic::init_pit_100hz();
 
+    // Initialize PS/2 Mouse
+    super::mouse::init();
+
     // Calibrate TSC — must come after PIT is live (uses 10 tick = 100 ms window).
     // Enable interrupts first so that `hlt` in calibrate() actually receives PIT ticks.
     enable_interrupts();
     super::tsc::calibrate();
+    // Seed the wall clock from the CMOS RTC (needs the calibrated TSC).
+    crate::time::init();
 
     // Init Local APIC one-shot timer (vector 48) — arms 1 ms precision preemption.
     // Requires TSC calibrated and interrupts enabled.
@@ -135,27 +139,26 @@ pub fn init() {
                 fb.blue_mask_shift,
             );
         }
-        serial::write_str("[AETERNA] Framebuffer initialized\r\n");
+        serial::write_str("[FB] ");
+        serial_dec(fb.width);
+        serial::write_str("x");
+        serial_dec(fb.height);
+        serial::write_str(", ");
+        serial_dec(fb.bpp as u64);
+        serial::write_str(" bpp\r\n");
 
         // Initialize fbconsole for text output
         super::fbconsole::init();
 
-        // Clear screen and draw welcome text (minimalist - white only)
+        // Blank screen; the boot log (src/main.rs) is the only thing drawn on it.
         framebuffer::clear(0x00000000);
-        framebuffer::draw_string_at(10, 10, "AETERNA Microkernel", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 26, "===================", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 50, "Framebuffer: OK", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 66, "Serial: OK", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 82, "GDT: OK", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 98, "IDT: OK", 0x00FFFFFF, 0x00000000);
-        framebuffer::draw_string_at(10, 114, "PIC: OK\n", 0x00FFFFFF, 0x00000000);
     } else {
-        serial::write_str("[AETERNA] No framebuffer available\r\n");
+        serial::write_str("[FB] No framebuffer from the boot loader\r\n");
     }
 
     // Enable hardware interrupts
     enable_interrupts();
-    serial::write_str("[AETERNA] Interrupts enabled\r\n");
+    serial::write_str("[CPU] Interrupts enabled\r\n");
 }
 
 pub fn serial_hex(mut val: u64) {

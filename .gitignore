@@ -43,3 +43,12 @@ rustc-ice-*.txt
 
 # --- AAM internal data ---
 aam/
+# Build artifacts
+*.o
+*.a
+!limine-10.8.2/**
+*.log
+isos/
+archive/
+user/target/
+boot/uefi/target/

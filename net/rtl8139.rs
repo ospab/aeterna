@@ -27,6 +27,10 @@ const REG_TSD0: u16       = 0x10;   // TX status descriptor 0
 
 // RX buffer: 8K + 16 bytes header + 1500 tail margin
 const RX_BUF_SIZE: usize = 8192 + 16 + 1500;
+/// Ring length programmed in RCR.RBLEN=00. With RCR.WRAP=1 the chip writes a
+/// packet that crosses the end linearly into the extra slack after the ring,
+/// so offsets wrap at RX_RING_LEN but packet data can be read contiguously.
+const RX_RING_LEN: usize = 8192;
 // Packet buffer for returning data
 const PACKET_BUF_SIZE: usize = 1600;
 
@@ -276,7 +280,7 @@ pub fn io_base() -> u16 {
 
 /// Send a packet (copies into TX descriptor buffer)
 pub fn send_packet(data: &[u8], len: usize) {
-    if !is_initialized() || len > 1500 || len < 14 { return; }
+    if !is_initialized() || len > 1514 || len < 14 { return; }
 
     unsafe {
         let desc = TX_CUR as usize;
@@ -303,6 +307,7 @@ pub fn send_packet(data: &[u8], len: usize) {
         }
 
         // Debug: log TX result
+        if super::trace() {
         crate::arch::x86_64::serial::write_str("[RTL8139] TX desc=");
         serial_dec(desc as u64);
         crate::arch::x86_64::serial::write_str(" len=");
@@ -315,6 +320,7 @@ pub fn send_packet(data: &[u8], len: usize) {
             crate::arch::x86_64::serial::write_str(" TIMEOUT");
         }
         crate::arch::x86_64::serial::write_str("\r\n");
+        }
 
         TX_CUR = ((TX_CUR + 1) % 4) as u8;
     }
@@ -334,16 +340,17 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
         // Read packet header at current offset
         let offset = RX_OFFSET;
         let header = u32::from_le_bytes([
-            RX_BUFFER.0[offset % RX_BUF_SIZE],
-            RX_BUFFER.0[(offset + 1) % RX_BUF_SIZE],
-            RX_BUFFER.0[(offset + 2) % RX_BUF_SIZE],
-            RX_BUFFER.0[(offset + 3) % RX_BUF_SIZE],
+            RX_BUFFER.0[offset],
+            RX_BUFFER.0[offset + 1],
+            RX_BUFFER.0[offset + 2],
+            RX_BUFFER.0[offset + 3],
         ]);
 
         let status = (header & 0xFFFF) as u16;
         let pkt_len = ((header >> 16) & 0xFFFF) as usize;
 
         // Debug: log received packet
+        if super::trace() {
         crate::arch::x86_64::serial::write_str("[RTL8139] RX: status=0x");
         serial_hex16(status);
         crate::arch::x86_64::serial::write_str(" len=");
@@ -351,15 +358,13 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
         crate::arch::x86_64::serial::write_str(" offset=");
         serial_dec(offset as u64);
         crate::arch::x86_64::serial::write_str("\r\n");
+        }
 
         // Check ROK (bit 0 of status)
-        if status & 0x01 == 0 {
-            // Bad packet — skip and reset receiver
-            crate::arch::x86_64::serial::write_str("[RTL8139] RX: bad status, resetting\r\n");
-            outb(IO_BASE + REG_CMD, 0x04); // TE only
-            core::arch::asm!("pause");
-            outb(IO_BASE + REG_CMD, 0x0C); // TE + RE
-            RX_OFFSET = 0;
+        if status & 0x01 == 0 || pkt_len > 1518 + 4 || pkt_len < 18 {
+            // Corrupt ring state: reset the receiver completely.
+            crate::arch::x86_64::serial::write_str("[RTL8139] RX: bad header, resetting receiver\r\n");
+            reset_rx();
             return None;
         }
 
@@ -370,21 +375,19 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
         if eth_len < 14 || pkt_len > 1518 {
             // Advance past this packet
             let advance = ((pkt_len + 4) + 3) & !3;
-            RX_OFFSET = (offset + advance) % RX_BUF_SIZE;
+            RX_OFFSET = (offset + advance) % RX_RING_LEN;
             outw(IO_BASE + REG_CAPR, (RX_OFFSET as u16).wrapping_sub(16));
             return None;
         }
 
         // Copy Ethernet frame (skip 4-byte RTL header, strip 4-byte CRC)
-        let data_start = (offset + 4) % RX_BUF_SIZE;
-        let copy_len = eth_len.min(PACKET_BUF_SIZE);
-        for i in 0..copy_len {
-            PACKET_BUF.0[i] = RX_BUFFER.0[(data_start + i) % RX_BUF_SIZE];
-        }
+        let data_start = offset + 4; // contiguous thanks to WRAP=1 + slack
+        let copy_len = eth_len.min(PACKET_BUF_SIZE).min(RX_BUF_SIZE - data_start);
+        PACKET_BUF.0[..copy_len].copy_from_slice(&RX_BUFFER.0[data_start..data_start + copy_len]);
 
         // Advance offset: aligned(4-byte header + pkt_len)
         let advance = ((pkt_len + 4) + 3) & !3;
-        RX_OFFSET = (offset + advance) % RX_BUF_SIZE;
+        RX_OFFSET = (offset + advance) % RX_RING_LEN;
 
         // Update CAPR: write (new_offset - 16) per RTL8139 spec to avoid overrun
         outw(IO_BASE + REG_CAPR, (RX_OFFSET as u16).wrapping_sub(16));
@@ -393,13 +396,27 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
     }
 }
 
+/// Re-initialise the receiver after a corrupt header (RX disabled, ring
+/// pointers reset, RX re-enabled), as recommended by the RTL8139 programming guide.
+unsafe fn reset_rx() {
+    let io = IO_BASE;
+    outb(io + REG_CMD, 0x04); // TE only (RX off)
+    let rx_phys = virt_to_phys(RX_BUFFER.0.as_ptr() as usize);
+    outl(io + REG_RBSTART, rx_phys);
+    RX_OFFSET = 0;
+    outb(io + REG_CMD, 0x0C); // TE + RE
+    outl(io + REG_RCR, 0x0000_E78F);
+    outw(io + REG_CAPR, 0xFFF0);
+    outw(io + REG_ISR, 0xFFFF);
+}
+
 /// Handle IRQ from RTL8139 - acknowledge interrupt
 pub fn handle_irq() {
     if DETACHED.load(core::sync::atomic::Ordering::Relaxed) { return; }
     unsafe {
         if !INITIALIZED { return; }
         let isr = inw(IO_BASE + REG_ISR);
-        if isr != 0 {
+        if isr != 0 && super::trace() {
             crate::arch::x86_64::serial::write_str("[RTL8139] IRQ: ISR=0x");
             serial_hex16(isr);
             crate::arch::x86_64::serial::write_str("\r\n");

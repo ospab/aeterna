@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 Virtual Memory Manager (VMM) for AETERNA microkernel.
@@ -61,6 +61,10 @@ pub const FLAG_HUGE:      u64 = 1 << 7;
 pub const FLAG_GLOBAL:    u64 = 1 << 8;
 /// No-execute: page cannot contain executable code (requires NXE in EFER)
 pub const FLAG_NX:        u64 = 1 << 63;
+/// Software bit (ignored by the CPU): the frame behind this user page belongs to the
+/// address space and is freed with it. Pages without it (e.g. shared kernel text
+/// mapped for tests, device memory) are only unmapped, never freed.
+pub const FLAG_OWNED:     u64 = 1 << 9;
 
 /// Mask to extract the physical address from a page table entry
 /// Bits 12..51 hold the 4K-aligned physical frame address
@@ -342,6 +346,11 @@ pub fn map_page_current(virt: u64, phys: u64, flags: u64) -> bool {
 /// Unmap a single 4K virtual page in the given address space.
 /// Returns the physical address that was mapped there, or None if not mapped.
 pub fn unmap_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+    unmap_page_entry(pml4_phys, virt).map(|(phys, _flags)| phys)
+}
+
+/// Like `unmap_page`, but also returns the flags the mapping had (e.g. `FLAG_OWNED`).
+pub fn unmap_page_entry(pml4_phys: u64, virt: u64) -> Option<(u64, u64)> {
     let i4 = pml4_index(virt);
     let i3 = pdpt_index(virt);
     let i2 = pd_index(virt);
@@ -364,8 +373,9 @@ pub fn unmap_page(pml4_phys: u64, virt: u64) -> Option<u64> {
         if !pt.entries[i1].is_present() { return None; }
 
         let phys = pt.entries[i1].addr();
+        let flags = pt.entries[i1].flags();
         pt.entries[i1].clear();
-        Some(phys)
+        Some((phys, flags))
     }
 }
 
@@ -498,6 +508,97 @@ pub fn create_address_space() -> Option<u64> {
 ///
 /// # Safety
 /// `task_pml4` must be a valid physical address of a 4K-aligned PML4 table.
+static NX_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn on EFER.NXE if the CPU supports no-execute pages. Returns whether NX is usable.
+pub fn enable_nx() -> bool {
+    const EFER: u32 = 0xC000_0080;
+    let edx: u32;
+    // SAFETY: CPUID 0x8000_0001 exists on every x86-64 CPU.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx", "cpuid", "mov rbx, {tmp:r}",
+            tmp = out(reg) _,
+            inout("eax") 0x8000_0001u32 => _,
+            inout("ecx") 0u32 => _,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if edx & (1 << 20) == 0 {
+        return false;
+    }
+    // SAFETY: setting EFER.NXE (bit 11) on a CPU that reports NX support.
+    unsafe {
+        let (lo, hi): (u32, u32);
+        core::arch::asm!("rdmsr", in("ecx") EFER, out("eax") lo, out("edx") hi, options(nomem, nostack));
+        let lo = lo | (1 << 11);
+        core::arch::asm!("wrmsr", in("ecx") EFER, in("eax") lo, in("edx") hi, options(nomem, nostack));
+    }
+    NX_ENABLED.store(true, Ordering::Relaxed);
+    true
+}
+
+/// `FLAG_NX` if no-execute pages are enabled, otherwise 0 (the bit would be reserved).
+pub fn nx_flag() -> u64 {
+    if NX_ENABLED.load(Ordering::Relaxed) { FLAG_NX } else { 0 }
+}
+
+/// Free a user address space created by `create_address_space`: every page table
+/// of the lower half, every leaf frame marked `FLAG_OWNED`, and the PML4 itself.
+/// The upper (kernel) half is shared and left alone.
+///
+/// Must not be called on the active CR3 or on the kernel PML4. Returns the number
+/// of owned user frames freed.
+pub fn destroy_address_space(pml4_phys: u64) -> u64 {
+    use crate::mm::physical::free_frame;
+    let pml4_phys = pml4_phys & ADDR_MASK;
+    let kernel = KERNEL_PML4_PHYS.load(Ordering::Relaxed) & ADDR_MASK;
+    if pml4_phys == 0 || pml4_phys == kernel || pml4_phys == read_cr3() & ADDR_MASK {
+        crate::arch::x86_64::serial::write_str("[VMM] WARN: refusing to destroy active/kernel address space\r\n");
+        return 0;
+    }
+    let mut owned = 0;
+    unsafe {
+        let pml4 = table_at_phys(pml4_phys);
+        for i4 in 0..256 {
+            if !pml4.entries[i4].is_present() {
+                continue;
+            }
+            let pdpt_phys = pml4.entries[i4].addr();
+            let pdpt = table_at_phys(pdpt_phys);
+            for i3 in 0..512 {
+                let e3 = &pdpt.entries[i3];
+                if !e3.is_present() || e3.is_huge() {
+                    continue; // huge user mappings are never created as owned
+                }
+                let pd_phys = e3.addr();
+                let pd = table_at_phys(pd_phys);
+                for i2 in 0..512 {
+                    let e2 = &pd.entries[i2];
+                    if !e2.is_present() || e2.is_huge() {
+                        continue;
+                    }
+                    let pt_phys = e2.addr();
+                    let pt = table_at_phys(pt_phys);
+                    for i1 in 0..512 {
+                        let e1 = &pt.entries[i1];
+                        if e1.is_present() && e1.flags() & FLAG_OWNED != 0 {
+                            free_frame(e1.addr());
+                            owned += 1;
+                        }
+                    }
+                    free_frame(pt_phys);
+                }
+                free_frame(pd_phys);
+            }
+            free_frame(pdpt_phys);
+        }
+    }
+    free_frame(pml4_phys);
+    owned
+}
+
 pub fn sync_kernel_mappings(task_pml4: u64) {
     let kernel_pml4_phys = KERNEL_PML4_PHYS.load(Ordering::Relaxed);
     if kernel_pml4_phys == 0 || task_pml4 == kernel_pml4_phys {

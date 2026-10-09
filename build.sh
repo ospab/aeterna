@@ -2,8 +2,10 @@
 # Build script for ospab.os v2 (AETERNA) — kernel + Limine + hybrid ISO (BIOS + UEFI)
 #
 # Usage:
-#   ./build.sh           — build kernel + ISO
+#   ./build.sh           — build kernel + ISO (Limine; our UEFI loader as an extra menu entry)
 #   ./build.sh kernel    — build kernel only (no ISO)
+#   ./build.sh image     — build kernel + our UEFI loader (boot/uefi) + GPT/FAT32 disk image
+#                          isos/ospab-os-v2-N.img; no WSL, xorriso or Limine needed
 #
 # Env:
 #   TARGET               — rust target (e.g. x86_64-unknown-none; empty = host)
@@ -33,7 +35,9 @@ TARGET="${TARGET:-}"
 ISO_ROOT="${ISO_ROOT:-/tmp/ospab_os_v2_iso_root}"
 ESP_IMG="$ISO_ROOT/efiboot.img"
 BUILD_ISO=true
+BUILD_IMAGE=false
 [ "$1" = "kernel" ] && BUILD_ISO=false
+[ "$1" = "image" ] && { BUILD_ISO=false; BUILD_IMAGE=true; }
 
 # --- Auto-increment ISO number ---
 mkdir -p "$ISOS_DIR"
@@ -59,11 +63,17 @@ if [ ! -f "$DOOM_LIB" ]; then
     }
 fi
 
+# --- Build user programs (user/, target x86_64-unknown-oos, runtime liboos) ---
+# Must run without RUSTFLAGS: it would override user/.cargo/config.toml (linker script).
+echo "--- Building user programs ---"
+( cd "$PROJECT_ROOT/user" && env -u RUSTFLAGS cargo +nightly build --release ) || {
+    echo "ERROR: user programs failed to build" >&2
+    exit 1
+}
+
 # --- Build kernel (custom target needs build-std; -A warnings avoids nightly ICE on bin crate) ---
 export RUSTFLAGS="${RUSTFLAGS:--A warnings}"
-if [ -f "$DOOM_LIB" ]; then
-    export RUSTFLAGS="$RUSTFLAGS -l static=doom -L $PROJECT_ROOT/target/doom"
-fi
+# DOOM (target/doom/libdoom.a) is linked by build.rs
 echo "--- Building kernel ---"
 if [ -n "$TARGET" ]; then
     cargo +nightly build --release --target "$TARGET"
@@ -92,7 +102,41 @@ else
     echo "Note: no objcopy found — kernel not stripped"
 fi
 
-[ "$BUILD_ISO" = false ] && exit 0
+[ "$BUILD_ISO" = false ] && [ "$BUILD_IMAGE" = false ] && exit 0
+
+# --- Build our UEFI loader (boot/uefi, target x86_64-unknown-uefi via build-std) ---
+# Like user/, it has its own .cargo/config.toml, so RUSTFLAGS must not leak in.
+LOADER_EFI="$PROJECT_ROOT/boot/uefi/target/x86_64-unknown-uefi/release/ospab_boot.efi"
+echo "--- Building UEFI loader ---"
+if ! ( cd "$PROJECT_ROOT/boot/uefi" && env -u RUSTFLAGS cargo +nightly build --release ); then
+    if [ "$BUILD_IMAGE" = true ]; then
+        echo "ERROR: UEFI loader failed to build" >&2
+        exit 1
+    fi
+    echo "WARN: UEFI loader failed to build; the ISO will not have the ospab loader entry"
+    LOADER_EFI=
+fi
+
+# --- GPT + FAT32 disk image with our loader (no Limine) ---
+if [ "$BUILD_IMAGE" = true ]; then
+    # Host tool, built with plain rustc so it ignores the kernel's .cargo/config.toml
+    MKIMAGE="$PROJECT_ROOT/target/mkimage"
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) MKIMAGE="$MKIMAGE.exe" ;; esac
+    if [ ! -f "$MKIMAGE" ] || [ "$PROJECT_ROOT/tools/mkimage.rs" -nt "$MKIMAGE" ]; then
+        echo "--- Building mkimage ---"
+        mkdir -p "$PROJECT_ROOT/target"
+        rustc -O --edition 2021 "$PROJECT_ROOT/tools/mkimage.rs" -o "$MKIMAGE"
+    fi
+    IMG_PATH="$ISOS_DIR/ospab-os-v2-${NEXT_NUM}.img"
+    echo "--- Creating disk image ---"
+    "$MKIMAGE" "$IMG_PATH"         "EFI/BOOT/BOOTX64.EFI=$LOADER_EFI"         "boot/KERNEL=$KERNEL_BIN"         "boot/ospab.cfg=$PROJECT_ROOT/boot/ospab.cfg"
+    echo ""
+    echo "DONE. Image: $IMG_PATH"
+    echo "Run (UEFI only): qemu-system-x86_64 -drive file=\"$IMG_PATH\",format=raw -m 512M -serial stdio \\"
+    echo "                   -drive if=pflash,format=raw,readonly=on,file=<edk2-x86_64-code.fd>"
+    echo "VMware: convert with qemu-img convert -O vmdk, firmware = UEFI"
+    exit 0
+fi
 
 # --- Ensure Limine binaries (build from limine-10.8.2 if missing) ---
 LIMINE_NEEDED=
@@ -161,6 +205,13 @@ cp "$LIMINE_BIN_DIR/limine-bios.sys"    "$ISO_ROOT/boot/limine/"
 # UEFI — boot loader + CD image
 cp "$LIMINE_BIN_DIR/BOOTX64.EFI"        "$ISO_ROOT/EFI/BOOT/"
 cp "$LIMINE_BIN_DIR/limine-uefi-cd.bin"  "$ISO_ROOT/boot/limine/"
+# Our UEFI loader, chainloaded from the Limine menu (test entry in limine.conf).
+# It reads ISO9660 itself and boots /boot/KERNEL with /boot/ospab.cfg.
+if [ -n "$LOADER_EFI" ] && [ -f "$LOADER_EFI" ]; then
+    mkdir -p "$ISO_ROOT/EFI/OSPAB"
+    cp "$LOADER_EFI" "$ISO_ROOT/EFI/OSPAB/OSPABLDR.EFI"
+    cp "$PROJECT_ROOT/boot/ospab.cfg" "$ISO_ROOT/boot/ospab.cfg"
+fi
 
 # --- Build hybrid ISO with xorriso (BIOS + UEFI) ---
 # Uses official Limine method: limine-uefi-cd.bin as El Torito EFI boot image,

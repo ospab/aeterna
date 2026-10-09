@@ -45,6 +45,8 @@ pub struct TlsConn {
     client_seq:   u64,
     server_seq:   u64,
     recv_buf:     Vec<u8>, // buffered data from TCP
+    plain:        Vec<u8>, // decrypted application data not yet returned
+    eof:          bool,    // peer closed (close_notify or TCP FIN)
 }
 
 // ─── Handshake message types ─────────────────────────────────────────────────
@@ -78,40 +80,54 @@ fn tcp_send_all(conn: usize, data: &[u8]) -> bool {
     }
 }
 
+/// Why a read did not produce a record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadErr {
+    /// Nothing (complete) arrived within the timeout; connection still open.
+    Timeout,
+    /// Peer closed or reset the TCP connection, or the stream is malformed.
+    Closed,
+}
+
 /// Read at least `min_bytes` from TCP into `buf`, appending to existing data.
-/// Returns false on timeout/error.
-fn tcp_read_into(conn: usize, buf: &mut Vec<u8>, min_bytes: usize, timeout: u64) -> bool {
+fn tcp_read_into(conn: usize, buf: &mut Vec<u8>, min_bytes: usize, timeout: u64) -> Result<(), ReadErr> {
+    use crate::userspace::net::tcp::{tcp_recv, TcpError};
     let start = crate::arch::x86_64::idt::timer_ticks();
     let mut tmp = [0u8; 4096];
     while buf.len() < min_bytes {
         let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
-        if elapsed > timeout { return false; }
-        match crate::userspace::net::tcp::tcp_recv(conn, &mut tmp, 50) {
-            Ok(0) => return false, // connection closed
+        if elapsed > timeout { return Err(ReadErr::Timeout); }
+        match tcp_recv(conn, &mut tmp, 50) {
+            Ok(0) => return Err(ReadErr::Closed), // peer closed (FIN)
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(crate::userspace::net::tcp::TcpError::WouldBlock) => continue,
-            Err(_) => return false,
+            Err(TcpError::WouldBlock) | Err(TcpError::TimedOut) => continue,
+            Err(_) => return Err(ReadErr::Closed),
         }
     }
-    true
+    Ok(())
 }
 
 /// Read one complete TLS record from TCP.
-fn read_record(conn: usize, buf: &mut Vec<u8>, timeout: u64) -> Option<(u8, Vec<u8>)> {
+fn read_record_ex(conn: usize, buf: &mut Vec<u8>, timeout: u64) -> Result<(u8, Vec<u8>), ReadErr> {
     // Need at least 5 bytes for header
-    if !tcp_read_into(conn, buf, 5, timeout) { return None; }
+    tcp_read_into(conn, buf, 5, timeout)?;
 
     // Parse length from header
     let len = ((buf[3] as usize) << 8) | (buf[4] as usize);
+    if len > 16384 + 2048 { return Err(ReadErr::Closed); } // RFC 5246 6.2.3 limit
     let total = 5 + len;
 
     // Read the rest
-    if !tcp_read_into(conn, buf, total, timeout) { return None; }
+    tcp_read_into(conn, buf, total, timeout)?;
 
-    let (ct, payload, consumed) = record::parse_record(buf)?;
+    let (ct, payload, consumed) = record::parse_record(buf).ok_or(ReadErr::Closed)?;
     // Remove consumed bytes from buffer
-    *buf = buf[consumed..].to_vec();
-    Some((ct, payload))
+    buf.drain(..consumed);
+    Ok((ct, payload))
+}
+
+fn read_record(conn: usize, buf: &mut Vec<u8>, timeout: u64) -> Option<(u8, Vec<u8>)> {
+    read_record_ex(conn, buf, timeout).ok()
 }
 
 // ─── ClientHello ─────────────────────────────────────────────────────────────
@@ -245,6 +261,8 @@ struct ServerHello {
     server_random: [u8; 32],
     session_id: Vec<u8>,
     cipher_suite: u16,
+    /// Server accepted RFC 7627 extended_master_secret.
+    ems: bool,
 }
 
 fn parse_server_hello(data: &[u8]) -> Option<ServerHello> {
@@ -260,7 +278,21 @@ fn parse_server_hello(data: &[u8]) -> Option<ServerHello> {
     let cs_offset = 35 + sid_len;
     let cipher_suite = ((data[cs_offset] as u16) << 8) | (data[cs_offset + 1] as u16);
 
-    Some(ServerHello { server_random, session_id, cipher_suite })
+    // Extensions: after cipher_suite(2) + compression_method(1)
+    let mut ems = false;
+    let mut p = cs_offset + 3;
+    if p + 2 <= data.len() {
+        let ext_end = (p + 2 + (((data[p] as usize) << 8) | data[p + 1] as usize)).min(data.len());
+        p += 2;
+        while p + 4 <= ext_end {
+            let typ = ((data[p] as u16) << 8) | data[p + 1] as u16;
+            let len = ((data[p + 2] as usize) << 8) | data[p + 3] as usize;
+            if typ == 0x0017 { ems = true; }
+            p += 4 + len;
+        }
+    }
+
+    Some(ServerHello { server_random, session_id, cipher_suite, ems })
 }
 
 // ─── Parse handshake messages from a record payload ─────────────────────────
@@ -308,12 +340,17 @@ fn derive_keys(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
     cipher_suite: u16,
+    ems_session_hash: Option<&[u8; 32]>,
 ) -> ([u8; 48], SessionKeys) {
     // master_secret = PRF(pre_master_secret, "master secret", client_random + server_random)
     let mut seed = [0u8; 64];
     seed[..32].copy_from_slice(client_random);
     seed[32..].copy_from_slice(server_random);
-    let ms_bytes = prf::prf(pre_master_secret, b"master secret", &seed, 48); // prf takes &[u8]
+    // RFC 7627: with extended_master_secret the seed is the session hash.
+    let ms_bytes = match ems_session_hash {
+        Some(h) => prf::prf(pre_master_secret, b"extended master secret", h, 48),
+        None => prf::prf(pre_master_secret, b"master secret", &seed, 48),
+    };
     let mut master_secret = [0u8; 48];
     master_secret.copy_from_slice(&ms_bytes);
 
@@ -536,8 +573,12 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
     }
 
     // 6. Derive session keys
+    // session_hash = Hash(ClientHello .. ClientKeyExchange) for RFC 7627
+    let session_hash = super::sha256::sha256(&hs_bytes);
     let (master_secret, keys) = derive_keys(
-        &pre_master_secret_vec, &client_random, &sh.server_random, sh.cipher_suite);
+        &pre_master_secret_vec, &client_random, &sh.server_random, sh.cipher_suite,
+        if sh.ems { Some(&session_hash) } else { None });
+    if sh.ems { s("[TLS] extended_master_secret in use\r\n"); }
     s("[TLS] Session keys derived\r\n");
 
     // 9. ChangeCipherSpec
@@ -585,6 +626,13 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
             record::CT_CHANGE_CIPHER => {
                 s("[TLS] ← ChangeCipherSpec\r\n");
                 got_server_ccs = true;
+            }
+            record::CT_HANDSHAKE if !got_server_ccs => {
+                // Plaintext handshake before the server's CCS, e.g.
+                // NewSessionTicket (we offer session_ticket). It is part of
+                // the transcript covered by the server's Finished.
+                s("[TLS] ← NewSessionTicket/handshake before CCS\r\n");
+                hs_bytes.extend_from_slice(&payload);
             }
             record::CT_HANDSHAKE if got_server_ccs => {
                 // This is the encrypted Finished
@@ -637,6 +685,8 @@ fn tls_connect_inner(tcp_conn: usize, hostname: &str) -> Result<TlsConn, &'stati
         client_seq: 1, // first encrypted record was Finished (seq 0)
         server_seq: 1, // server's Finished was seq 0
         recv_buf,
+        plain: Vec::new(),
+        eof: false,
     })
 }
 
@@ -683,23 +733,29 @@ impl TlsConn {
 
     /// Receive application data (decrypted).
     /// Returns number of bytes read, or 0 on connection close.
+    /// Returns Ok(0) only at end of stream; Err("TLS: receive timeout") if no
+    /// data arrived within `timeout_ticks`.
     pub fn recv(&mut self, buf: &mut [u8], timeout_ticks: u64) -> Result<usize, &'static str> {
         let start = crate::arch::x86_64::idt::timer_ticks();
 
         loop {
+            // Hand out previously decrypted data first.
+            if !self.plain.is_empty() {
+                let take = core::cmp::min(self.plain.len(), buf.len());
+                buf[..take].copy_from_slice(&self.plain[..take]);
+                self.plain.drain(..take);
+                return Ok(take);
+            }
+            if self.eof { return Ok(0); }
+
             let elapsed = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
-            if elapsed > timeout_ticks { return Ok(0); }
+            if elapsed > timeout_ticks { return Err("TLS: receive timeout"); }
 
             // Try to read a record
-            let rec = read_record(self.tcp_conn, &mut self.recv_buf, 50);
-            let (ct, payload) = match rec {
-                Some(r) => r,
-                None => {
-                    // Check if we've exceeded total timeout
-                    let elapsed2 = crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start);
-                    if elapsed2 > timeout_ticks { return Ok(0); }
-                    continue;
-                }
+            let (ct, payload) = match read_record_ex(self.tcp_conn, &mut self.recv_buf, 50) {
+                Ok(r) => r,
+                Err(ReadErr::Closed) => { self.eof = true; return Ok(0); }
+                Err(ReadErr::Timeout) => continue,
             };
 
             match ct {
@@ -721,20 +777,23 @@ impl TlsConn {
                             &keys.server_mac_key,
                             &keys.server_enc_key,
                         ).ok_or("TLS: decrypt failed")?
-                    };;
+                    };
 
                     self.server_seq += 1;
-
-                    let take = core::cmp::min(decrypted.len(), buf.len());
-                    buf[..take].copy_from_slice(&decrypted[..take]);
-                    return Ok(take);
+                    // Buffer the whole record; a record can be larger than `buf`.
+                    self.plain.extend_from_slice(&decrypted);
+                    continue;
                 }
                 record::CT_ALERT => {
                     // Close notify or error — treat as EOF
+                    self.server_seq += 1;
+                    self.eof = true;
                     return Ok(0);
                 }
                 _ => {
-                    // Skip non-app-data records
+                    // Skip other records (e.g. post-handshake HelloRequest);
+                    // they are encrypted too and consume a sequence number.
+                    self.server_seq += 1;
                     continue;
                 }
             }

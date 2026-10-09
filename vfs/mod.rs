@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 Virtual Filesystem (VFS) for AETERNA microkernel.
@@ -32,9 +32,50 @@ pub mod procfs;
 pub use ramfs::RamNode;
 use alloc::boxed::Box;
 
-// Helper for disk_sync
+// ─── Syncable FS Registry ───────────────────────────────────────────────────
+
+/// The filesystem instance that should be synced to disk.
+/// Set during boot to the primary RamFS (or the Upper layer of CowFS).
+static mut SYNCABLE_FS: Option<&'static ramfs::RamFs> = None;
+
+/// Register a RamFS instance as the primary one for disk persistence.
+pub fn set_syncable_fs(fs: &'static ramfs::RamFs) {
+    unsafe { SYNCABLE_FS = Some(fs); }
+}
+
+/// Helper for disk_sync: find the registered syncable RamFS and get a copy of its tree.
 pub fn get_tree_copy() -> Option<alloc::collections::BTreeMap<String, RamNode>> {
-    ramfs::get_tree_copy()
+    unsafe {
+        SYNCABLE_FS.map(|fs| fs.get_tree_copy())
+    }
+}
+
+/// Helper for disk_sync: check if the registered syncable FS is dirty.
+pub fn is_syncable_dirty() -> bool {
+    unsafe {
+        SYNCABLE_FS.map(|fs| fs.is_dirty.load(core::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
+    }
+}
+
+/// Force a disk sync of the registered syncable FS.
+pub fn sync_now() {
+    disk_sync::sync_filesystem();
+}
+
+/// Reset the dirty flag on the syncable FS.
+pub fn clear_syncable_dirty() {
+    unsafe {
+        if let Some(fs) = SYNCABLE_FS {
+            fs.is_dirty.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Get the node count of the registered syncable RamFS.
+pub fn node_count() -> usize {
+    unsafe {
+        SYNCABLE_FS.map(|fs| fs.node_count()).unwrap_or(0)
+    }
 }
 
 use alloc::string::String;

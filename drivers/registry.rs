@@ -76,40 +76,31 @@ pub fn mark_detached(slot: usize) {
     }
 }
 
-/// Try to initialize a driver with fault isolation.
-/// Wraps the init closure in `catch_unwind`. If the closure panics,
-/// the driver is marked Failed and the kernel continues.
+/// Initialize a driver and record the outcome in the registry.
 ///
-/// Returns `true` if init succeeded, `false` if it failed or panicked.
+/// Returns `true` if init succeeded, `false` if it reported failure.
 pub fn try_init_driver(name: &'static str, init_fn: fn() -> bool) -> bool {
     let slot = register(name);
     if slot >= MAX_DRIVERS { return false; }
 
-    crate::arch::x86_64::serial::write_str("[DRV] Initializing: ");
+    crate::arch::x86_64::serial::write_str("[DRV] ");
     crate::arch::x86_64::serial::write_str(name);
-    crate::arch::x86_64::serial::write_str("\r\n");
+    crate::arch::x86_64::serial::write_str(": probing\r\n");
 
-    // Use catch_unwind for panic isolation.
-    // SAFETY: This is a bare-metal kernel; we configure panic=unwind
-    // in the target JSON to enable this. If panic=abort is used,
-    // catch_unwind becomes a no-op and panics still crash.
-    // For now, we wrap in a simple call with manual panic flag.
-    let result = {
-        // Mark as attempting init
-        let success = init_fn();
-        success
-    };
+    // No unwinding in the kernel (panic=abort): a panicking driver still takes
+    // the kernel down. The registry only records whether init reported success.
+    let result = init_fn();
 
     if result {
         mark_active(slot);
         crate::arch::x86_64::serial::write_str("[DRV] ");
         crate::arch::x86_64::serial::write_str(name);
-        crate::arch::x86_64::serial::write_str(": Active\r\n");
+        crate::arch::x86_64::serial::write_str(": active\r\n");
     } else {
         mark_failed(slot);
-        crate::arch::x86_64::serial::write_str("[WARN] Driver ");
+        crate::arch::x86_64::serial::write_str("[DRV] ");
         crate::arch::x86_64::serial::write_str(name);
-        crate::arch::x86_64::serial::write_str(" failed to init\r\n");
+        crate::arch::x86_64::serial::write_str(": not available\r\n");
     }
     result
 }

@@ -1,0 +1,11 @@
+[build]
+target = "x86_64-unknown-oos.json"
+
+[target.x86_64-unknown-oos]
+# rustc runs from the workspace root, so the script path is relative to user/.
+rustflags = ["-C", "link-arg=-Tlink.ld"]
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true

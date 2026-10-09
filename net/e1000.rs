@@ -540,8 +540,8 @@ pub fn is_initialized() -> bool {
 pub fn send_packet(data: &[u8], len: usize) {
     if !is_initialized() || len == 0 || len > 1514 { return; }
 
-    // ─── TX Trace ───────────────────────────────────────────────────────────
-    {
+    // ─── TX Trace (only when net tracing is enabled) ──────────────────────
+    if super::trace() {
         let s = crate::arch::x86_64::serial::write_str;
         s("[NET] TX: size=");
         serial_dec(len as u64);
@@ -645,8 +645,8 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
             copy_len,
         );
 
-        // ─── RX Trace ─────────────────────────────────────────────────────
-        {
+        // ─── RX Trace (only when net tracing is enabled) ──────────────────
+        if super::trace() {
             let s = crate::arch::x86_64::serial::write_str;
             let et = if copy_len >= 14 {
                 u16::from_be_bytes([PACKET_OUT[12], PACKET_OUT[13]])
@@ -699,6 +699,7 @@ pub fn handle_irq() {
     if is_initialized() {
         let icr = read_reg(REG_ICR); // reading clears interrupts
         if icr == 0 { return; } // spurious
+        if !super::trace() { return; }
         let s = crate::arch::x86_64::serial::write_str;
         s("[e1000] IRQ ICR=0x");
         serial_hex32(icr);

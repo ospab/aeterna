@@ -7,14 +7,13 @@
  * run_lsblk(args)   — list all block devices including NVMe
  * run_mkfs(args)    — format a partition with AeternaFS
  *
- * All output goes to the framebuffer via framebuffer::draw_string().
+ * All output goes through plum::io (stdout/stderr can be piped or redirected).
  */
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
-use crate::arch::x86_64::framebuffer;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
@@ -24,24 +23,24 @@ const FG_HL: u32  = 0x00FFCC00;
 const FG_DIR: u32 = 0x005555FF;
 const BG: u32     = 0x00000000;
 
-fn puts(s: &str)  { framebuffer::draw_string(s, FG, BG); }
-fn ok(s: &str)    { framebuffer::draw_string(s, FG_OK, BG); }
-fn err(s: &str)   { framebuffer::draw_string(s, FG_ERR, BG); }
-fn dim(s: &str)   { framebuffer::draw_string(s, FG_DIM, BG); }
-fn hl(s: &str)    { framebuffer::draw_string(s, FG_HL, BG); }
+fn puts(s: &str)  { crate::userspace::plum::io::out_c(s, FG); }
+fn ok(s: &str)    { crate::userspace::plum::io::out_c(s, FG_OK); }
+fn err(s: &str)   { crate::userspace::plum::io::err(s); }
+fn dim(s: &str)   { crate::userspace::plum::io::out_c(s, FG_DIM); }
+fn hl(s: &str)    { crate::userspace::plum::io::out_c(s, FG_HL); }
 
 fn put_u64(mut n: u64) {
     if n == 0 { puts("0"); return; }
     let mut buf = [0u8; 20]; let mut i = 0;
     while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    for j in (0..i).rev() { framebuffer::draw_char(buf[j] as char, FG, BG); }
+    for j in (0..i).rev() { { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c((buf[j] as char).encode_utf8(&mut cb), FG); }; }
 }
 
 fn put_u64_col(mut n: u64, col: u32) {
-    if n == 0 { framebuffer::draw_char('0', col, BG); return; }
+    if n == 0 { { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c(('0').encode_utf8(&mut cb), col); }; return; }
     let mut buf = [0u8; 20]; let mut i = 0;
     while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    for j in (0..i).rev() { framebuffer::draw_char(buf[j] as char, col, BG); }
+    for j in (0..i).rev() { { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c((buf[j] as char).encode_utf8(&mut cb), col); }; }
 }
 
 fn put_size_mib(mib: u64) {
@@ -200,6 +199,10 @@ pub fn run_fdisk(args: &str) {
 
 /// Extended `lsblk` with NVMe support.
 pub fn run_lsblk(_args: &str) {
+    if !crate::drivers::nvme::is_initialized() && crate::drivers::disk_count() == 0 {
+        puts("lsblk: no block devices found\n");
+        return;
+    }
     puts("NAME           TYPE    SIZE       RO  MODEL\n");
     dim("──────────────────────────────────────────────────────────\n");
 

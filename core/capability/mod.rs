@@ -1,8 +1,6 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-Distributed under the Boost Software License, Version 1.1.
-See LICENSE or https://www.boost.org/LICENSE_1_0.txt for details.
 
 Capability-based security for AETERNA microkernel.
 Processes request capability tokens instead of running as root.
@@ -284,32 +282,3 @@ fn serial_dec(mut val: u64) {
     for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
 }
 
-// ─── Required-capability manifest helper ─────────────────────────────────────
-
-/// Declare the capability manifest for a module at compile time.
-/// Call from module init / top of main; returns a struct holding all tokens.
-///
-/// Example:
-/// ```rust
-/// let caps = AaiCaps::acquire();
-/// cmd_load("/models/foo.tmt-ai", &caps.fs_read);
-/// ```
-pub struct AaiCaps {
-    pub fs_read:  CapabilityToken,   // read /models/*, /doom/*
-    pub framebuf: CapabilityToken,   // draw inference output
-    pub serial:   CapabilityToken,   // log to COM1
-    pub mem_huge: CapabilityToken,   // mmap huge-page weight buffers
-}
-
-impl AaiCaps {
-    /// Acquire all capabilities required by the aai utility.
-    /// Kernel will deny unauthorised tasks at spawn time.
-    pub fn acquire() -> Self {
-        AaiCaps {
-            fs_read:  CapFsRead::grant("/models"),
-            framebuf: CapFramebuf::grant(),
-            serial:   CapSerial::grant(),
-            mem_huge: CapMemHuge::grant(),
-        }
-    }
-}

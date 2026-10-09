@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 grape — Terminal text editor for ospab.os (AETERNA)
@@ -77,6 +77,8 @@ struct EditorState {
     search_query: String,
     /// Should the editor exit?
     quit: bool,
+    /// Ctrl+X was pressed once on a modified buffer
+    quit_armed: bool,
 }
 
 // ─── Colors ─────────────────────────────────────────────────────────────────
@@ -151,6 +153,7 @@ pub fn edit(path: &str) {
         cut_buffer: Vec::new(),
         search_query: String::new(),
         quit: false,
+        quit_armed: false,
     };
 
     // Load file from VFS if it exists
@@ -173,7 +176,15 @@ pub fn edit(path: &str) {
     loop {
         refresh_screen(&state);
         let key = wait_key();
+        let was_armed = state.quit_armed;
         process_key(&mut state, key);
+        if was_armed && key != '' {
+            state.quit_armed = false;
+        }
+        // keep the view consistent after any edit (prevents the cursor
+        // row/column arithmetic below from underflowing)
+        clamp_cx(&mut state);
+        clamp_scroll(&mut state);
         if state.quit {
             break;
         }
@@ -201,9 +212,9 @@ fn process_key(state: &mut EditorState, key: char) {
     match key {
         // ── Ctrl+X: Exit ──
         '\x18' => {
-            if state.dirty {
-                state.status_msg = String::from("Modified buffer! Ctrl+X again to discard, Ctrl+O to save");
-                state.dirty = false; // Allow second Ctrl+X to quit
+            if state.dirty && !state.quit_armed {
+                state.status_msg = String::from("Modified buffer! Ctrl+X again to discard changes, Ctrl+O to save");
+                state.quit_armed = true;
                 return;
             }
             state.quit = true;
@@ -245,6 +256,7 @@ fn process_key(state: &mut EditorState, key: char) {
             if !state.cut_buffer.is_empty() {
                 let line = Line::from_bytes(&state.cut_buffer);
                 state.lines.insert(state.cy, line);
+                state.cy += 1;
                 state.dirty = true;
             }
         }
@@ -512,12 +524,16 @@ fn save_file(state: &mut EditorState) {
         }
     }
 
+    // Relative names typed at the save prompt are relative to the shell's cwd
+    if !state.filename.starts_with('/') {
+        state.filename = crate::userspace::plum::resolve_path(&state.filename);
+    }
     let path = state.filename.as_str();
-    // Ensure parent directory exists
+    // The parent directory must exist (like nano: no implicit mkdir -p)
     if let Some(last_slash) = path.rfind('/') {
-        if last_slash > 0 {
-            let parent = &path[..last_slash];
-            crate::fs::mkdir(parent);
+        if last_slash > 0 && !crate::fs::exists(&path[..last_slash]) {
+            state.status_msg = String::from("[ Error: directory does not exist ]");
+            return;
         }
     }
 
@@ -652,7 +668,7 @@ fn draw_title_bar(state: &EditorState, cols: usize) {
 
     if state.dirty {
         let offset = 10 + if state.filename.is_empty() { 12 } else { state.filename.len() };
-        draw_str_at(offset + 1, 0, "[Modified]", 0x0000FFFF, BG_TITLE);
+        draw_str_at(offset + 1, 0, "[Modified]", 0x00FFFF00, BG_TITLE);
     }
 
     // Right side: line count

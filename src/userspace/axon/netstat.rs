@@ -8,7 +8,6 @@
 extern crate alloc;
 use alloc::format;
 
-use crate::arch::x86_64::framebuffer;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
@@ -17,17 +16,17 @@ const FG_DIM: u32 = 0x00AAAAAA;
 const FG_HL: u32  = 0x00FFCC00;
 const BG: u32     = 0x00000000;
 
-fn puts(s: &str) { framebuffer::draw_string(s, FG, BG); }
-fn ok(s: &str)   { framebuffer::draw_string(s, FG_OK, BG); }
-fn err(s: &str)  { framebuffer::draw_string(s, FG_ERR, BG); }
-fn dim(s: &str)  { framebuffer::draw_string(s, FG_DIM, BG); }
-fn hl(s: &str)   { framebuffer::draw_string(s, FG_HL, BG); }
+fn puts(s: &str) { crate::userspace::plum::io::out_c(s, FG); }
+fn ok(s: &str)   { crate::userspace::plum::io::out_c(s, FG_OK); }
+fn err(s: &str)  { crate::userspace::plum::io::err(s); }
+fn dim(s: &str)  { crate::userspace::plum::io::out_c(s, FG_DIM); }
+fn hl(s: &str)   { crate::userspace::plum::io::out_c(s, FG_HL); }
 
 fn draw_mac(mac: &[u8; 6], color: u32) {
     let hex = b"0123456789abcdef";
     for i in 0..6 {
-        framebuffer::draw_char(hex[(mac[i] >> 4) as usize] as char, color, BG);
-        framebuffer::draw_char(hex[(mac[i] & 0xF) as usize] as char, color, BG);
+        { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c((hex[(mac[i] >> 4) as usize] as char).encode_utf8(&mut cb), color); };
+        { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c((hex[(mac[i] & 0xF) as usize] as char).encode_utf8(&mut cb), color); };
         if i < 5 { puts(":"); }
     }
 }

@@ -52,7 +52,7 @@ pub fn is_local(ip: [u8; 4]) -> bool {
 /// protocol: IP protocol number, dst_ip: destination, payload: data above IP, ttl: time-to-live
 pub fn send_ipv4_ttl(protocol: u8, dst_ip: [u8; 4], payload: &[u8], ttl: u8) {
     let total_len = 20 + payload.len();
-    if total_len > 1480 { return; }
+    if total_len > 1500 { return; }
 
     let mut pkt = [0u8; 1500];
 

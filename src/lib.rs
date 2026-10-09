@@ -1,8 +1,6 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-Distributed under the Boost Software License, Version 1.1.
-See LICENSE or https://www.boost.org/LICENSE_1_0.txt for details.
 */
 #![no_std]
 // In a bare-metal kernel we intentionally access mutable statics directly;
@@ -25,6 +23,9 @@ pub mod core;
 
 // Kernel event log — used by panic handler and terminal
 pub mod klog;
+
+// System wall clock (ns since 2012-08-09 UTC)
+pub mod time;
 
 // Network and Storage moved to userspace (microkernel separation)
 
@@ -53,13 +54,7 @@ pub use userspace::plum;
 pub mod doom;
 
 // AETERNA AI Model (AAM) - minimal transformer + tokenizer
-#[path = "../aam/mod.rs"]
-pub mod aam;
-
 // ─── ANE — Aeterna Neural Engine (no_std PyTorch replacement) ───────────────
-#[path = "../lib/ane/mod.rs"]
-pub mod ane;
-
 // bench — System Latency Tax benchmark (RDTSC FMA workload)
 pub mod bench;
 

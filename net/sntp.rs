@@ -17,7 +17,7 @@
  * API:
  *   sync_system_time()          — try NTP_FALLBACKS list, update global state
  *   sync_time([ip;4])           — sync against specific server
- *   unix_time()                 — current Unix timestamp (0 = never synced)
+ *   unix_time()                 — current Unix timestamp (from crate::time)
  *   local_time()                — unix_time() + timezone offset
  *   format_datetime(ts, buf)    — "YYYY-MM-DD HH:MM:SS UTC"
  *   format_datetime_with_tz(…)  — includes timezone suffix
@@ -28,9 +28,6 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 
 // ─── Global state ────────────────────────────────────────────────────────────
 
-static mut SYNCED_UNIX_TIME: u64  = 0;
-static mut SYNCED_AT_TICK:   u64  = 0;
-static mut TIME_SYNCED:      bool = false;
 /// UTC offset in seconds for display.  Populated lazily from /etc/timezone.
 static mut TZ_OFFSET_SECS:   i64  = 0;
 static mut TZ_LOADED:        bool = false;
@@ -63,17 +60,11 @@ impl SntpError {
 
 // ─── Public accessors ────────────────────────────────────────────────────────
 
-pub fn is_synced() -> bool { unsafe { TIME_SYNCED } }
+pub fn is_synced() -> bool { crate::time::source() == crate::time::Source::Ntp }
 
-/// Current estimated Unix timestamp; advances by elapsed ticks since last sync.
-/// Returns 0 if `sync_time` / `sync_system_time` has never succeeded.
+/// Current Unix timestamp from the system clock (RTC-seeded, NTP-corrected).
 pub fn unix_time() -> u64 {
-    unsafe {
-        if !TIME_SYNCED { return 0; }
-        let elapsed = crate::arch::x86_64::idt::timer_ticks()
-            .wrapping_sub(SYNCED_AT_TICK) / 100;      // 100 Hz → seconds
-        SYNCED_UNIX_TIME.saturating_add(elapsed)
-    }
+    crate::time::unix_secs().max(0) as u64
 }
 
 /// `unix_time()` with the timezone offset from /etc/timezone applied.
@@ -153,7 +144,9 @@ pub fn parse_ntp_response(response: &[u8]) -> Result<u64, SntpError> {
         response[40], response[41], response[42], response[43],
     ]) as u64;
 
-    if ntp_sec < NTP_EPOCH_OFFSET { return Err(SntpError::InvalidTimestamp); }
+    // The 32-bit seconds field wraps on 2036-02-07 (NTP era 1). A value in the lower
+    // half can only be era 1 for any clock we will see (era 0 would mean before 1968).
+    let ntp_sec = if ntp_sec < 0x8000_0000 { ntp_sec + (1u64 << 32) } else { ntp_sec };
 
     Ok(ntp_sec - NTP_EPOCH_OFFSET)
 }
@@ -184,12 +177,10 @@ pub fn sync_time(server_ip: [u8; 4]) -> Result<u64, SntpError> {
     let resp = super::udp::wait_rx(300).ok_or(SntpError::Timeout)?;
     let ts   = parse_ntp_response(resp)?;
 
-    unsafe {
-        SYNCED_UNIX_TIME = ts;
-        SYNCED_AT_TICK   = crate::arch::x86_64::idt::timer_ticks();
-        TIME_SYNCED      = true;
-        TZ_LOADED        = false; // re-read timezone on next query
-    }
+    let frac  = u32::from_be_bytes([resp[44], resp[45], resp[46], resp[47]]);
+    let nanos = ((frac as u64 * 1_000_000_000) >> 32) as u32;
+    crate::time::set(crate::time::from_unix(ts as i64, nanos), crate::time::Source::Ntp);
+    unsafe { TZ_LOADED = false; } // re-read timezone on next query
     let _ = read_timezone_offset();
     Ok(ts)
 }
@@ -312,8 +303,8 @@ mod tests {
         let mut p = server_pkt(2_208_989_800); p[1] = 0;
         assert_eq!(parse_ntp_response(&p), Err(SntpError::InvalidResponse));
     }
-    #[test] fn ntp_pre_epoch_rejected() {
-        assert_eq!(parse_ntp_response(&server_pkt(100)), Err(SntpError::InvalidTimestamp));
+    #[test] fn ntp_era1_after_2036() {
+        assert_eq!(parse_ntp_response(&server_pkt(100)), Ok((1u64 << 32) + 100 - NTP_EPOCH_OFFSET));
     }
 
     // ── parse_timezone_offset ───────────────────────────────────────────────

@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 Disk persistence for AETERNA's RamFS.
@@ -103,6 +103,47 @@ fn select_disk() -> Option<(usize, crate::drivers::DiskKind, usize)> {
 /// Expose the chosen disk index for boot-time inspection
 pub fn primary_disk_index() -> Option<usize> {
     select_disk().map(|(g, _, _)| g)
+}
+
+/// GPT type GUID the installer gives the AETERNA root partition
+/// (0FC63DAF-8483-4772-8E79-3D69D8477DE4, mixed-endian on disk).
+const ROOT_TYPE_GUID: [u8; 16] = [0xAF,0x3D,0xC6,0x0F,0x83,0x84,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4];
+
+/// Sectors skipped at the start of the AETERNA root partition
+/// (sector 0 holds the installer's identity record).
+const ROOT_SKIP: u64 = 8;
+
+/// First LBA of the persistence blob on disk `global_idx`.
+///
+/// * No GPT (blank or raw disk): LBA 2048, as before.
+/// * GPT with an "AETERNA" root partition (written by `install`): inside that
+///   partition, so the blob never lands on the ESP's FAT32 boot sector —
+///   which also sits at LBA 2048 and would make the disk unbootable.
+/// * Any other GPT disk: None — persistence is disabled rather than
+///   overwriting someone else's partition.
+pub fn base_lba(global_idx: usize) -> Option<u64> {
+    let mut hdr = [0u8; 512];
+    if !crate::drivers::read(global_idx, 1, 1, &mut hdr) { return None; }
+    if &hdr[0..8] != b"EFI PART" { return Some(LBA_BASE); }
+    let ent_lba = u64::from_le_bytes(hdr[72..80].try_into().ok()?);
+    let n_ent   = u32::from_le_bytes(hdr[80..84].try_into().ok()?).min(128) as u64;
+    let ent_sz  = u32::from_le_bytes(hdr[84..88].try_into().ok()?) as u64;
+    if ent_sz != 128 { return None; }
+    let mut sec = [0u8; 512];
+    for i in 0..n_ent {
+        if i % 4 == 0 && !crate::drivers::read(global_idx, ent_lba + i / 4, 1, &mut sec) { return None; }
+        let o = (i % 4) as usize * 128;
+        let e = &sec[o..o + 128];
+        if e[0..16] != ROOT_TYPE_GUID { continue; }
+        // Partition name (UTF-16LE) must start with "AETERNA"
+        let named = b"AETERNA".iter().enumerate().all(|(k, &c)| e[56 + k * 2] == c && e[57 + k * 2] == 0);
+        if !named { continue; }
+        let start = u64::from_le_bytes(e[32..40].try_into().ok()?);
+        let end   = u64::from_le_bytes(e[40..48].try_into().ok()?);
+        if end > start + ROOT_SKIP + (MAX_FS_BYTES / 512) as u64 { return Some(start + ROOT_SKIP); }
+        return None;
+    }
+    None
 }
 
 // ─── Serialization ───────────────────────────────────────────────────────────
@@ -270,15 +311,16 @@ pub fn deserialize_ramfs(buf: &[u8]) -> Option<BTreeMap<String, RamNode>> {
 /// Returns true on success.
 pub fn write_to_disk(data: *const u8, total_bytes: usize, sector_count: u32, buffer_phys: u64) -> bool {
     let (global_idx, kind, per_kind_idx) = match select_disk() { Some(t) => t, None => return false };
+    let base = match base_lba(global_idx) { Some(b) => b, None => return false };
 
     match kind {
         crate::drivers::DiskKind::Ahci => {
-            return crate::drivers::ahci::dma_write(per_kind_idx, LBA_BASE, sector_count, buffer_phys);
+            return crate::drivers::ahci::dma_write(per_kind_idx, base, sector_count, buffer_phys);
         }
         crate::drivers::DiskKind::Ata => {
             // Fallback: copy through existing ATA path via unified driver
             let slice = unsafe { core::slice::from_raw_parts(data, total_bytes) };
-            return crate::drivers::write(global_idx, LBA_BASE, sector_count, slice);
+            return crate::drivers::write(global_idx, base, sector_count, slice);
         }
     }
 }
@@ -290,10 +332,11 @@ pub fn write_to_disk(data: *const u8, total_bytes: usize, sector_count: u32, buf
 ///   3. Read remaining sectors in 128-sector batches (ATA-safe).
 pub fn read_from_disk() -> Option<Vec<u8>> {
     let (global_idx, _kind, _per_kind_idx) = select_disk()?;
+    let base = base_lba(global_idx)?;
 
     // Step 1: read header sector
     let mut hdr = [0u8; 512];
-    if !crate::drivers::read(global_idx, LBA_BASE, 1, &mut hdr) {
+    if !crate::drivers::read(global_idx, base, 1, &mut hdr) {
         crate::arch::x86_64::serial::write_str("[FS] read header sector failed\r\n");
         return None;
     }
@@ -313,7 +356,9 @@ pub fn read_from_disk() -> Option<Vec<u8>> {
 
     crate::arch::x86_64::serial::write_str("[FS] reading ");
     serial_dec(sector_count as u64);
-    crate::arch::x86_64::serial::write_str(" sectors from LBA 2048\r\n");
+    crate::arch::x86_64::serial::write_str(" sectors from LBA ");
+    serial_dec(base);
+    crate::arch::x86_64::serial::write_str("\r\n");
 
     // Step 2: allocate full buffer
     let total = sector_count as usize * 512;
@@ -326,7 +371,7 @@ pub fn read_from_disk() -> Option<Vec<u8>> {
         let batch = (sector_count - done).min(BATCH);
         let off = done as usize * 512;
         let end = off + batch as usize * 512;
-        if !crate::drivers::read(global_idx, LBA_BASE + done as u64, batch, &mut buf[off..end]) {
+        if !crate::drivers::read(global_idx, base + done as u64, batch, &mut buf[off..end]) {
             crate::arch::x86_64::serial::write_str("[FS] batch read failed at sector ");
             serial_dec(done as u64);
             crate::arch::x86_64::serial::write_str("\r\n");
@@ -345,21 +390,18 @@ fn serial_dec(mut v: u64) {
     for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
 }
 
-// ─── High-level sync ──────────────────────────────────────────────────────────
-
 /// Mark the filesystem dirty and record the current tick.
 /// Called once per write mutation from ramfs — never blocks.
 #[inline]
-pub fn mark_dirty() {
-    super::ramfs::IS_DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
+pub fn mark_dirty_at_tick() {
     let t = crate::arch::x86_64::idt::timer_ticks();
     LAST_DIRTY_TICK.store(t, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Returns true if the RamFS has unflushed changes.
+/// Returns true if the designated syncable RamFS has unflushed changes.
 #[inline]
 pub fn is_dirty() -> bool {
-    super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed)
+    super::is_syncable_dirty()
 }
 
 /// Deferred write-back — call from the terminal idle loop (each HLT iteration).
@@ -367,7 +409,7 @@ pub fn is_dirty() -> bool {
 /// This makes saves instantaneous (RAM write) while the disk flush happens silently
 /// in the background without blocking gameplay or the terminal.
 pub fn deferred_tick() {
-    if !super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+    if !super::is_syncable_dirty() {
         return;
     }
     let now  = crate::arch::x86_64::idt::timer_ticks();
@@ -390,8 +432,19 @@ struct MedToken {
 /// Returns true if written successfully.
 pub fn sync_filesystem() -> bool {
     // Fast-path: nothing has changed since last flush.
-    if !super::ramfs::IS_DIRTY.load(core::sync::atomic::Ordering::Relaxed) {
+    if !super::is_syncable_dirty() {
         return true;
+    }
+
+    // No persistence disk: say so once and stop the deferred retries until
+    // the next mutation (each mutation re-arms LAST_DIRTY_TICK).
+    static NO_DISK_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if select_disk().is_none() {
+        if !NO_DISK_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::arch::x86_64::serial::write_str("[FS] no persistence disk: filesystem changes stay in RAM only\r\n");
+        }
+        LAST_DIRTY_TICK.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+        return false;
     }
 
     let tree = match super::get_tree_copy() {
@@ -408,17 +461,15 @@ pub fn sync_filesystem() -> bool {
     let frames_needed = ((total_bytes + 4095) / 4096) as u64;
 
     // Deterministic Memory Fabric: allocate/retain a dedicated MED token for serialization.
-    // NOTE — intentional physical-frame retention: when the RamFS grows beyond the current
-    // buffer capacity, new frames are allocated and the previous token is replaced.  The old
-    // frames are NOT freed (the bump PMM has no free path).  This is acceptable because:
-    //   (a) RamFS rarely shrinks back after growth, so re-growth is unlikely.
-    //   (b) Each growth step wastes only ≤8 MiB (MAX_FS_BYTES) of physical frames.
-    //   (c) A proper slab allocator is planned for Phase 9+.
     static mut MED_BUF: Option<MedToken> = None;
     let med = unsafe {
         match &MED_BUF {
             Some(tok) if tok.capacity >= total_bytes => MedToken { phys: tok.phys, virt: tok.virt, capacity: tok.capacity },
             _ => {
+                // Growing: give the old buffer back before taking a bigger one.
+                if let Some(old) = MED_BUF.take() {
+                    crate::mm::physical::free_frames(old.phys, (old.capacity / 4096) as u64);
+                }
                 if let Some(p) = crate::mm::physical::alloc_frames(frames_needed) {
                     let cap = (frames_needed as usize) * 4096;
                     let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);
@@ -451,25 +502,34 @@ pub fn sync_filesystem() -> bool {
     }
 
     if !write_to_disk(med.virt, total_bytes, sectors_needed as u32, med.phys) {
-        crate::arch::x86_64::serial::write_str("[FS] write_to_disk failed\r\n");
+        // Back off: retry only after another DEFERRED_SYNC_TICKS, and keep the
+        // serial log short.
+        static FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            crate::arch::x86_64::serial::write_str("[FS] write_to_disk failed (will retry later)\r\n");
+        }
+        LAST_DIRTY_TICK.store(crate::arch::x86_64::idt::timer_ticks(), core::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
     // Read-back verification: AHCI read of superblock must match magic
     let mut verify = [0u8; 512];
     let (global_idx, kind, per_kind_idx) = match select_disk() { Some(t) => t, None => return false };
+    let base = match base_lba(global_idx) { Some(b) => b, None => return false };
     let read_ok = match kind {
-        crate::drivers::DiskKind::Ahci => crate::drivers::ahci::read_sectors(per_kind_idx, LBA_BASE, 1, &mut verify),
-        crate::drivers::DiskKind::Ata => crate::drivers::read(global_idx, LBA_BASE, 1, &mut verify),
+        crate::drivers::DiskKind::Ahci => crate::drivers::ahci::read_sectors(per_kind_idx, base, 1, &mut verify),
+        crate::drivers::DiskKind::Ata => crate::drivers::read(global_idx, base, 1, &mut verify),
     };
     if !read_ok || verify.len() < 8 || u64::from_le_bytes(verify[0..8].try_into().unwrap_or_default()) != SUPER_MAGIC {
         crate::arch::x86_64::serial::write_str("[FS] write verification failed — superblock magic mismatch\r\n");
+        LAST_DIRTY_TICK.store(crate::arch::x86_64::idt::timer_ticks(), core::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
     // Mark filesystem clean — reset sentinel so deferred_tick won't fire again until next mutation.
     LAST_DIRTY_TICK.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
-    super::ramfs::IS_DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
+    super::clear_syncable_dirty();
     // Record the snapshot size so df can report real disk usage.
     LAST_SNAPSHOT_BYTES.store(total_bytes, core::sync::atomic::Ordering::Relaxed);
 

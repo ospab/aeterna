@@ -20,13 +20,26 @@ fn main() {
     let lib = Path::new(&manifest).join("target/doom/libdoom.a");
     if lib.exists() {
         println!("cargo:rustc-cfg=doom_supported");
-        // Note: RUSTFLAGS in build.sh already passes -l static=doom -L target/doom
-        // We set the cfg so Rust code can conditionally compile DOOM FFI.
+        // Link only into the kernel crate (RUSTFLAGS would also hit core/alloc under build-std).
+        println!("cargo:rustc-link-search=native={}", lib.parent().unwrap().display());
+        println!("cargo:rustc-link-lib=static=doom");
     }
+    // Relink the kernel whenever the DOOM C library is rebuilt.
+    println!("cargo:rerun-if-changed=target/doom/libdoom.a");
+
+    // First user program (built by build.sh from user/): embedded until the kernel
+    // can load programs from the filesystem.
+    let hello = Path::new(&manifest).join("user/target/x86_64-unknown-oos/release/hello");
+    if hello.exists() {
+        println!("cargo:rustc-cfg=user_hello");
+        println!("cargo:rustc-env=OOS_USER_HELLO={}", hello.display());
+    }
+    println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/hello");
 
     // Declare custom cfg names so rustc doesn't warn about unexpected_cfgs
     println!("cargo::rustc-check-cfg=cfg(doom_wad_present)");
     println!("cargo::rustc-check-cfg=cfg(doom_supported)");
+    println!("cargo::rustc-check-cfg=cfg(user_hello)");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=target/doom/libdoom.a");

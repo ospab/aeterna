@@ -135,8 +135,8 @@ pub fn handle_icmp(data: &[u8], src_ip: [u8; 4], ttl: u8) {
 /// Linux default: payload_size = 56 → total ICMP = 64 → IP packet = 84 bytes.
 pub fn send_ping_sized(dst_ip: [u8; 4], seq: u16, payload_size: usize) {
     // Cap to prevent overflowing the 1500-byte Ethernet MTU
-    // IP header = 20, ICMP header = 8 → max payload = 1500 - 14 (eth) - 20 - 8 = 1458
-    let payload_size = payload_size.min(1458);
+    // IP MTU 1500: IP header 20 + ICMP header 8 → max payload 1472 (no fragmentation)
+    let payload_size = payload_size.min(1472);
     let icmp_len = 8 + payload_size;
 
     let mut pkt = [0u8; 1480];

@@ -1,5 +1,5 @@
-﻿/*
-Business Source License 1.1
+/*
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Interrupt Descriptor Table (IDT) and exception handlers for AETERNA microkernel.
 Rewritten for proper PIC support and diagnostic output (tech-manifest п.4, п.8).
@@ -148,6 +148,10 @@ macro_rules! exception_no_error {
         pub extern "C" fn $name() {
             naked_asm!(
                 "push 0",         // fake error code for uniform stack layout
+                "test qword ptr [rsp + 16], 3", // came from ring 3? (CS RPL)
+                "jz 7f",
+                "swapgs",               // ... then switch to the kernel GS base
+                "7:",
                 "push rax",
                 "push rbx",
                 "push rcx",
@@ -182,6 +186,10 @@ macro_rules! exception_no_error {
                 "pop rbx",
                 "pop rax",
                 "add rsp, 8",    // skip error code
+                "test qword ptr [rsp + 8], 3",  // returning to ring 3 (possibly another task)?
+                "jz 8f",
+                "swapgs",               // ... then restore the user GS base
+                "8:",
                 "iretq",
                 const $vector,
                 sym exception_dispatch,
@@ -197,6 +205,10 @@ macro_rules! exception_with_error {
         pub extern "C" fn $name() {
             naked_asm!(
                 // error code already on stack from CPU
+                "test qword ptr [rsp + 16], 3", // came from ring 3? (CS RPL)
+                "jz 7f",
+                "swapgs",
+                "7:",
                 "push rax",
                 "push rbx",
                 "push rcx",
@@ -231,6 +243,10 @@ macro_rules! exception_with_error {
                 "pop rbx",
                 "pop rax",
                 "add rsp, 8",   // skip error code
+                "test qword ptr [rsp + 8], 3",  // returning to ring 3 (possibly another task)?
+                "jz 8f",
+                "swapgs",               // ... then restore the user GS base
+                "8:",
                 "iretq",
                 const $vector,
                 sym exception_dispatch,
@@ -248,6 +264,10 @@ macro_rules! irq_handler {
         pub extern "C" fn $name() {
             naked_asm!(
                 "push 0",
+                "test qword ptr [rsp + 16], 3", // came from ring 3? (CS RPL)
+                "jz 7f",
+                "swapgs",               // ... then switch to the kernel GS base
+                "7:",
                 "push rax",
                 "push rbx",
                 "push rcx",
@@ -271,6 +291,7 @@ macro_rules! irq_handler {
                 "fxsave [rsp]",
                 "mov rdi, rbp",        // saved_state = GPR save area
                 "mov rsi, {}",
+                "mov rdx, rsp",        // fx_area = FPU/SSE save area
                 "call {}",
                 // ── Restore FPU/SSE state ──
                 "fxrstor [rsp]",
@@ -291,6 +312,10 @@ macro_rules! irq_handler {
                 "pop rbx",
                 "pop rax",
                 "add rsp, 8",
+                "test qword ptr [rsp + 8], 3",  // returning to ring 3 (possibly another task)?
+                "jz 8f",
+                "swapgs",               // ... then restore the user GS base
+                "8:",
                 "iretq",
                 const $irq,
                 sym irq_dispatch,
@@ -341,6 +366,10 @@ irq_handler!(irq_cascade, 2u64);
 pub extern "C" fn apic_timer_isr() {
     naked_asm!(
         "push 0",
+        "test qword ptr [rsp + 16], 3", // came from ring 3? (CS RPL)
+        "jz 7f",
+        "swapgs",               // ... then switch to the kernel GS base
+        "7:",
         "push rax",
         "push rbx",
         "push rcx",
@@ -362,6 +391,7 @@ pub extern "C" fn apic_timer_isr() {
         "and rsp, -16",        // 16-byte align for fxsave
         "fxsave [rsp]",
         "mov rdi, rbp",        // saved_state = GPR save area
+        "mov rsi, rsp",        // fx_area = FPU/SSE save area
         "call {}",
         // ── Restore FPU/SSE state ──
         "fxrstor [rsp]",
@@ -382,6 +412,10 @@ pub extern "C" fn apic_timer_isr() {
         "pop rbx",
         "pop rax",
         "add rsp, 8",
+        "test qword ptr [rsp + 8], 3",  // returning to ring 3 (possibly another task)?
+        "jz 8f",
+        "swapgs",               // ... then restore the user GS base
+        "8:",
         "iretq",
         sym apic_timer_dispatch,
     );
@@ -389,7 +423,7 @@ pub extern "C" fn apic_timer_isr() {
 
 /// Dispatcher called from `apic_timer_isr`.
 /// Re-arms a 1 ms one-shot, drives scheduler preemption, ACKs APIC.
-extern "C" fn apic_timer_dispatch(saved_state: *mut u8) {
+extern "C" fn apic_timer_dispatch(saved_state: *mut u8, fx_area: *mut u8) {
     // ACK the APIC *first* so the CPU can take the next interrupt.
     crate::arch::x86_64::apic::send_eoi();
 
@@ -398,7 +432,7 @@ extern "C" fn apic_timer_dispatch(saved_state: *mut u8) {
     crate::arch::x86_64::apic::one_shot_us(1_000);
 
     // Drive scheduler context switch — same interface as PIT handler.
-    crate::core::scheduler::on_timer_irq(saved_state as *mut u8);
+    crate::core::scheduler::on_timer_irq(saved_state as *mut u8, fx_area);
 }
 irq_handler!(irq_com2, 3u64);
 irq_handler!(irq_com1, 4u64);
@@ -477,6 +511,15 @@ extern "C" fn exception_dispatch(saved_state: *mut u8, vector: u64) {
         fault_rsp  = *base.add(19); // RSP at offset 19
     }
 
+    // Page fault inside copy_from_user/copy_to_user: the user passed a bad pointer.
+    // Resume at the copy routine's fixup label, which reports the failure to the syscall.
+    if vector == 14 && fault_cs & 3 == 0 {
+        if let Some(fixup) = crate::mm::usercopy::fixup_for(fault_rip) {
+            unsafe { *(saved_state as *mut u64).add(16) = fixup };
+            return;
+        }
+    }
+
     // ── Ring-3 process fault: kill process, yield to next ready task ──
     if fault_cs & 3 != 0 {
         let pid = crate::core::scheduler::current_task_id();
@@ -499,11 +542,12 @@ extern "C" fn exception_dispatch(saved_state: *mut u8, vector: u64) {
         serial_hex(fault_addr);
         crate::arch::x86_64::serial::write_str(". Terminating.\r\n");
 
+        crate::arch::x86_64::panic::report_process_fault(pid as u64, name, fault_addr);
         crate::core::scheduler::exit_pid(pid);
 
         // Patch saved_state so iretq resumes the next ready task instead of
         // returning into the now-dead process's faulting instruction.
-        crate::core::scheduler::on_timer_irq(saved_state);
+        crate::core::scheduler::on_timer_irq(saved_state, core::ptr::null_mut());
         return;
     }
 
@@ -526,11 +570,27 @@ extern "C" fn exception_dispatch(saved_state: *mut u8, vector: u64) {
     serial_hex(fault_rsp);
     crate::arch::x86_64::serial::write_str("\r\n");
 
+    let cr2 = if vector == 14 {
+        let v: u64;
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) v, options(nomem, nostack)); }
+        v
+    } else {
+        0
+    };
+    crate::arch::x86_64::panic::record_exception(crate::arch::x86_64::panic::ExceptionInfo {
+        name,
+        vector,
+        error_code,
+        rip: fault_rip,
+        rsp: fault_rsp,
+        cs: fault_cs,
+        cr2,
+    });
     panic!("CPU Exception");
 }
 
 /// IRQ dispatcher - handles hardware interrupts, sends EOI
-extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64) {
+extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
     // ACPI SCI can be routed to any IRQ (FADT.sci_interrupt, typically 9).
     // Handle it first so the power button is processed regardless of which
     // IRQ slot the firmware chose.
@@ -546,14 +606,17 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64) {
             unsafe {
                 TIMER_TICKS += 1;
             }
-            crate::core::scheduler::on_timer_irq(saved_state as *mut u8);
+            // Audio: wipe played ring data / keep DMA alive (try-lock, cheap)
+            crate::drivers::audio::timer_tick();
+            crate::core::scheduler::on_timer_irq(saved_state as *mut u8, fx_area);
         }
         1 => {
             // Keyboard interrupt - read scancode and buffer it
             unsafe {
                 let scancode: u8;
                 asm!("in al, dx", in("dx") 0x60u16, out("al") scancode, options(nomem, nostack));
-                
+                crate::arch::x86_64::keyboard::irq_scancode(scancode); // Ctrl+C flag
+
                 // Store in ring buffer for keyboard driver to pick up
                 let write_idx = KB_BUFFER_WRITE & (KB_BUFFER_SIZE - 1);
                 KB_BUFFER[write_idx] = scancode;
@@ -588,6 +651,10 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64) {
             unsafe {
                 asm!("in al, dx", in("dx") 0x177u16, out("al") _, options(nomem, nostack));
             }
+        }
+        12 => {
+            // PS/2 Mouse
+            crate::arch::x86_64::mouse::handle_irq();
         }
         _ => {
             // Other IRQs - ignore for now
@@ -656,6 +723,7 @@ pub fn kb_irq_read() -> Option<u8> {
 /// Called by the XHCI driver to feed translated scancodes into the same
 /// pipeline used by the PS/2 keyboard IRQ handler.
 pub fn kb_buffer_write(scancode: u8) {
+    crate::arch::x86_64::keyboard::irq_scancode(scancode); // Ctrl+C flag
     unsafe {
         let write_idx = KB_BUFFER_WRITE & (KB_BUFFER_SIZE - 1);
         KB_BUFFER[write_idx] = scancode;
@@ -716,7 +784,7 @@ fn draw_hex_fb(val: u64) {
 // ============================================================================
 
 pub fn init() {
-    crate::arch::x86_64::serial::write_str("[AETERNA] IDT init...\r\n");
+    crate::arch::x86_64::serial::write_str("[CPU] IDT init...\r\n");
     
     static mut IDT: Option<Idt> = None;
     
@@ -776,5 +844,5 @@ pub fn init() {
         idt.load();
     }
     
-    crate::arch::x86_64::serial::write_str("[AETERNA] IDT loaded (exceptions 0-31, IRQ 0-15)\r\n");
+    crate::arch::x86_64::serial::write_str("[CPU] IDT loaded (exceptions 0-31, IRQ 0-15)\r\n");
 }

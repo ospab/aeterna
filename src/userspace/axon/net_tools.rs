@@ -26,10 +26,8 @@ fn dim(s: &str)   { framebuffer::draw_string(s, FG_DIM, BG); }
 fn hl(s: &str)    { framebuffer::draw_string(s, FG_HL, BG); }
 
 fn check_ctrl_c() -> bool {
-    while let Some(ch) = crate::arch::x86_64::keyboard::try_read_key() {
-        if ch == '\x03' { return true; }
-    }
-    false
+    // Ctrl+C is flagged by the keyboard IRQ (shared API; the shell clears it)
+    crate::arch::x86_64::keyboard::interrupt_pending()
 }
 
 fn put_usize(mut n: usize) {
@@ -121,11 +119,40 @@ pub fn cmd_netstat(_args: &str) {
         puts("\n");
     }
     if n == 0 {
-        puts("  Gateway ");
-        puts(&format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]));
-        puts("  ");
-        draw_mac_dim(&gw_mac);
-        puts("\n");
+        dim("  (no fresh entries)\n");
+    }
+    if gw != [0, 0, 0, 0] {
+        puts(&format!("  default gateway {}.{}.{}.{}  ", gw[0], gw[1], gw[2], gw[3]));
+        if gw_mac == [0xFF; 6] {
+            err("unresolved\n");
+        } else {
+            draw_mac_dim(&gw_mac);
+            puts("\n");
+        }
+    }
+
+    // TCP connection table (real entries from the stack)
+    puts("\n");
+    hl("  Active TCP connections:\n");
+    dim("  Proto  Local Address          Foreign Address        State\n");
+    let mut conns = [(net::tcp::TcpState::Closed, 0u16, [0u8; 4], 0u16); 16];
+    let cn = net::tcp::active_connections(&mut conns);
+    for i in 0..cn {
+        let (st, lport, rip, rport) = conns[i];
+        let local = if st == net::tcp::TcpState::Listen {
+            format!("0.0.0.0:{}", lport)
+        } else {
+            format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], lport)
+        };
+        let remote = if st == net::tcp::TcpState::Listen {
+            alloc::string::String::from("0.0.0.0:*")
+        } else {
+            format!("{}.{}.{}.{}:{}", rip[0], rip[1], rip[2], rip[3], rport)
+        };
+        puts(&format!("  tcp    {:<22} {:<22} {}\n", local, remote, st.as_str()));
+    }
+    if cn == 0 {
+        dim("  (none)\n");
     }
 }
 
@@ -276,7 +303,7 @@ pub fn cmd_df(_args: &str) {
     dim("  ---------------------------------------------------------------\n");
 
     // RamFS usage
-    let node_count = crate::fs::ramfs::node_count();
+    let node_count = crate::fs::node_count();
     let ramfs_used_kb = (node_count * 256) / 1024;
     let heap_total_kb = if crate::mm::heap::is_initialized() {
         let (used, free) = crate::mm::heap::stats();
@@ -509,31 +536,44 @@ pub fn cmd_ip_show(args: &str) {
     }
 }
 
+/// Interface name used for the single physical NIC.
+const IFNAME: &str = "eth0";
+
+/// `lo` is real: ipv4::send_ipv4 delivers 127.0.0.0/8 (and our own address)
+/// locally without touching the NIC. It has no packet counters of its own.
+fn show_lo(with_addr: bool) {
+    dim("1: lo: <LOOPBACK,UP> mtu 65536 (software loopback in the IPv4 layer)\n");
+    if with_addr {
+        dim("    inet 127.0.0.1/8 scope host lo\n");
+    }
+}
+
+fn show_eth_header(up: bool) {
+    use crate::net;
+    puts("2: ");
+    hl(IFNAME);
+    puts(": <BROADCAST,MULTICAST");
+    if up { ok(",UP,LOWER_UP"); } else { err(",NO-CARRIER"); }
+    puts("> mtu 1500 state ");
+    if up { ok("UP"); } else { err("DOWN"); }
+    puts("\n");
+    dim("    driver: ");
+    dim(net::nic_model());
+    dim("\n");
+}
+
 fn cmd_ip_show_addr() {
     use crate::net;
     let ip   = unsafe { net::OUR_IP };
     let mask = unsafe { net::SUBNET_MASK };
     let mac  = unsafe { net::OUR_MAC };
-    let nic  = net::nic_name();
     let up   = net::link_up();
     let plen = subnet_prefix_len(mask);
     let brd  = ip_broadcast(ip, mask);
-    let rx_p = net::rx_packets();
-    let tx_p = net::tx_packets();
 
-    // Loopback
-    dim("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
-    dim("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
-    dim("    inet 127.0.0.1/8 scope host lo\n\n");
-
-    // NIC
-    puts("2: ");
-    hl(nic);
-    puts(": <BROADCAST,MULTICAST,");
-    if up { ok("UP,LOWER_UP"); } else { err("NO-CARRIER"); }
-    puts("> mtu 1500 state ");
-    if up { ok("UP"); } else { err("DOWN"); }
+    show_lo(true);
     puts("\n");
+    show_eth_header(up);
     puts("    link/ether ");
     draw_mac(&mac);
     puts(" brd ff:ff:ff:ff:ff:ff\n");
@@ -542,40 +582,26 @@ fn cmd_ip_show_addr() {
     puts(&format!("/{} brd ", plen));
     put_ip(brd);
     puts(" scope global ");
-    puts(nic);
+    puts(IFNAME);
+    if ip[0] == 169 && ip[1] == 254 {
+        err("  (link-local fallback: DHCP failed)");
+    }
     puts("\n");
-    puts("    RX: ");
-    put_usize(rx_p as usize);
-    puts(" pkts  TX: ");
-    put_usize(tx_p as usize);
-    puts(" pkts\n");
 }
 
 fn cmd_ip_show_link() {
     use crate::net;
     let mac = unsafe { net::OUR_MAC };
-    let nic = net::nic_name();
     let up  = net::link_up();
-    let rx  = net::rx_packets();
-    let tx  = net::tx_packets();
-    let rxb = net::rx_bytes();
-    let txb = net::tx_bytes();
 
-    dim("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
-    dim("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\n");
-
-    puts("2: ");
-    hl(nic);
-    puts(": <BROADCAST,MULTICAST,");
-    if up { ok("UP,LOWER_UP"); } else { err("NO-CARRIER"); }
-    puts("> mtu 1500 state ");
-    if up { ok("UP"); } else { err("DOWN"); }
+    show_lo(false);
     puts("\n");
+    show_eth_header(up);
     puts("    link/ether ");
     draw_mac(&mac);
     puts(" brd ff:ff:ff:ff:ff:ff\n");
-    puts(&format!("    RX: packets={} bytes={}\n", rx, rxb));
-    puts(&format!("    TX: packets={} bytes={}\n", tx, txb));
+    puts(&format!("    RX: packets={} bytes={}\n", net::rx_packets(), net::rx_bytes()));
+    puts(&format!("    TX: packets={} bytes={}\n", net::tx_packets(), net::tx_bytes()));
 }
 
 fn cmd_ip_show_route() {
@@ -583,19 +609,18 @@ fn cmd_ip_show_route() {
     let ip   = unsafe { net::OUR_IP };
     let gw   = unsafe { net::GATEWAY_IP };
     let mask = unsafe { net::SUBNET_MASK };
-    let nic  = net::nic_name();
     let plen = subnet_prefix_len(mask);
     let net_addr = ip_network(ip, mask);
 
-    puts("default via ");
-    put_ip(gw);
-    puts(" dev ");
-    puts(nic);
-    puts("\n");
+    if gw != [0, 0, 0, 0] {
+        puts("default via ");
+        put_ip(gw);
+        puts(" dev ");
+        puts(IFNAME);
+        puts("\n");
+    }
     put_ip(net_addr);
-    puts(&format!("/{} dev ", plen));
-    puts(nic);
-    puts(" proto kernel scope link src ");
+    puts(&format!("/{} dev {} proto kernel scope link src ", plen, IFNAME));
     put_ip(ip);
     puts("\n");
     puts("127.0.0.0/8 dev lo scope host\n");
@@ -616,20 +641,55 @@ pub fn cmd_nslookup(args: &str) {
         return;
     }
 
-    let dns_ip = unsafe { crate::userspace::net::DNS_IP };
-    let dns_str = format!("{}.{}.{}.{}", dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3]);
+    use crate::userspace::net::{dns, resolver};
+    let name = args.split_whitespace().next().unwrap_or(args);
+    let fmt_ip = |ip: [u8; 4]| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
 
-    dim(&format!("Server:\t\t{}\n", dns_str));
-    dim(&format!("Address:\t{}#53\n\n", dns_str));
+    if let Some(ip) = resolver::parse_ipv4(name) {
+        // Reverse (PTR) lookups are not implemented.
+        puts(&format!("Name:  {}\nAddress: {}\n", name, fmt_ip(ip)));
+        dim("(IP literal; reverse PTR lookup is not supported)\n");
+        return;
+    }
 
-    match crate::userspace::net::resolver::resolve_host(args) {
-        Ok(ip) => {
+    // /etc/hosts first, like resolve_host() does.
+    if let Some(ip) = resolver::hosts_lookup(name) {
+        dim("Source:    /etc/hosts\n\n");
+        puts(&format!("Name:  {}\n", name));
+        ok(&format!("Address: {}\n", fmt_ip(ip)));
+        return;
+    }
+
+    match dns::query(name) {
+        Ok(a) => {
+            if a.cached {
+                dim("Server:    (local cache)\n\n");
+            } else {
+                dim(&format!("Server:    {}\n", fmt_ip(a.server)));
+                dim(&format!("Address:  {}#53\n\n", fmt_ip(a.server)));
+            }
             dim("Non-authoritative answer:\n");
-            puts(&format!("Name:\t{}\n", args));
-            ok(&format!("Address: {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]));
+            puts(&format!("Name:  {}\n", name));
+            ok(&format!("Address: {}\n", fmt_ip(a.ip)));
         }
         Err(e) => {
-            err(&format!("nslookup: can't resolve '{}': {}\n", args, e.as_str()));
+            match e {
+                dns::DnsError::NxDomain { server } | dns::DnsError::NoAddress { server } => {
+                    dim(&format!("Server:    {}\n\n", fmt_ip(server)));
+                }
+                dns::DnsError::NoResponse => {
+                    let mut srv = [[0u8; 4]; 6];
+                    let n = dns::servers(&mut srv);
+                    let mut list = alloc::string::String::new();
+                    for i in 0..n {
+                        if i > 0 { list.push_str(", "); }
+                        list.push_str(&fmt_ip(srv[i]));
+                    }
+                    dim(&format!("Tried:    {}\n\n", list));
+                }
+                _ => {}
+            }
+            err(&format!("nslookup: can't resolve '{}': {}\n", name, e.as_str()));
         }
     }
 }
@@ -657,6 +717,46 @@ fn decode_chunked(data: &[u8]) -> alloc::vec::Vec<u8> {
         pos += take + 2; // skip data + trailing CRLF
     }
     out
+}
+
+/// Upper bound on a buffered HTTP response.
+const MAX_RESPONSE: usize = 512 * 1024;
+
+/// True once `acc` holds a complete HTTP response (by Content-Length, the
+/// final chunk, or headers-only for HEAD / bodiless statuses). Used to stop
+/// reading without waiting for the server to close the connection.
+fn http_response_complete(acc: &[u8], head_only: bool) -> bool {
+    let sep = match acc.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => i,
+        None => return false,
+    };
+    let body_len = acc.len() - (sep + 4);
+    let hdr = core::str::from_utf8(&acc[..sep]).unwrap_or("");
+    let mut status = 0u16;
+    let mut content_len: Option<usize> = None;
+    let mut chunked = false;
+    for (i, line) in hdr.split("\r\n").enumerate() {
+        if i == 0 {
+            status = line.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        } else if let Some(col) = line.find(':') {
+            let (k, v) = (line[..col].trim(), line[col + 1..].trim());
+            if k.eq_ignore_ascii_case("content-length") {
+                content_len = v.parse().ok();
+            } else if k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked") {
+                chunked = true;
+            }
+        }
+    }
+    if head_only || status == 204 || status == 304 || (100..200).contains(&status) {
+        return true;
+    }
+    if chunked {
+        return acc.ends_with(b"\r\n0\r\n\r\n") || (body_len == 5 && acc.ends_with(b"0\r\n\r\n"));
+    }
+    match content_len {
+        Some(cl) => body_len >= cl,
+        None => false, // read until the server closes
+    }
 }
 
 /// Write response bytes to the framebuffer (printable + common whitespace).
@@ -696,6 +796,7 @@ pub fn cmd_curl(args: &str) {
     let mut follow      = false; // -L / --location
     let mut method_ovrd = "";
     let mut post_data   = "";
+    let mut out_file    = "";
     let mut url_raw     = "";
     let mut extra: Vec<&str> = Vec::new();
     {
@@ -710,7 +811,7 @@ pub fn cmd_curl(args: &str) {
                 "-H" | "--header"    => { extra.push(it.next().unwrap_or("")); }
                 "-X" | "--request"   => { method_ovrd = it.next().unwrap_or(""); }
                 "-d" | "--data"      => { post_data  = it.next().unwrap_or(""); }
-                "-o" | "--output"    => { let _ = it.next(); }
+                "-o" | "--output"    => { out_file = it.next().unwrap_or(""); }
                 _ if !tok.starts_with('-') => url_raw = tok,
                 _ => {}
             }
@@ -803,12 +904,19 @@ pub fn cmd_curl(args: &str) {
                 let mut buf = [0u8; 4096];
                 loop {
                     if check_ctrl_c() { dim("\n[interrupted]\n"); tls.close(); return; }
-                    match tls.recv(&mut buf, 500) {
+                    match tls.recv(&mut buf, 1000) {
                         Ok(0)  => break,
                         Ok(n)  => acc.extend_from_slice(&buf[..n]),
-                        Err(_) => break,
+                        Err(e) => {
+                            if !silent { err("curl: "); err(e); err(" (response may be incomplete)\n"); }
+                            break;
+                        }
                     }
-                    if acc.len() > 512 * 1024 { break; } // cap at 512 KB
+                    if http_response_complete(&acc, head_only) { break; }
+                    if acc.len() > MAX_RESPONSE {
+                        if !silent { err("curl: response truncated at 512 KiB\n"); }
+                        break;
+                    }
                 }
                 tls.close();
                 break 'conn acc;
@@ -830,14 +938,19 @@ pub fn cmd_curl(args: &str) {
                         crate::userspace::net::tcp::tcp_close(conn);
                         return;
                     }
-                    match crate::userspace::net::tcp::tcp_recv(conn, &mut buf, 400) {
+                    match crate::userspace::net::tcp::tcp_recv(conn, &mut buf, 1000) {
                         Ok(0) => break,
                         Ok(n) => acc.extend_from_slice(&buf[..n]),
-                        Err(crate::userspace::net::tcp::TcpError::TimedOut)
-                        | Err(crate::userspace::net::tcp::TcpError::WouldBlock) => break,
-                        Err(e) => { err("\ncurl: recv: "); err(e.as_str()); err("\n"); break; }
+                        Err(e) => {
+                            if !silent { err("curl: recv: "); err(e.as_str()); err(" (response may be incomplete)\n"); }
+                            break;
+                        }
                     }
-                    if acc.len() > 512 * 1024 { break; }
+                    if http_response_complete(&acc, head_only) { break; }
+                    if acc.len() > MAX_RESPONSE {
+                        if !silent { err("curl: response truncated at 512 KiB\n"); }
+                        break;
+                    }
                 }
                 crate::userspace::net::tcp::tcp_close(conn);
                 break 'conn acc;
@@ -926,6 +1039,14 @@ pub fn cmd_curl(args: &str) {
                 if line.is_empty() { break; }
                 puts(line); puts("\n");
             }
+        } else if !out_file.is_empty() {
+            let path = crate::userspace::plum::resolve_path(out_file);
+            if crate::fs::write_file(&path, &body) {
+                if !silent { ok(&format!("curl: saved {} bytes to {} (HTTP {})\n", body.len(), path, status_code)); }
+            } else {
+                err(&format!("curl: cannot write {}\n", path));
+            }
+            break 'redir;
         } else if inc_hdrs {
             // -i: headers + body
             print_http_bytes(hdr_bytes, FG_DIM);

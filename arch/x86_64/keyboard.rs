@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 PS/2 keyboard driver: interrupt-driven via IRQ1 buffer + scancode decoding.
 US QWERTY layout. Supports Shift, CapsLock, Ctrl+C, Backspace, Tab, Escape.
@@ -36,6 +36,48 @@ static mut RIGHT_SHIFT: bool = false;
 static mut CTRL_PRESSED: bool = false;
 static mut CAPS_LOCK: bool = false;
 static mut EXTENDED: bool = false; // 0xE0 prefix seen
+
+// ─── Ctrl+C as an interrupt (seen at IRQ time) ──────────────────────────────
+//
+// The IRQ1 handler passes every raw scancode to `irq_scancode()`.  When it
+// sees Ctrl+C it sets INTERRUPT_PENDING, so long-running commands notice it
+// even though they never read the keyboard queue.  The '\x03' character is
+// still queued as before, so line editing at the prompt keeps working.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+static IRQ_CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Called from the keyboard IRQ handler (and USB HID injection) with each raw
+/// set-1 scancode. Must stay tiny: it runs in interrupt context.
+#[inline]
+pub fn irq_scancode(sc: u8) {
+    match sc {
+        0x1D => IRQ_CTRL_DOWN.store(true, Ordering::Relaxed),  // (left or E0-prefixed right) Ctrl down
+        0x9D => IRQ_CTRL_DOWN.store(false, Ordering::Relaxed), // Ctrl up
+        0x2E if IRQ_CTRL_DOWN.load(Ordering::Relaxed) => INTERRUPT_PENDING.store(true, Ordering::Relaxed),
+        _ => {}
+    }
+}
+
+/// Has Ctrl+C been pressed since the flag was last cleared?
+#[inline]
+pub fn interrupt_pending() -> bool {
+    INTERRUPT_PENDING.load(Ordering::Relaxed)
+}
+
+/// Return and clear the Ctrl+C flag.
+#[inline]
+pub fn take_interrupt() -> bool {
+    INTERRUPT_PENDING.swap(false, Ordering::Relaxed)
+}
+
+/// Clear the Ctrl+C flag (the shell does this before each new command).
+#[inline]
+pub fn clear_interrupt() {
+    INTERRUPT_PENDING.store(false, Ordering::Relaxed);
+}
 
 /// Initialize keyboard: drain pending scancodes from IRQ buffer
 pub fn init() {

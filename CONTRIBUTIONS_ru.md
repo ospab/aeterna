@@ -198,5 +198,5 @@ qemu-system-x86_64 -cdrom isos/ospab-os-v2-103.iso -m 256M -serial stdio
 ## Лицензия
 
 Участвуя в разработке AETERNA / ospab.os, вы соглашаетесь с тем, что ваши
-вклады будут распространяться под лицензией **Boost Software License 1.1**
+вклады будут распространяться под лицензией **GNU Affero General Public License v3.0** (AGPL-3.0-only)
 (см. [LICENSE](LICENSE)).

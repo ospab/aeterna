@@ -1,6 +1,7 @@
 [package]
 name = "ospab_os"
 version = "1.1.0"
+license = "AGPL-3.0-only"
 authors = ["ospab "]
 edition = "2021"
 

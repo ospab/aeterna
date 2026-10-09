@@ -15,6 +15,8 @@ pub mod virtio_net;
 pub mod rtl8139;
 pub mod e1000;
 pub mod rtl8169;
+pub mod pcnet;
+pub mod vmxnet3;
 pub mod ethernet;
 pub mod diag;
 pub mod arp;
@@ -28,7 +30,7 @@ pub mod sntp;
 pub mod tls;
 pub mod resolver;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // ─── Universal NIC trait (owned by this module) ───
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,8 +55,14 @@ pub static mut OUR_MAC: [u8; 6]      = [0; 6];
 pub static mut GATEWAY_MAC: [u8; 6]  = [0xFF; 6]; // broadcast until ARP resolve
 
 static NET_UP: AtomicBool = AtomicBool::new(false);
-// 0=RTL8139  1=e1000  2=RTL8169  3=VirtIO
-static mut ACTIVE_NIC: u8 = 0;
+pub const NIC_VIRTIO: u8 = 0;
+pub const NIC_RTL8139: u8 = 1;
+pub const NIC_E1000: u8 = 2;
+pub const NIC_RTL8169: u8 = 3;
+pub const NIC_PCNET: u8 = 4;
+pub const NIC_VMXNET3: u8 = 5;
+pub const NIC_NONE: u8 = 0xFF;
+static mut ACTIVE_NIC: u8 = NIC_NONE;
 // Packet counters
 static RX_PKTS: AtomicU64 = AtomicU64::new(0);
 static TX_PKTS: AtomicU64 = AtomicU64::new(0);
@@ -72,10 +80,13 @@ pub fn tx_bytes() -> u64 { TX_BYTES.load(Ordering::Relaxed) }
 pub fn link_up() -> bool {
     if !is_up() { return false; }
     match unsafe { ACTIVE_NIC } {
-        0 => virtio_net::link_up(),
-        1 => rtl8139::link_up(),
-        2 => e1000::link_up(),
-        _ => rtl8169::link_up(),
+        NIC_VIRTIO  => virtio_net::link_up(),
+        NIC_RTL8139 => rtl8139::link_up(),
+        NIC_E1000   => e1000::link_up(),
+        NIC_RTL8169 => rtl8169::link_up(),
+        NIC_PCNET   => pcnet::link_up(),
+        NIC_VMXNET3 => vmxnet3::link_up(),
+        _ => false,
     }
 }
 
@@ -123,35 +134,40 @@ pub fn dhcp_renew() -> bool {
 pub fn init() -> bool {
     crate::arch::x86_64::serial::write_str("[NET] Initializing network stack...\r\n");
 
-    // Step 1: Find and init NIC — try VirtIO, RTL8139, e1000, RTL8169 in order
-    enum NicKind { Rtl8139, E1000, Rtl8169, VirtIo }
-    let nic: NicKind;
-    if rtl8139::probe_and_init() {
-        crate::arch::x86_64::serial::write_str("[NET] RTL8139 found\r\n");
-        nic = NicKind::Rtl8139;
+    // Step 1: Find and init a NIC. ACTIVE_NIC numbering (see NIC_* consts)
+    // is used by poll_rx / send_raw / link_up / diag / nic_name.
+    let s = crate::arch::x86_64::serial::write_str;
+    let nic: u8 = if rtl8139::probe_and_init() {
+        NIC_RTL8139
     } else if e1000::probe_and_init() {
-        crate::arch::x86_64::serial::write_str("[NET] Intel e1000 found\r\n");
-        nic = NicKind::E1000;
+        NIC_E1000
     } else if rtl8169::probe_and_init() {
-        crate::arch::x86_64::serial::write_str("[NET] RTL8169/8111 found\r\n");
-        nic = NicKind::Rtl8169;
+        NIC_RTL8169
     } else if virtio_net::probe_and_init() {
-        crate::arch::x86_64::serial::write_str("[NET] VirtIO-Net found\r\n");
-        nic = NicKind::VirtIo;
+        NIC_VIRTIO
+    } else if pcnet::probe_and_init() {
+        NIC_PCNET
+    } else if vmxnet3::probe_and_init() {
+        NIC_VMXNET3
     } else {
-        crate::arch::x86_64::serial::write_str("[NET] No supported NIC found\r\n");
+        s("[NET] No supported NIC found (supported: RTL8139, Intel e1000 family, RTL8169/8111, virtio-net, AMD PCnet = VMware vlance, VMware vmxnet3)\r\n");
         return false;
-    }
+    };
 
     // Store which NIC is active so poll_rx / send_raw know which to call
-    unsafe { ACTIVE_NIC = nic as u8; }
+    unsafe { ACTIVE_NIC = nic; }
+    s("[NET] Using NIC driver: ");
+    s(nic_model());
+    s("\r\n");
 
     // Copy MAC from whichever NIC was found
-    let mac = match unsafe { ACTIVE_NIC } {
-        0 => rtl8139::mac_address(),
-        1 => e1000::mac_address(),
-        2 => rtl8169::mac_address(),
-        _ => virtio_net::mac_address(),
+    let mac = match nic {
+        NIC_VIRTIO  => virtio_net::mac_address(),
+        NIC_RTL8139 => rtl8139::mac_address(),
+        NIC_E1000   => e1000::mac_address(),
+        NIC_RTL8169 => rtl8169::mac_address(),
+        NIC_PCNET   => pcnet::mac_address(),
+        _           => vmxnet3::mac_address(),
     };
     unsafe {
         OUR_MAC = mac;
@@ -227,79 +243,99 @@ pub fn init() -> bool {
     true
 }
 
+/// Nesting depth of non-ISR network code (poll_rx / send_raw). While it is
+/// non-zero the NIC IRQ handler must NOT touch the RX/TX rings or the shared
+/// packet buffers: the interrupted code may be in the middle of using them.
+static NET_BUSY: AtomicU32 = AtomicU32::new(0);
+
+/// Per-packet serial tracing in the NIC drivers. Off by default: at 115200 baud
+/// each trace line costs several milliseconds, which throttles TCP badly.
+static NET_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub fn trace() -> bool { NET_TRACE.load(Ordering::Relaxed) }
+pub fn set_trace(on: bool) { NET_TRACE.store(on, Ordering::Relaxed); }
+
+/// RAII marker for non-ISR code that mutates shared network state (TCP
+/// connection table etc.). While alive, the NIC IRQ handler does not drain RX.
+pub struct BusyGuard;
+impl BusyGuard {
+    pub fn new() -> Self { NET_BUSY.fetch_add(1, Ordering::Acquire); BusyGuard }
+}
+impl Drop for BusyGuard {
+    fn drop(&mut self) { NET_BUSY.fetch_sub(1, Ordering::Release); }
+}
+
 /// Poll for received packets — dispatches to the active NIC
 pub fn poll_rx() {
+    NET_BUSY.fetch_add(1, Ordering::Acquire);
+    poll_rx_inner();
+    NET_BUSY.fetch_sub(1, Ordering::Release);
+}
+
+fn poll_rx_inner() {
+    fn drain(recv: fn() -> Option<(&'static [u8], usize)>) {
+        // Bounded so a flood cannot starve the caller forever.
+        for _ in 0..256 {
+            match recv() {
+                Some((buf, len)) => {
+                    if len < 14 { continue; }
+                    RX_PKTS.fetch_add(1, Ordering::Relaxed);
+                    RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    ethernet::handle_frame(&buf[..len]);
+                }
+                None => break,
+            }
+        }
+    }
     match unsafe { ACTIVE_NIC } {
-        0 => {
-            while let Some((buf, len)) = virtio_net::receive_packet() {
-                if len < 14 { continue; }
-                RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                ethernet::handle_frame(&buf[..len]);
-            }
-        }
-        1 => {
-            while let Some((buf, len)) = rtl8139::receive_packet() {
-                if len < 14 { continue; }
-                RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                ethernet::handle_frame(&buf[..len]);
-            }
-        }
-        2 => {
-            while let Some((buf, len)) = e1000::receive_packet() {
-                if len < 14 { continue; }
-                RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                ethernet::handle_frame(&buf[..len]);
-            }
-        }
-        _ => {
-            while let Some((buf, len)) = rtl8169::receive_packet() {
-                if len < 14 { continue; }
-                RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                ethernet::handle_frame(&buf[..len]);
-            }
-        }
+        NIC_VIRTIO  => drain(virtio_net::receive_packet),
+        NIC_RTL8139 => drain(rtl8139::receive_packet),
+        NIC_E1000   => drain(e1000::receive_packet),
+        NIC_RTL8169 => drain(rtl8169::receive_packet),
+        NIC_PCNET   => drain(pcnet::receive_packet),
+        NIC_VMXNET3 => drain(vmxnet3::receive_packet),
+        _ => {}
     }
 }
 
 /// Send a raw Ethernet frame
 pub fn send_raw(buf: &[u8], len: usize) {
+    NET_BUSY.fetch_add(1, Ordering::Acquire);
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
     match unsafe { ACTIVE_NIC } {
-        0 => virtio_net::send_packet(buf, len),
-        1 => rtl8139::send_packet(buf, len),
-        2 => e1000::send_packet(buf, len),
-        _ => rtl8169::send_packet(buf, len),
+        NIC_VIRTIO  => virtio_net::send_packet(buf, len),
+        NIC_RTL8139 => rtl8139::send_packet(buf, len),
+        NIC_E1000   => e1000::send_packet(buf, len),
+        NIC_RTL8169 => rtl8169::send_packet(buf, len),
+        NIC_PCNET   => pcnet::send_packet(buf, len),
+        NIC_VMXNET3 => vmxnet3::send_packet(buf, len),
+        _ => {}
     }
+    NET_BUSY.fetch_sub(1, Ordering::Release);
 }
 
-/// Handle network IRQ — called from IDT IRQ 9/10/11 dispatcher (inside ISR).
+/// Handle network IRQ — called from the IDT IRQ 9/10/11 dispatcher (inside ISR).
 ///
-/// Interrupt-driven path:
-///   1. Acknowledge the NIC's interrupt register (clears IRQ line).
-///   2. **Immediately drain all available receive descriptors** — every packet
-///      that arrived since the last drain is handled right now, inside the ISR,
-///      without waiting for the next 10 ms PIT tick.
-///   3. The NIC's hardware interrupt line is de-asserted after step 1, so no
-///      spurious re-delivery occurs.
-///
-/// This is Task 2 of the latency-elimination plan: ping RTT is now bounded by
-/// NIC-to-ISR delivery time (typically <200 µs on VMware/QEMU), not by the
-/// 10 ms PIT period.
+///   1. Acknowledge the NIC's interrupt register (de-asserts the IRQ line).
+///   2. Drain received frames right away — unless non-ISR network code was
+///      interrupted mid-operation (NET_BUSY), in which case that code polls
+///      the NIC itself as soon as it resumes.
+/// All network paths also work purely by polling, so a NIC whose IRQ is not
+/// routed (e.g. IRQ line > 15 behind a bridge) still works.
 pub fn handle_net_irq() {
-    // Step 1: ack NIC interrupt register
     match unsafe { ACTIVE_NIC } {
-        0 => virtio_net::handle_irq(),
-        1 => rtl8139::handle_irq(),
-        2 => e1000::handle_irq(),
-        _ => rtl8169::handle_irq(),
+        NIC_VIRTIO  => virtio_net::handle_irq(),
+        NIC_RTL8139 => rtl8139::handle_irq(),
+        NIC_E1000   => e1000::handle_irq(),
+        NIC_RTL8169 => rtl8169::handle_irq(),
+        NIC_PCNET   => pcnet::handle_irq(),
+        NIC_VMXNET3 => vmxnet3::handle_irq(),
+        _ => return,
     }
-    // Step 2: drain all pending RX frames immediately (interrupt-driven poll)
-    poll_rx();
+    if NET_BUSY.load(Ordering::Acquire) == 0 {
+        poll_rx();
+    }
 }
 
 /// Diagnostic registers for the active NIC
@@ -307,23 +343,81 @@ pub fn handle_net_irq() {
 /// For RTL8139: (ISR as u32, CMD as u32, CBR as u32, CAPR as u32)
 pub fn diag() -> (u32, u32, u32, u32) {
     match unsafe { ACTIVE_NIC } {
-        1 => {
+        NIC_RTL8139 => {
             let (isr, cmd, cbr, capr) = rtl8139::diag();
             (isr as u32, cmd as u32, cbr as u32, capr as u32)
         }
-        2 => e1000::diag_regs(),
+        NIC_E1000 => e1000::diag_regs(),
         _ => (0, 0, 0, 0),
     }
 }
 
-/// Report which NIC is active (for terminal ifconfig)
+/// Short name of the active NIC driver (for ifconfig / ip / netstat).
 pub fn nic_name() -> &'static str {
     match unsafe { ACTIVE_NIC } {
-        0 => "VirtIO-Net",
-        1 => "RTL8139",
-        2 => "Intel e1000",
-        _ => "RTL8169/8111",
+        NIC_VIRTIO  => "VirtIO-Net",
+        NIC_RTL8139 => "RTL8139",
+        NIC_E1000   => "Intel e1000",
+        NIC_RTL8169 => "RTL8169/8111",
+        NIC_PCNET   => "AMD PCnet",
+        NIC_VMXNET3 => "vmxnet3",
+        _           => "none",
     }
+}
+
+/// Descriptive model string of the active NIC, including PCI vendor:device.
+pub fn nic_model() -> &'static str {
+    match unsafe { ACTIVE_NIC } {
+        NIC_VIRTIO  => "virtio-net (1af4:1000, legacy I/O)",
+        NIC_RTL8139 => "Realtek RTL8139 (10ec:8139)",
+        NIC_E1000   => "Intel e1000 family (8086:xxxx)",
+        NIC_RTL8169 => "Realtek RTL8169/8111 (10ec:8169/8168)",
+        NIC_PCNET   => "AMD PCnet-PCI II Am79C970A (1022:2000, VMware vlance)",
+        NIC_VMXNET3 => "VMware vmxnet3 (15ad:07b0)",
+        _           => "none",
+    }
+}
+
+/// Brute-force PCI configuration scan of every bus/device/function (covers
+/// devices behind PCI-PCI bridges and does not depend on the size of the
+/// kernel's PCI device table). Returns the first match.
+pub fn pci_scan(vendor: u16, device: u16) -> Option<(u8, u8, u8)> {
+    for bus in 0u16..256 {
+        for dev in 0u8..32 {
+            if crate::pci::vendor_id(bus as u8, dev, 0) == 0xFFFF { continue; }
+            let multi = crate::pci::header_type(bus as u8, dev, 0) & 0x80 != 0;
+            let nfunc = if multi { 8 } else { 1 };
+            for func in 0..nfunc {
+                if crate::pci::vendor_id(bus as u8, dev, func) == vendor
+                    && crate::pci::device_id(bus as u8, dev, func) == device
+                {
+                    return Some((bus as u8, dev, func));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn serial_bdf(bus: u8, dev: u8, func: u8) {
+    serial_hex_byte(bus);
+    crate::arch::x86_64::serial::write_byte(b':');
+    serial_hex_byte(dev);
+    crate::arch::x86_64::serial::write_byte(b'.');
+    crate::arch::x86_64::serial::write_byte(b'0' + func);
+}
+
+pub(crate) fn serial_hex16(v: u16) {
+    serial_hex_byte((v >> 8) as u8);
+    serial_hex_byte(v as u8);
+}
+
+pub(crate) fn serial_dec(mut v: u64) {
+    if v == 0 { crate::arch::x86_64::serial::write_byte(b'0'); return; }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
 }
 
 /// Format IP for display: writes "x.x.x.x" into buf, returns len

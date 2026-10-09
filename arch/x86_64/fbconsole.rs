@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Framebuffer-based console for text output.
 Replaces VGA text mode with graphical framebuffer.
@@ -8,14 +8,14 @@ Replaces VGA text mode with graphical framebuffer.
 use core::fmt;
 use super::framebuffer;
 
-/// Console colors (RGB)
+/// Console colors, 0x00RRGGBB (the framebuffer converts to its native layout)
 pub const COLOR_BLACK: u32 = 0x00000000;
 pub const COLOR_WHITE: u32 = 0x00FFFFFF;
-pub const COLOR_RED: u32 = 0x0000FF00;
+pub const COLOR_RED: u32 = 0x00FF0000;
 pub const COLOR_GREEN: u32 = 0x0000FF00;
-pub const COLOR_BLUE: u32 = 0x00FF0000;
-pub const COLOR_YELLOW: u32 = 0x0000FFFF;
-pub const COLOR_CYAN: u32 = 0x00FFFF00;
+pub const COLOR_BLUE: u32 = 0x000000FF;
+pub const COLOR_YELLOW: u32 = 0x00FFFF00;
+pub const COLOR_CYAN: u32 = 0x0000FFFF;
 pub const COLOR_MAGENTA: u32 = 0x00FF00FF;
 pub const COLOR_GRAY: u32 = 0x00808080;
 

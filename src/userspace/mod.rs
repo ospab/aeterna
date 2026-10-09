@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 userspace — Kernel-integrated userland modules.
@@ -35,5 +35,3 @@ pub mod tomato;
 #[path = "../../userland/seed/src/lib.rs"]
 pub mod seed;
 
-#[path = "../../userland/aai/src/lib.rs"]
-pub mod aai;

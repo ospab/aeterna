@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 DOOM bare-metal port for AETERNA.
@@ -155,6 +155,12 @@ const MS_PER_TICK: u64 = 10;
 pub extern "C" fn rust_get_ticks_ms() -> u32 {
     let ticks = crate::arch::x86_64::idt::timer_ticks();
     (ticks * MS_PER_TICK) as u32
+}
+
+/// Return microseconds since kernel boot (using high-resolution TSC)
+#[no_mangle]
+pub extern "C" fn rust_get_ticks_us() -> u64 {
+    crate::arch::x86_64::tsc::tsc_us()
 }
 
 /// Spin-delay for `ms` milliseconds (HLT-based to avoid busy-spinning hard)
@@ -726,6 +732,9 @@ pub fn run() {
 
         serial::write_str("[DOOM] Engine exited\r\n");
 
+        // Silence the hardware immediately to stop any looping sounds
+        crate::drivers::audio::clear_buffer();
+
         // Force a final disk sync so the last-written save state survives
         // an OS reboot. Deferred tick fires ~10 s after the last write, but
         // we do one unconditional flush here to guarantee consistency at exit.
@@ -763,8 +772,60 @@ pub unsafe extern "C" fn rust_hda_write_pcm(data: *const u8, len: u32) {
     crate::drivers::audio::write_pcm(input);
 }
 
-/// Returns 1 if the HDA audio driver is initialized and streaming, 0 otherwise.
+/// Returns 1 if an audio driver is initialized and streaming, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn rust_hda_is_ready() -> i32 {
     if crate::drivers::audio::is_ready() { 1 } else { 0 }
+}
+
+/// Non-blocking: queue s16le stereo PCM at rust_audio_rate(); returns the
+/// number of bytes accepted (multiple of 4).
+#[no_mangle]
+pub unsafe extern "C" fn rust_audio_submit(data: *const u8, len: u32) -> u32 {
+    if data.is_null() || len == 0 { return 0; }
+    let input = core::slice::from_raw_parts(data, len as usize);
+    crate::drivers::audio::submit(input) as u32
+}
+
+/// Frames queued ahead of the hardware play position.
+#[no_mangle]
+pub extern "C" fn rust_audio_queued_frames() -> u32 {
+    crate::drivers::audio::queued_frames()
+}
+
+/// Output sample rate of the active audio device (Hz).
+#[no_mangle]
+pub extern "C" fn rust_audio_rate() -> u32 {
+    crate::drivers::audio::sample_rate()
+}
+
+// ─── Mouse bridge (exported to DOOM C engine) ───────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn rust_doom_get_mouse(dx: *mut i32, dy: *mut i32, b: *mut u8) {
+    let (mut mdx, mut mdy, mut mbtns) = crate::arch::x86_64::mouse::poll();
+
+    // Support VMMouse (absolute) by converting to deltas for DOOM
+    if crate::drivers::gpu::is_absolute() {
+        static mut LAST_V_X: u32 = 0;
+        static mut LAST_V_Y: u32 = 0;
+        if let Some(ev) = crate::drivers::gpu::mouse_poll() {
+            unsafe {
+                if LAST_V_X != 0 || LAST_V_Y != 0 {
+                    // Convert 0..65535 range to reasonable pixel deltas
+                    mdx += (ev.x as i32 - LAST_V_X as i32) / 16;
+                    mdy += (ev.y as i32 - LAST_V_Y as i32) / 16;
+                }
+                LAST_V_X = ev.x;
+                LAST_V_Y = ev.y;
+                mbtns = ev.buttons;
+            }
+        }
+    }
+
+    unsafe {
+        if !dx.is_null() { *dx = mdx; }
+        if !dy.is_null() { *dy = mdy; }
+        if !b.is_null() { *b = mbtns; }
+    }
 }

@@ -1,0 +1,9 @@
+[package]
+name = "liboos"
+description = "Runtime library for ospab.os user programs: entry point, syscalls, heap, printing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linked_list_allocator = "0.10"

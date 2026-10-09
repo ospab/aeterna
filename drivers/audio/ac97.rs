@@ -337,7 +337,7 @@ unsafe fn init_codec() -> u32 {
 
     // 4. Set PCM output volume to max with no mute
     //    Format: [4:0] = right gain (0=max), [12:8] = left gain (0=max), [15] = mute
-    nam_write16(NAM_PCM_VOL, 0x0808); // -12 dB attenuate to prevent clipping, no mute
+    nam_write16(NAM_PCM_VOL, 0x0808); // 0x08 = 0 dB on AC97 PCM-out (0x00 would be +12 dB), unmuted
 
     // 5. Check Extended Audio ID for Variable Rate Audio (VRA) support
     let ext_id = nam_read16(NAM_EXT_AUDIO_ID);
@@ -369,8 +369,10 @@ unsafe fn init_codec() -> u32 {
 
 // ─── DMA memory setup ─────────────────────────────────────────────────────────
 
-/// Allocate physical memory for BDL array + all 32 audio ring buffers.
-/// Fills BUF_PHYS/BUF_VIRT and BDL_PHYS/BDL_VIRT.
+/// Allocate physical memory for BDL array + the 128 KiB PCM ring.
+/// The ring is one physically contiguous block (so the generic stream code in
+/// mod.rs can treat it as a flat cyclic buffer); BDL entry i points at
+/// ring + i*4096.
 unsafe fn alloc_dma_memory() -> bool {
     // Allocate BDL array frame (BDL_ENTRIES × 8 bytes = 256 bytes → fits in one 4K frame)
     let bdl_frame = match alloc_dma_frame() {
@@ -386,23 +388,25 @@ unsafe fn alloc_dma_memory() -> bool {
     BDL_PHYS = bdl_frame;
     BDL_VIRT = bdl_v;
 
-    // Allocate one 4K frame per BDL entry for PCM data
+    let ring = match physical::alloc_frames(BDL_ENTRIES as u64) {
+        Some(p) if p + RING_BYTES as u64 <= 0x1_0000_0000 => p,
+        Some(_) => {
+            serial::write_str("[AC97] PCM ring above 4 GiB — AC97 DMA is 32-bit only\r\n");
+            return false;
+        }
+        None => {
+            serial::write_str("[AC97] Failed to allocate 128 KiB contiguous PCM ring\r\n");
+            return false;
+        }
+    };
+    let ring_v = phys_to_virt(ring);
+    core::ptr::write_bytes(ring_v as *mut u8, 0, RING_BYTES);
     for i in 0..BDL_ENTRIES {
-        let frame = match alloc_dma_frame() {
-            Some(f) => f,
-            None => {
-                serial::write_str("[AC97] Failed to allocate PCM buffer frame\r\n");
-                return false;
-            }
-        };
-        let virt = phys_to_virt(frame as u64);
-        // Fill with silence (0 for signed 16-bit PCM = no signal)
-        core::ptr::write_bytes(virt as *mut u8, 0, BUF_BYTES);
-        BUF_PHYS[i] = frame;
-        BUF_VIRT[i] = virt;
+        BUF_PHYS[i] = ring as u32 + (i * BUF_BYTES) as u32;
+        BUF_VIRT[i] = ring_v + (i * BUF_BYTES) as u64;
     }
 
-    serial::write_str("[AC97] DMA ring allocated: 33 frames (BDL + 32 PCM bufs)\r\n");
+    serial::write_str("[AC97] DMA ring allocated: BDL + 128 KiB contiguous PCM ring\r\n");
     true
 }
 
@@ -410,13 +414,8 @@ unsafe fn alloc_dma_memory() -> bool {
 
 /// Reset the PCM-Output channel, program BDBAR, LVI, and start DMA.
 unsafe fn init_nabm() -> bool {
-    // 1. Cold-reset the NABM (assert then de-assert global reset)
-    //    Bit 1 of GLBCNT must be 1 for normal operation; clear it to cold-reset.
-    let glbcnt = nabm_read32(NABM_GLBCNT);
-    nabm_write32(NABM_GLBCNT, glbcnt & !GLBCNT_COLD_RST);
-    wait_ticks(1);
-    nabm_write32(NABM_GLBCNT, glbcnt | GLBCNT_COLD_RST);
-    wait_ticks(2); // codec needs time after cold reset
+    // (The AC-link cold reset happens in cold_reset() before the codec is
+    //  programmed — doing it here would wipe the mixer settings.)
 
     // 2. Reset the PCM-Output channel registers (CR.RR = 1 → clear → ready)
     pco_write_cr(CR_RR);
@@ -430,25 +429,43 @@ unsafe fn init_nabm() -> bool {
     // 3. Write BDBAR: physical base address of BDL array (must be 32-bit)
     nabm_write32(PCO_BASE + PCO_OFF_BDBAR, BDL_PHYS);
 
-    // 4. Fill all 32 BDL entries (silence, IOC on every entry for refill)
+    // 4. Fill all 32 BDL entries (silence).  No IOC: the driver is polled,
+    //    the PIC line is never unmasked, so no interrupt must be raised.
     for i in 0..BDL_ENTRIES {
-        // Alternate IOC every entry so we can refill as early as possible
-        let flags = BDL_IOC | BDL_BUP;
-        set_bdl_entry(i, BUF_PHYS[i], BUF_SAMPLES, flags);
+        set_bdl_entry(i, BUF_PHYS[i], BUF_SAMPLES, BDL_BUP);
     }
 
-    // 5. Set LVI = 31 (all entries pre-filled and valid)
+    // 5. Set LVI = 31 (all entries valid); keepalive() keeps LVI one entry
+    //    behind CIV so the ring plays cyclically forever.
     pco_write_lvi((BDL_ENTRIES - 1) as u8);
 
     // 6. Clear any stale status bits (write 1 to clear W1C bits)
     pco_write_sr(SR_LVBCI | SR_BCIS | SR_FIFOE);
 
-    // 7. Start DMA: enable IOC + LVBI interrupts, set RUN bit
-    pco_write_cr(CR_RPBM | CR_IOCE | CR_LVBIE);
+    // 7. Start DMA (run bit only, no interrupt enables)
+    pco_write_cr(CR_RPBM);
 
     DMA_RUNNING.store(true, Ordering::Release);
-    serial::write_str("[AC97] NABM PCM-OUT DMA started, LVI=31\r\n");
+    serial::write_str("[AC97] NABM PCM-OUT DMA started (polled, cyclic), LVI=31\r\n");
     true
+}
+
+/// AC-link cold reset + wait for the primary codec to report ready.
+unsafe fn cold_reset() {
+    let glbcnt = nabm_read32(NABM_GLBCNT);
+    serial::write_str("[AC97] GLBCNT before reset=0x"); log_u32(glbcnt); serial::write_str("\r\n");
+    nabm_write32(NABM_GLBCNT, glbcnt & !(GLBCNT_COLD_RST | GLBCNT_GIE));
+    wait_ticks(1);
+    nabm_write32(NABM_GLBCNT, (glbcnt | GLBCNT_COLD_RST) & !GLBCNT_GIE);
+    // GLBSTS bit 8 = primary codec ready
+    let deadline = crate::arch::x86_64::idt::timer_ticks() + 50;
+    let mut sts = nabm_read32(NABM_GLBSTS);
+    while sts & (1 << 8) == 0 && crate::arch::x86_64::idt::timer_ticks() < deadline {
+        asm!("pause");
+        sts = nabm_read32(NABM_GLBSTS);
+    }
+    serial::write_str("[AC97] GLBSTS after cold reset=0x"); log_u32(sts);
+    serial::write_str(if sts & (1 << 8) != 0 { " (codec ready)\r\n" } else { " (codec NOT ready — continuing)\r\n" });
 }
 
 // ─── Public: init ─────────────────────────────────────────────────────────────
@@ -484,7 +501,8 @@ pub fn init() -> bool {
                     let (class, subclass, _) = crate::pci::class_code(b, d, f);
 
                     // Check class: 0x04 (Multimedia), 0x01 (Audio Device / AC97)
-                    let is_ac97_class = class == 0x04 && subclass == 0x01;
+                    let is_ac97_class = class == 0x04 && subclass == 0x01
+                        && matches!(vid, 0x8086 | 0x1106 | 0x1022 | 0x10DE | 0x1039);
                     
                     let mut is_known = false;
                     for &(kv, kd) in &known_ids {
@@ -515,9 +533,9 @@ pub fn init() -> bool {
     let did = crate::pci::device_id(bus, dev, func);
     serial::write_str("[AC97] Found PCI ");
     log_u16(vid); serial::write_str(":"); log_u16(did);
-    serial::write_str(" at bus="); serial::write_byte(b'0' + bus);
-    serial::write_str(" dev="); serial::write_byte(b'0' + dev);
-    serial::write_str(" func="); serial::write_byte(b'0' + func);
+    serial::write_str(" at bus="); log_u8(bus);
+    serial::write_str(" dev="); log_u8(dev);
+    serial::write_str(" func="); log_u8(func);
     serial::write_str("\r\n");
 
     // ── Step 2: Read PCI BARs ────────────────────────────────────────────────
@@ -557,14 +575,15 @@ pub fn init() -> bool {
     if irq_line < 16 {
         AC97_IRQ.store(irq_line, Ordering::Relaxed);
         serial::write_str("[AC97] PCI IRQ line=");
-        serial::write_byte(b'0' + irq_line);
+        log_u8(irq_line);
         serial::write_str("\r\n");
     } else {
         // 0xFF means not connected; keep default of 5 (QEMU AC97 default)
         serial::write_str("[AC97] IRQ unassigned, defaulting to 5\r\n");
     }
 
-    // ── Step 5: Initialize codec (NAM) ─────────────────────────────────────────
+    // ── Step 5: AC-link cold reset, then initialize codec (NAM) ─────────────────
+    unsafe { cold_reset(); }
     let rate = unsafe { init_codec() };
     SAMPLE_RATE_HZ.store(rate, Ordering::Relaxed);
 
@@ -589,143 +608,64 @@ pub fn init() -> bool {
     true
 }
 
-// ─── Public: enable Global Interrupt Enable ──────────────────────────────────
+// ─── Public: polled ring interface (used by audio::mod stream code) ──────────
 
-/// Must be called AFTER init() completes to enable AC97 interrupt delivery.
-/// Separated so the caller can register the IRQ handler before enabling.
-pub fn enable_interrupts() {
-    if !AUDIO_READY.load(Ordering::Acquire) { return; }
+/// Virtual address of the 128 KiB cyclic PCM ring.
+pub fn ring_ptr() -> *mut u8 { unsafe { BUF_VIRT[0] as *mut u8 } }
+
+/// Size of the PCM ring in bytes.
+pub fn ring_bytes() -> usize { RING_BYTES }
+
+/// Current hardware play position (byte offset inside the ring).
+pub fn hw_pos() -> usize {
+    if !AUDIO_READY.load(Ordering::Acquire) { return 0; }
     unsafe {
-        let glbcnt = nabm_read32(NABM_GLBCNT);
-        nabm_write32(NABM_GLBCNT, glbcnt | GLBCNT_GIE);
-        serial::write_str("[AC97] Global Interrupt Enable set (GIE=1)\r\n");
+        // CIV and PICB are separate registers: re-read until stable.
+        for _ in 0..4 {
+            let civ1 = pco_read_civ() & 0x1F;
+            let picb = nabm_read16(PCO_BASE + PCO_OFF_PICB) as usize;
+            let civ2 = pco_read_civ() & 0x1F;
+            if civ1 == civ2 {
+                let played = BUF_BYTES.saturating_sub(picb.min(BUF_SAMPLES as usize) * 2);
+                return (civ1 as usize * BUF_BYTES + played) % RING_BYTES;
+            }
+        }
+        (pco_read_civ() as usize & 0x1F) * BUF_BYTES
     }
 }
 
-// ─── Public: IRQ handler ──────────────────────────────────────────────────────
+/// Keep the DMA engine running cyclically: LVI = CIV - 1, restart if halted.
+pub fn keepalive() {
+    if !AUDIO_READY.load(Ordering::Acquire) { return; }
+    unsafe {
+        let civ = pco_read_civ() & 0x1F;
+        pco_write_lvi(civ.wrapping_sub(1) & 0x1F);
+        let sr = pco_read_sr();
+        if sr & (SR_LVBCI | SR_BCIS | SR_FIFOE) != 0 {
+            pco_write_sr(SR_LVBCI | SR_BCIS | SR_FIFOE);
+        }
+        let cr = pco_read_cr();
+        if cr & CR_RPBM == 0 {
+            pco_write_cr(CR_RPBM);
+            if !DMA_RUNNING.swap(true, Ordering::Relaxed) {
+                serial::write_str("[AC97] DMA was stopped — restarted\r\n");
+            }
+        }
+    }
+}
 
-/// Called from `idt::irq_dispatch()` on the AC97 PIC IRQ.
-///
-/// Clears all W1C status bits in the PCM-OUT status register.
-/// Sets BUFFER_DONE so the write path can advance the fill cursor.
-/// If the DMA halted (LVBCI), re-arms and resumes.
-#[allow(clippy::needless_return)]
+/// Kept for compatibility: the driver is polled, interrupts stay disabled.
+pub fn enable_interrupts() {}
+
+/// IRQ hook: only acknowledges status bits (no interrupts are enabled).
 pub fn handle_irq() {
     if !AUDIO_READY.load(Ordering::Acquire) { return; }
-
     unsafe {
         let sr = pco_read_sr();
-
-        if sr & (SR_BCIS | SR_LVBCI | SR_FIFOE) == 0 {
-            return; // spurious IRQ
-        }
-
-        // Clear all write-1-to-clear interrupt bits
-        pco_write_sr(SR_LVBCI | SR_BCIS | SR_FIFOE);
-
-        if sr & SR_FIFOE != 0 {
-            // FIFO overrun: log but continue (data was dropped at codec side)
-            serial::write_str("[AC97] FIFO error\r\n");
-        }
-
-        // Signal the producer that at least one buffer slot is now free
-        BUFFER_DONE.store(true, Ordering::Release);
-
-        if sr & SR_LVBCI != 0 {
-            // DMA halted at LVI; re-arm by advancing LVI to current fill position
-            // so it can keep playing the pre-filled (silence) entries.
-            let fill = FILL_IDX.load(Ordering::Acquire);
-            // Set LVI to the entry just before fill (last valid = fill - 1 mod 32)
-            let new_lvi = fill.wrapping_sub(1) & 0x1F;
-            pco_write_lvi(new_lvi);
-            // Ensure DMA is running
-            let cr = pco_read_cr();
-            if cr & CR_RPBM == 0 {
-                pco_write_cr(CR_RPBM | CR_IOCE | CR_LVBIE);
-                DMA_RUNNING.store(true, Ordering::Relaxed);
-            }
+        if sr & (SR_BCIS | SR_LVBCI | SR_FIFOE) != 0 {
+            pco_write_sr(SR_LVBCI | SR_BCIS | SR_FIFOE);
         }
     }
-}
-
-// ─── Public: PCM submission ───────────────────────────────────────────────────
-
-/// Write raw 16-bit signed stereo PCM data to the AC97 DMA ring buffer.
-///
-/// Data must be:  44100 Hz (or 48000 Hz if VRA absent), 16-bit LE, 2-channel interleaved.
-///
-/// This function is **non-blocking**: if the ring is full it drops the overflow.
-/// Returns the number of bytes actually accepted.
-pub fn write_pcm(data: &[u8]) -> usize {
-    if !AUDIO_READY.load(Ordering::Acquire) { return 0; }
-
-    let mut written = 0usize;
-    let mut src = data;
-
-    while !src.is_empty() {
-        let fill = FILL_IDX.load(Ordering::Acquire) as usize;
-        let civ  = unsafe { pco_read_civ() } as usize;
-
-        // How many entries are in-flight (filled but not yet played)?
-        // in_flight = (fill - civ) mod 32
-        let in_flight = fill.wrapping_sub(civ) & 0x1F;
-
-        // Leave 1 entry headroom so we never overwrite what hardware is playing
-        if in_flight >= BDL_ENTRIES - 1 {
-            // Ring full — non-blocking: drop remaining data
-            break;
-        }
-
-        // How many bytes can go into the current fill entry?
-        let buf_virt = unsafe { BUF_VIRT[fill] };
-        let chunk = src.len().min(BUF_BYTES);
-        let pad   = BUF_BYTES - chunk;
-
-        // Copy PCM data into BDL entry buffer
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), buf_virt as *mut u8, chunk);
-            // Zero-pad remainder with silence (0x00 = silence for signed 16-bit)
-            if pad > 0 {
-                core::ptr::write_bytes((buf_virt as *mut u8).add(chunk), 0, pad);
-            }
-        }
-
-        // Publish this entry to hardware by advancing LVI
-        let new_lvi = fill as u8 & 0x1F;
-        unsafe { pco_write_lvi(new_lvi); }
-
-        // Advance FILL_IDX (mod 32)
-        FILL_IDX.store((fill + 1) as u8 & 0x1F, Ordering::Release);
-
-        // Ensure DMA is running (it may have halted if we were slow)
-        if !DMA_RUNNING.load(Ordering::Relaxed) {
-            unsafe {
-                let cr = pco_read_cr();
-                if cr & CR_RPBM == 0 {
-                    pco_write_cr(CR_RPBM | CR_IOCE | CR_LVBIE);
-                    DMA_RUNNING.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-
-        written += chunk;
-        src = &src[chunk..];
-
-        // Clear the done flag if we just processed the buffer it referred to
-        BUFFER_DONE.store(false, Ordering::Release);
-    }
-
-    written
-}
-
-/// Convenience wrapper over `write_pcm` matching the DOOM audio callback signature.
-///
-/// The DOOM engine provides mono/stereo chunks at its internal rate; callers are
-/// responsible for upsampling/format-converting before calling this.
-/// Returns true if all data was accepted, false if the ring was partially full.
-pub fn play_sample(data: &[u8]) -> bool {
-    if data.is_empty() { return true; }
-    write_pcm(data) == data.len()
 }
 
 // ─── Public: status ───────────────────────────────────────────────────────────
@@ -742,9 +682,12 @@ pub fn irq_line() -> u8 {
 
 /// Returns (civ, fill_idx, in_flight) for debugging.
 pub fn dma_status() -> (u8, u8, u8) {
-    let civ  = unsafe { if is_ready() { pco_read_civ() } else { 0 } };
-    let fill = FILL_IDX.load(Ordering::Relaxed);
-    let in_flight = fill.wrapping_sub(civ) & 0x1F;
+    // fill = BDL entry holding the end of queued data, in_flight = whole
+    // entries queued ahead of the hardware.
+    let civ  = unsafe { if is_ready() { pco_read_civ() & 0x1F } else { 0 } };
+    let queued_bytes = super::queued_frames() as usize * 4;
+    let in_flight = (queued_bytes / BUF_BYTES) as u8;
+    let fill = (civ as usize + (hw_pos() % BUF_BYTES + queued_bytes) / BUF_BYTES) as u8 & 0x1F;
     (civ, fill, in_flight)
 }
 
@@ -936,4 +879,11 @@ pub fn dump_mem_map() {
     }
 
     serial::write_str("[AC97-MEM] === End Memory Map ===\r\n");
+}
+
+/// Stop PCM-out DMA (before reset / power-off).
+pub fn stop() {
+    if NABM_BASE.load(Ordering::Relaxed) == 0 { return; }
+    DMA_RUNNING.store(false, Ordering::Release);
+    unsafe { pco_write_cr(0); }
 }

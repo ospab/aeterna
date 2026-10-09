@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 8259 PIC (Programmable Interrupt Controller) driver for AETERNA microkernel.
 Remaps IRQ 0-15 to IDT vectors 32-47.
@@ -90,7 +90,7 @@ pub fn init() {
         io_wait();
     }
 
-    crate::arch::x86_64::serial::write_str("[AETERNA] PIC initialized (IRQ 0-15 -> IDT 32-47)\r\n");
+    crate::arch::x86_64::serial::write_str("[PIC] Initialized (IRQ 0-15 -> IDT 32-47)\r\n");
 }
 
 /// Send End-of-Interrupt to the appropriate PIC(s)

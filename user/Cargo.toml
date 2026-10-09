@@ -1,0 +1,16 @@
+[workspace]
+members = ["liboos", "hello"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+version = "0.1.0"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

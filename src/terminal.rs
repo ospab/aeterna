@@ -1,74 +1,69 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-Linux-like terminal for AETERNA microkernel.
-Features:
-  - Clean prompt: root@ospab:~#
-  - Command history with Up/Down arrows (16 entries)
-  - Proper backspace (never deletes prompt)
-  - Ctrl+C: cancel input, Ctrl+L: clear screen, Ctrl+D: EOF
-  - White text on black background (colors only for errors/warnings/highlights)
-  - Real system commands with live data
+Interactive console for ospab.os (AETERNA kernel), drawn on the framebuffer.
+
+It runs in ring 0 as part of the kernel, like every other tool here for now.
+  - prompt root@<hostname>:<path>#
+  - line editor: cursor keys, Home/End, Delete, Ctrl+A/E/U/K/W, Tab completion
+  - command history (Up/Down), `history`
+  - "--More--" pager for long output
+Lines are run by the plum shell (pipes, ;, &&, variables, aliases, scripts).
+Commands implemented here (help, date, free, ...) are registered with plum
+as console commands; a plain line like `free` is run directly.
 */
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::string::String;
+use alloc::vec::Vec;
 use ospab_os::arch::x86_64::framebuffer;
 use ospab_os::arch::x86_64::keyboard;
 use ospab_os::klog;
 use ospab_os::{fs, acpi, axon};
 
-// Builtin command list for Tab completion (includes AXON)
-const BUILTINS: &[&str] = &[
-    "help", "echo", "clear", "ver", "version", "uname", "ls", "pwd", "cd",
-    "cat", "mkdir", "touch", "rm", "save", "write", "whoami", "hostname",
-    "date", "about", "meminfo", "free", "uptime", "dmesg", "lsmem",
-    "lspci", "lsblk", "fdisk", "mkfs", "mount", "ping", "ifconfig", "ip", "ntpdate", "netdiag", "soundtest", "sync",
-    "nslookup", "curl", "traceroute", "netstat",
-    "dump_disk", "reboot", "shutdown", "poweroff", "halt", "install", "history",
-    "tutor", "grape", "tomato", "seed", "bash", "doom", "aai", "export", "alias",
-    "unalias", "env", "set", "unset", "type", "source", "plum",
-    "ps", "top", "bench", "vol", "mute", "ring3test",
-];
-
 extern crate alloc;
 
-// ─── Global Ctrl+C flag ────────────────────────────────────────────────────
-// Set when Ctrl+C is pressed during a running command.
-// Long-running commands must check this and break out.
-static CTRL_C: AtomicBool = AtomicBool::new(false);
+#[path = "testmode.rs"]
+mod testmode;
 
-/// Call from any running command to check if the user pressed Ctrl+C.
-/// Returns true and prints "^C" if so.
-fn check_ctrl_c() -> bool {
-    // Non-blocking drain: consume only Ctrl+C, push others back
-    while let Some(ch) = keyboard::try_read_key() {
-        if ch == '\x03' {
-            CTRL_C.store(true, Ordering::Relaxed);
-            break;
-        }
-        // Not Ctrl+C — ignore (key is consumed but that's acceptable
-        // in a running command context where input goes to the command)
-    }
-    CTRL_C.load(Ordering::Relaxed)
-}
+/// Commands implemented in this file.
+const TERMINAL_COMMANDS: &[&str] = &[
+    "help", "clear", "version", "ver", "uname", "whoami", "hostname",
+    "date", "about", "free", "meminfo", "lsmem", "uptime", "dmesg",
+    "ifconfig", "ntpdate", "netdiag",
+    "soundtest", "vol", "mute", "sync", "dump_disk", "changelog",
+    "reboot", "shutdown", "poweroff", "halt", "install", "history", "tutor",
+    "grape", "tomato", "seed", "doom", "bench", "ring3test", "testmode",
+];
 
-// ─── Colors — minimal palette (white on black, colors only where needed) ───
-const FG: u32         = 0x00FFFFFF;   // Default: white
-const FG_DIM: u32     = 0x00AAAAAA;   // Dim gray for secondary info
-const FG_ERR: u32     = 0x000000FF;   // Red — errors only
-const FG_WARN: u32    = 0x0000FFFF;   // Yellow — warnings only
-const FG_OK: u32      = 0x0000FF00;   // Green — success indicators
-const FG_PROMPT: u32  = 0x0000FF00;   // Green — prompt user@host
-const FG_PATH: u32    = 0x00FF8844;   // Blue-ish — prompt path (BGR)
-const FG_DIR: u32     = 0x00FF8844;   // Blue — directory names in ls
-const FG_HL: u32      = 0x0000CCFF;   // Cyan highlight
-const BG: u32         = 0x00000000;   // Black background
+/// Shell builtins and file commands, for Tab completion only.
+const SHELL_COMMANDS: &[&str] = &[
+    "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "echo", "write", "save",
+    "export", "set", "unset", "env", "alias", "unalias", "source", "bash", "sh",
+    "type", "which", "test", "read", "exit", "plum", "ip",
+];
 
-// ─── Prompt ───
-const PROMPT_USER: &str = "root@ospab";
-const PROMPT_SEP: &str  = ":";
-const PROMPT_PATH: &str = "~";
-const PROMPT_HASH: &str = "# ";
+/// Commands that draw full-screen UIs, wait for keys or run until stopped:
+/// the pager is not used for them.
+const NO_PAGER: &[&str] = &[
+    "grape", "doom", "top", "ping", "install", "tomato", "yes", "clear",
+    "bench", "reboot", "shutdown", "poweroff", "halt", "traceroute", "seed",
+    "curl", "soundtest", "ntpdate", "netdiag", "verify_audio", "verify_net", "read",
+    "testmode",
+];
+
+/// PIT rate behind `idt::timer_ticks()`.
+const TIMER_HZ: u64 = 100;
+
+// ─── Colors (0x00RRGGBB; the framebuffer converts to its native layout) ───
+const FG: u32         = 0x00FFFFFF;   // Default text
+const FG_DIM: u32     = 0x00A0A0A0;   // Secondary info
+const FG_ERR: u32     = 0x00FF5555;   // Errors
+const FG_WARN: u32    = 0x00FFCC44;   // Warnings, section headings
+const FG_OK: u32      = 0x0055DD55;   // Success
+const FG_PROMPT: u32  = 0x0055DD55;   // Prompt user@host
+const FG_PATH: u32    = 0x005599FF;   // Prompt path
+const FG_HL: u32      = 0x0055CCFF;   // Highlighted names (commands, keys)
+const BG: u32         = 0x00000000;
 
 // ─── Input buffer ───
 const INPUT_BUFFER_SIZE: usize = 256;
@@ -77,7 +72,7 @@ static mut INPUT_LEN: usize = 0;
 static mut INPUT_CURSOR: usize = 0;
 
 // ─── Command history ───
-const HISTORY_SIZE: usize = 16;
+const HISTORY_SIZE: usize = 64;
 static mut HISTORY: [[u8; INPUT_BUFFER_SIZE]; HISTORY_SIZE] = [[0; INPUT_BUFFER_SIZE]; HISTORY_SIZE];
 static mut HISTORY_LENS: [usize; HISTORY_SIZE] = [0; HISTORY_SIZE];
 static mut HISTORY_COUNT: usize = 0;
@@ -87,132 +82,43 @@ static mut HISTORY_BROWSING: bool = false;
 // ─── Prompt position tracking ───
 static mut PROMPT_END_X: u64 = 0;
 static mut PROMPT_END_Y: u64 = 0;
-
-// ─── Current working directory ───
-static mut CWD: [u8; 64] = [0; 64];
-static mut CWD_LEN: usize = 0;
-
-fn init_cwd() {
-    unsafe {
-        CWD[0] = b'/';
-        CWD_LEN = 1;
-    }
-}
+/// framebuffer::scroll_count() when PROMPT_END_Y was last valid.
+static mut PROMPT_SCROLLS: u64 = 0;
 
 fn cwd_str() -> &'static str {
     ospab_os::plum::cwd()
 }
 
-/// Resolve a user-supplied path to an absolute path.
-/// Delegates to plum shell's path resolution (uses PWD env).
-fn resolve_path(path: &str) -> alloc::string::String {
+/// Resolve a user-supplied path to an absolute path (plum's PWD rules).
+fn resolve_path(path: &str) -> String {
     ospab_os::plum::resolve_path(path)
 }
 
-/// Return a slice of the current input up to cursor as &str
-fn current_input_prefix() -> &'static str {
-    unsafe { core::str::from_utf8_unchecked(&INPUT_BUFFER[..INPUT_CURSOR]) }
-}
-
-/// Attempt to complete the token before the cursor. Returns number of bytes inserted.
-fn try_complete() -> Option<usize> {
-    // Find token bounds (last space/tab)
-    let prefix = current_input_prefix();
-    let token_start = prefix.rfind(' ').map(|p| p + 1).unwrap_or(0);
-    let token = &prefix[token_start..];
-
-    // If empty token, nothing to do
-    if token.is_empty() { return Some(0); }
-
-    // If token contains '/', complete path
-    let (dir, base) = if let Some(pos) = token.rfind('/') {
-        let dir = &token[..pos];
-        let base = &token[pos + 1..];
-        let mut abs = resolve_path(dir);
-        if abs.is_empty() { abs.push('/'); }
-        (abs, base)
-    } else {
-        (alloc::string::String::from(cwd_str()), token)
-    };
-
-    // Collect matches from filesystem
-    let mut matches: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    if let Some(entries) = fs::readdir(&dir) {
-        for e in entries {
-            if e.name.starts_with(base) {
-                matches.push(e.name);
+/// Hostname from /etc/hostname, or "ospab".
+fn hostname() -> String {
+    if let Some(data) = fs::read_file("/etc/hostname") {
+        if let Ok(text) = core::str::from_utf8(&data) {
+            let t = text.trim();
+            if !t.is_empty() {
+                return String::from(t);
             }
         }
     }
-
-    // If token has no slash and is first token, also complete builtins and axon commands
-    let is_first_token = token_start == 0;
-    if is_first_token && !token.contains('/') {
-        for &b in BUILTINS {
-            if b.starts_with(token) { matches.push(alloc::string::String::from(b)); }
-        }
-        for &a in axon::command_list() {
-            if a.starts_with(token) { matches.push(alloc::string::String::from(a)); }
-        }
-    }
-
-    // Deduplicate
-    matches.sort();
-    matches.dedup();
-
-    if matches.is_empty() {
-        return Some(0);
-    }
-
-    // Unique completion: insert remainder
-    if matches.len() == 1 {
-        let m = &matches[0];
-        if m.len() >= base.len() {
-            let suffix = &m[base.len()..];
-            unsafe {
-                let need = suffix.len();
-                if INPUT_LEN + need >= INPUT_BUFFER_SIZE { return Some(0); }
-                for i in (INPUT_CURSOR..INPUT_LEN).rev() {
-                    INPUT_BUFFER[i + need] = INPUT_BUFFER[i];
-                }
-                for (k, b) in suffix.as_bytes().iter().enumerate() {
-                    INPUT_BUFFER[INPUT_CURSOR + k] = *b;
-                }
-                INPUT_CURSOR += need;
-                INPUT_LEN += need;
-            }
-            return Some(suffix.len());
-        }
-        return Some(0);
-    }
-
-    // Multiple matches: show list and redraw line
-    puts("\n");
-    for m in &matches {
-        puts(m);
-        puts("  ");
-    }
-    puts("\n");
-    // Redraw prompt + input line
-    redraw_line();
-    Some(0)
+    String::from("ospab")
 }
+
+// ══════════════════════════════════════════════════════════════
+// Main loop
+// ══════════════════════════════════════════════════════════════
 
 /// Main terminal loop — never returns
 pub fn run() -> ! {
     keyboard::init();
-    init_cwd();
+    ospab_os::plum::set_external_handler(console_handler);
 
     framebuffer::clear(BG);
     framebuffer::set_cursor_pos(0, 0);
-
-    // Minimal welcome — white text
-    puts("AETERNA Microkernel ");
-    puts(crate::version::VERSION_STR);
-    puts(" (");
-    puts(crate::version::ARCH);
-    puts(")\n");
-    puts("Type 'help' for available commands.\n\n");
+    print_banner();
 
     klog::record(klog::EventSource::Terminal, "Terminal started");
 
@@ -221,9 +127,26 @@ pub fn run() -> ! {
         let cmd = read_line();
         if !cmd.is_empty() {
             history_push(cmd);
-            execute_command(cmd);
+            // Copy out of the static input buffer: commands may re-enter the line editor.
+            let owned = String::from(cmd);
+            execute_command(&owned);
         }
     }
+}
+
+fn print_banner() {
+    framebuffer::draw_string(crate::version::OS_VERSION, FG_OK, BG);
+    dim_print("  AETERNA kernel ");
+    dim_print(crate::version::VERSION_STR);
+    dim_print(" (");
+    dim_print(crate::version::ARCH);
+    dim_print(")\n");
+    dim_print("Development build: the shell and all tools run inside the kernel (ring 0).\n");
+    puts("Type ");
+    hl_print("help");
+    puts(" for commands, ");
+    hl_print("tutor");
+    puts(" for a short tour.\n\n");
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -231,20 +154,46 @@ pub fn run() -> ! {
 // ══════════════════════════════════════════════════════════════
 
 fn draw_prompt() {
-    framebuffer::draw_string(PROMPT_USER, FG_PROMPT, BG);
-    framebuffer::draw_string(PROMPT_SEP, FG, BG);
-    // Show live PWD from plum shell
-    let pwd = ospab_os::plum::cwd();
-    if pwd == "/" {
+    // Start the prompt on a fresh line if a command left the cursor mid-line.
+    let (x, _) = framebuffer::cursor_pos();
+    if x != 0 {
+        puts("\n");
+    }
+    let host = hostname();
+    framebuffer::draw_string("root@", FG_PROMPT, BG);
+    framebuffer::draw_string(&host, FG_PROMPT, BG);
+    framebuffer::draw_string(":", FG, BG);
+    let pwd = cwd_str();
+    let home = ospab_os::plum::getenv("HOME").unwrap_or("");
+    if !home.is_empty() && home != "/" && pwd == home {
         framebuffer::draw_string("~", FG_PATH, BG);
+    } else if !home.is_empty() && home != "/" && pwd.starts_with(home)
+        && pwd.as_bytes().get(home.len()) == Some(&b'/')
+    {
+        framebuffer::draw_string("~", FG_PATH, BG);
+        framebuffer::draw_string(&pwd[home.len()..], FG_PATH, BG);
     } else {
         framebuffer::draw_string(pwd, FG_PATH, BG);
     }
-    framebuffer::draw_string(PROMPT_HASH, FG, BG);
+    framebuffer::draw_string("# ", FG, BG);
     unsafe {
         let (x, y) = framebuffer::cursor_pos();
         PROMPT_END_X = x;
         PROMPT_END_Y = y;
+        PROMPT_SCROLLS = framebuffer::scroll_count();
+    }
+}
+
+/// If the screen scrolled since the prompt was drawn, move the remembered
+/// prompt position up by the same number of text rows.
+fn track_scroll() {
+    unsafe {
+        let now = framebuffer::scroll_count();
+        let delta = now.wrapping_sub(PROMPT_SCROLLS);
+        if delta > 0 {
+            PROMPT_END_Y = PROMPT_END_Y.saturating_sub(delta * framebuffer::CHAR_HEIGHT);
+            PROMPT_SCROLLS = now;
+        }
     }
 }
 
@@ -256,6 +205,15 @@ fn history_push(cmd: &str) {
     let bytes = cmd.as_bytes();
     if bytes.is_empty() { return; }
     unsafe {
+        // Skip an exact repeat of the previous command.
+        if HISTORY_COUNT > 0 {
+            let prev = (HISTORY_COUNT - 1) % HISTORY_SIZE;
+            if &HISTORY[prev][..HISTORY_LENS[prev]] == bytes {
+                HISTORY_POS = HISTORY_COUNT;
+                HISTORY_BROWSING = false;
+                return;
+            }
+        }
         let slot = HISTORY_COUNT % HISTORY_SIZE;
         let len = bytes.len().min(INPUT_BUFFER_SIZE);
         HISTORY[slot][..len].copy_from_slice(&bytes[..len]);
@@ -300,36 +258,26 @@ fn history_down() -> Option<&'static str> {
 
 fn replace_input_line(new_text: &str) {
     unsafe {
-        // Clear old text on screen
-        let (sx, sy) = input_screen_pos(0);
-        framebuffer::set_cursor_pos(sx, sy);
-        for _ in 0..INPUT_LEN {
-            framebuffer::draw_char(' ', FG, BG);
-        }
-        framebuffer::draw_char(' ', FG, BG); // extra for old cursor block
-        // Write new text
-        framebuffer::set_cursor_pos(PROMPT_END_X, PROMPT_END_Y);
+        let old_len = INPUT_LEN;
         let bytes = new_text.as_bytes();
         let len = bytes.len().min(INPUT_BUFFER_SIZE - 1);
         INPUT_BUFFER[..len].copy_from_slice(&bytes[..len]);
         INPUT_LEN = len;
         INPUT_CURSOR = len;
-        for i in 0..len {
-            framebuffer::draw_char(bytes[i] as char, FG, BG);
-        }
+        redraw_input_from(0, old_len);
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-// Cursor position helpers
+// Line editor helpers
 // ══════════════════════════════════════════════════════════════
 
-/// Compute the screen pixel position for a given buffer index.
+/// Screen pixel position for a given input buffer index.
 fn input_screen_pos(idx: usize) -> (u64, u64) {
     unsafe {
         let cw = framebuffer::CHAR_WIDTH;
         let ch = framebuffer::CHAR_HEIGHT;
-        let cols = framebuffer::screen_cols();
+        let cols = framebuffer::screen_cols().max(1);
         let prompt_col = PROMPT_END_X / cw;
         let total_col = prompt_col + idx as u64;
         let row_offset = total_col / cols;
@@ -338,46 +286,45 @@ fn input_screen_pos(idx: usize) -> (u64, u64) {
     }
 }
 
-/// Redraw the input buffer from position `from` to end, clear trailing char,
-/// then reposition framebuffer cursor to INPUT_CURSOR.
-fn redraw_input_from(from: usize) {
+/// Redraw the input from `from` to the end, blank out what is left of an
+/// older, longer line (`old_len`), then put the cursor at INPUT_CURSOR.
+fn redraw_input_from(from: usize, old_len: usize) {
     unsafe {
         let (x, y) = input_screen_pos(from);
         framebuffer::set_cursor_pos(x, y);
         for i in from..INPUT_LEN {
             framebuffer::draw_char(INPUT_BUFFER[i] as char, FG, BG);
+            track_scroll();
         }
-        // Clear one trailing char (covers deletions)
-        framebuffer::draw_char(' ', FG, BG);
-        // Reposition to cursor
+        let tail = old_len.max(INPUT_LEN + 1) - INPUT_LEN;
+        for _ in 0..tail {
+            framebuffer::draw_char(' ', FG, BG);
+            track_scroll();
+        }
         let (cx, cy) = input_screen_pos(INPUT_CURSOR);
         framebuffer::set_cursor_pos(cx, cy);
     }
 }
 
-/// Redraw prompt and the whole input line (used after listing completions)
+/// Redraw prompt and the whole input line on a new line (after completion lists).
 fn redraw_line() {
-    // Move to new line, redraw prompt and buffer
-    framebuffer::draw_char('\n', FG, BG);
     draw_prompt();
     unsafe {
         for i in 0..INPUT_LEN {
             framebuffer::draw_char(INPUT_BUFFER[i] as char, FG, BG);
+            track_scroll();
         }
         let (cx, cy) = input_screen_pos(INPUT_CURSOR);
         framebuffer::set_cursor_pos(cx, cy);
     }
 }
 
-/// Draw a visible block cursor (inverted colors) at current INPUT_CURSOR.
+/// Draw a block cursor (inverted colors) at INPUT_CURSOR.
 fn draw_input_cursor() {
     unsafe {
         let (x, y) = input_screen_pos(INPUT_CURSOR);
-        if INPUT_CURSOR < INPUT_LEN {
-            framebuffer::draw_char_at(x, y, INPUT_BUFFER[INPUT_CURSOR] as char, BG, FG);
-        } else {
-            framebuffer::draw_char_at(x, y, ' ', BG, FG);
-        }
+        let c = if INPUT_CURSOR < INPUT_LEN { INPUT_BUFFER[INPUT_CURSOR] as char } else { ' ' };
+        framebuffer::draw_char_at(x, y, c, BG, FG);
     }
 }
 
@@ -385,12 +332,121 @@ fn draw_input_cursor() {
 fn erase_input_cursor() {
     unsafe {
         let (x, y) = input_screen_pos(INPUT_CURSOR);
-        if INPUT_CURSOR < INPUT_LEN {
-            framebuffer::draw_char_at(x, y, INPUT_BUFFER[INPUT_CURSOR] as char, FG, BG);
-        } else {
-            framebuffer::draw_char_at(x, y, ' ', FG, BG);
+        let c = if INPUT_CURSOR < INPUT_LEN { INPUT_BUFFER[INPUT_CURSOR] as char } else { ' ' };
+        framebuffer::draw_char_at(x, y, c, FG, BG);
+    }
+}
+
+/// Delete `count` bytes starting at `at` from the input buffer.
+unsafe fn input_delete(at: usize, count: usize) {
+    if count == 0 || at >= INPUT_LEN { return; }
+    let count = count.min(INPUT_LEN - at);
+    for i in at..INPUT_LEN - count {
+        INPUT_BUFFER[i] = INPUT_BUFFER[i + count];
+    }
+    INPUT_LEN -= count;
+}
+
+/// Insert bytes at the cursor. Returns how many were inserted.
+unsafe fn input_insert(bytes: &[u8]) -> usize {
+    let need = bytes.len();
+    if need == 0 || INPUT_LEN + need >= INPUT_BUFFER_SIZE { return 0; }
+    for i in (INPUT_CURSOR..INPUT_LEN).rev() {
+        INPUT_BUFFER[i + need] = INPUT_BUFFER[i];
+    }
+    INPUT_BUFFER[INPUT_CURSOR..INPUT_CURSOR + need].copy_from_slice(bytes);
+    INPUT_CURSOR += need;
+    INPUT_LEN += need;
+    need
+}
+
+// ══════════════════════════════════════════════════════════════
+// Tab completion
+// ══════════════════════════════════════════════════════════════
+
+fn current_input_prefix() -> &'static str {
+    unsafe { core::str::from_utf8_unchecked(&INPUT_BUFFER[..INPUT_CURSOR]) }
+}
+
+/// Complete the token before the cursor. Returns number of bytes inserted.
+fn try_complete() -> usize {
+    let prefix = current_input_prefix();
+    let token_start = prefix.rfind(' ').map(|p| p + 1).unwrap_or(0);
+    let token = &prefix[token_start..];
+    let is_first_token = prefix[..token_start].trim().is_empty();
+
+    let (dir, base) = if let Some(pos) = token.rfind('/') {
+        let dir_part = &token[..pos];
+        let abs = if dir_part.is_empty() { String::from("/") } else { resolve_path(dir_part) };
+        (abs, &token[pos + 1..])
+    } else {
+        (String::from(cwd_str()), token)
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+    if is_first_token && !token.contains('/') {
+        for &b in TERMINAL_COMMANDS.iter().chain(SHELL_COMMANDS.iter()).chain(axon::command_list().iter()) {
+            if b.starts_with(token) { matches.push(String::from(b)); }
+        }
+    } else if let Some(entries) = fs::readdir(&dir) {
+        for e in entries {
+            if e.name.starts_with(base) {
+                let mut name = e.name.clone();
+                if e.node_type == fs::NodeType::Directory { name.push('/'); }
+                matches.push(name);
+            }
         }
     }
+    matches.sort();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return 0;
+    }
+
+    // Longest common prefix of all matches.
+    let first = matches[0].as_bytes();
+    let mut common = first.len();
+    for m in &matches[1..] {
+        let mb = m.as_bytes();
+        let mut n = 0;
+        while n < common && n < mb.len() && mb[n] == first[n] { n += 1; }
+        common = n;
+    }
+
+    if common > base.len() {
+        let suffix = &matches[0][base.len()..common];
+        let mut ins = String::from(suffix);
+        if matches.len() == 1 && !suffix.ends_with('/') {
+            ins.push(' ');
+        }
+        return unsafe { input_insert(ins.as_bytes()) };
+    }
+
+    if matches.len() > 1 {
+        // Show candidates in columns, then redraw the line below them.
+        unsafe {
+            let (ex, ey) = input_screen_pos(INPUT_LEN);
+            framebuffer::set_cursor_pos(ex, ey);
+        }
+        puts("\n");
+        let width = matches.iter().map(|m| m.len()).max().unwrap_or(1) + 2;
+        let cols = (framebuffer::screen_cols() as usize / width).max(1);
+        for (i, m) in matches.iter().enumerate() {
+            if m.ends_with('/') {
+                framebuffer::draw_string(m, FG_PATH, BG);
+            } else {
+                puts(m);
+            }
+            if (i + 1) % cols == 0 || i + 1 == matches.len() {
+                puts("\n");
+            } else {
+                pad(m.len(), width);
+            }
+        }
+        redraw_line();
+    }
+    0
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -406,674 +462,555 @@ fn read_line() -> &'static str {
         draw_input_cursor();
 
         loop {
-            let c = keyboard::poll_key();
-
-            if let Some(ch) = c {
-                erase_input_cursor();
-
-                match ch {
-                    '\n' => {
-                        // Move fb cursor past end of text before newline
-                        let (ex, ey) = input_screen_pos(INPUT_LEN);
-                        framebuffer::set_cursor_pos(ex, ey);
-                        framebuffer::draw_char('\n', FG, BG);
-                        INPUT_BUFFER[INPUT_LEN] = 0;
-                        return core::str::from_utf8_unchecked(&INPUT_BUFFER[..INPUT_LEN]);
+            let ch = match keyboard::try_read_key() {
+                Some(c) => c,
+                None => {
+                    // No key — sleep until the next interrupt, then let a
+                    // deferred disk write-back run if one is due.
+                    asm!("hlt");
+                    if ospab_os::drivers::disk_count() > 0 {
+                        fs::disk_sync::deferred_tick();
                     }
+                    continue;
+                }
+            };
 
-                    '\x08' => {
-                        // Backspace: delete char before cursor
-                        if INPUT_CURSOR > 0 {
-                            for i in INPUT_CURSOR..INPUT_LEN {
-                                INPUT_BUFFER[i - 1] = INPUT_BUFFER[i];
-                            }
-                            INPUT_CURSOR -= 1;
-                            INPUT_LEN -= 1;
-                            redraw_input_from(INPUT_CURSOR);
-                        }
-                    }
+            erase_input_cursor();
 
-                    k if k == keyboard::KEY_DELETE => {
-                        // Delete: remove char at cursor
-                        if INPUT_CURSOR < INPUT_LEN {
-                            for i in INPUT_CURSOR..INPUT_LEN - 1 {
-                                INPUT_BUFFER[i] = INPUT_BUFFER[i + 1];
-                            }
-                            INPUT_LEN -= 1;
-                            redraw_input_from(INPUT_CURSOR);
-                        }
-                    }
-
-                    k if k == keyboard::KEY_LEFT => {
-                        if INPUT_CURSOR > 0 {
-                            INPUT_CURSOR -= 1;
-                            let (x, y) = input_screen_pos(INPUT_CURSOR);
-                            framebuffer::set_cursor_pos(x, y);
-                        }
-                    }
-
-                    k if k == keyboard::KEY_RIGHT => {
-                        if INPUT_CURSOR < INPUT_LEN {
-                            INPUT_CURSOR += 1;
-                            let (x, y) = input_screen_pos(INPUT_CURSOR);
-                            framebuffer::set_cursor_pos(x, y);
-                        }
-                    }
-
-                    k if k == keyboard::KEY_HOME => {
-                        INPUT_CURSOR = 0;
-                        framebuffer::set_cursor_pos(PROMPT_END_X, PROMPT_END_Y);
-                    }
-
-                    k if k == keyboard::KEY_END => {
-                        INPUT_CURSOR = INPUT_LEN;
-                        let (x, y) = input_screen_pos(INPUT_LEN);
-                        framebuffer::set_cursor_pos(x, y);
-                    }
-
-                    k if k == keyboard::KEY_UP => {
-                        if let Some(text) = history_up() {
-                            replace_input_line(text);
-                        }
-                    }
-
-                    k if k == keyboard::KEY_DOWN => {
-                        if let Some(text) = history_down() {
-                            replace_input_line(text);
-                        }
-                    }
-
-                    '\x03' => {
-                        // Ctrl+C: cancel input
-                        let (ex, ey) = input_screen_pos(INPUT_LEN);
-                        framebuffer::set_cursor_pos(ex, ey);
-                        framebuffer::draw_string("^C", FG_DIM, BG);
-                        framebuffer::draw_char('\n', FG, BG);
-                        INPUT_LEN = 0;
-                        INPUT_CURSOR = 0;
-                        CTRL_C.store(false, Ordering::Relaxed);
-                        return core::str::from_utf8_unchecked(&INPUT_BUFFER[..0]);
-                    }
-
-                    '\x0C' => {
-                        // Ctrl+L: clear screen
-                        framebuffer::clear(BG);
-                        framebuffer::set_cursor_pos(0, 0);
-                        INPUT_LEN = 0;
-                        INPUT_CURSOR = 0;
-                        return core::str::from_utf8_unchecked(&INPUT_BUFFER[..0]);
-                    }
-
-                    '\t' => {
-                        // Tab: completion for commands and filesystem entries
-                        if let Some(inserted) = try_complete() {
-                            if inserted > 0 {
-                                redraw_input_from(INPUT_CURSOR - inserted);
-                            }
-                        }
-                    }
-
-                    '\x1B' | '\x04' => {}
-                    k if k == keyboard::KEY_PGUP || k == keyboard::KEY_PGDN => {}
-
-                    c if c.is_ascii() && (c as u8) >= 0x20 => {
-                        if INPUT_LEN < INPUT_BUFFER_SIZE - 1 {
-                            // Insert character at cursor position
-                            for i in (INPUT_CURSOR..INPUT_LEN).rev() {
-                                INPUT_BUFFER[i + 1] = INPUT_BUFFER[i];
-                            }
-                            INPUT_BUFFER[INPUT_CURSOR] = c as u8;
-                            INPUT_CURSOR += 1;
-                            INPUT_LEN += 1;
-
-                            if INPUT_CURSOR == INPUT_LEN {
-                                // Appending at end — just draw the char
-                                framebuffer::draw_char(c, FG, BG);
-                            } else {
-                                // Inserted in middle — redraw from insert point
-                                redraw_input_from(INPUT_CURSOR - 1);
-                            }
-                        }
-                    }
-
-                    _ => {}
+            match ch {
+                '\n' => {
+                    let (ex, ey) = input_screen_pos(INPUT_LEN);
+                    framebuffer::set_cursor_pos(ex, ey);
+                    framebuffer::draw_char('\n', FG, BG);
+                    INPUT_BUFFER[INPUT_LEN] = 0;
+                    return core::str::from_utf8_unchecked(&INPUT_BUFFER[..INPUT_LEN]);
                 }
 
-                draw_input_cursor();
-            } else {
-                // No key — yield CPU, then check if a deferred write-back is due.
-                unsafe { core::arch::asm!("hlt"); }
-                ospab_os::fs::disk_sync::deferred_tick();
+                '\x08' => {
+                    // Backspace: delete char before cursor
+                    if INPUT_CURSOR > 0 {
+                        let old = INPUT_LEN;
+                        INPUT_CURSOR -= 1;
+                        input_delete(INPUT_CURSOR, 1);
+                        redraw_input_from(INPUT_CURSOR, old);
+                    }
+                }
+
+                k if k == keyboard::KEY_DELETE || k == '\x04' => {
+                    // Delete / Ctrl+D: remove char at cursor
+                    if INPUT_CURSOR < INPUT_LEN {
+                        let old = INPUT_LEN;
+                        input_delete(INPUT_CURSOR, 1);
+                        redraw_input_from(INPUT_CURSOR, old);
+                    }
+                }
+
+                k if k == keyboard::KEY_LEFT || k == '\x02' => {
+                    if INPUT_CURSOR > 0 { INPUT_CURSOR -= 1; }
+                }
+
+                k if k == keyboard::KEY_RIGHT || k == '\x06' => {
+                    if INPUT_CURSOR < INPUT_LEN { INPUT_CURSOR += 1; }
+                }
+
+                k if k == keyboard::KEY_HOME || k == '\x01' => {
+                    INPUT_CURSOR = 0;
+                }
+
+                k if k == keyboard::KEY_END || k == '\x05' => {
+                    INPUT_CURSOR = INPUT_LEN;
+                }
+
+                k if k == keyboard::KEY_UP || k == '\x10' => {
+                    if let Some(text) = history_up() {
+                        replace_input_line(text);
+                    }
+                }
+
+                k if k == keyboard::KEY_DOWN || k == '\x0E' => {
+                    if let Some(text) = history_down() {
+                        replace_input_line(text);
+                    }
+                }
+
+                '\x15' => {
+                    // Ctrl+U: delete from line start to cursor
+                    let old = INPUT_LEN;
+                    let n = INPUT_CURSOR;
+                    INPUT_CURSOR = 0;
+                    input_delete(0, n);
+                    redraw_input_from(0, old);
+                }
+
+                '\x0B' => {
+                    // Ctrl+K: delete from cursor to end of line
+                    let old = INPUT_LEN;
+                    INPUT_LEN = INPUT_CURSOR;
+                    redraw_input_from(INPUT_CURSOR, old);
+                }
+
+                '\x17' => {
+                    // Ctrl+W: delete the word before the cursor
+                    let old = INPUT_LEN;
+                    let mut start = INPUT_CURSOR;
+                    while start > 0 && INPUT_BUFFER[start - 1] == b' ' { start -= 1; }
+                    while start > 0 && INPUT_BUFFER[start - 1] != b' ' { start -= 1; }
+                    let n = INPUT_CURSOR - start;
+                    INPUT_CURSOR = start;
+                    input_delete(start, n);
+                    redraw_input_from(start, old);
+                }
+
+                '\x03' => {
+                    // Ctrl+C: cancel input
+                    let (ex, ey) = input_screen_pos(INPUT_LEN);
+                    framebuffer::set_cursor_pos(ex, ey);
+                    framebuffer::draw_string("^C", FG_DIM, BG);
+                    framebuffer::draw_char('\n', FG, BG);
+                    INPUT_LEN = 0;
+                    INPUT_CURSOR = 0;
+                    return core::str::from_utf8_unchecked(&INPUT_BUFFER[..0]);
+                }
+
+                '\x0C' => {
+                    // Ctrl+L: clear screen, keep what was typed
+                    framebuffer::clear(BG);
+                    framebuffer::set_cursor_pos(0, 0);
+                    redraw_line();
+                }
+
+                '\t' => {
+                    let start = INPUT_CURSOR;
+                    let inserted = try_complete();
+                    if inserted > 0 {
+                        redraw_input_from(start, INPUT_LEN);
+                    }
+                }
+
+                c if c.is_ascii() && (c as u8) >= 0x20 && (c as u8) < 0x7F => {
+                    let at_end = INPUT_CURSOR == INPUT_LEN;
+                    if input_insert(&[c as u8]) == 1 {
+                        if at_end {
+                            let (x, y) = input_screen_pos(INPUT_CURSOR - 1);
+                            framebuffer::set_cursor_pos(x, y);
+                            framebuffer::draw_char(c, FG, BG);
+                        } else {
+                            redraw_input_from(INPUT_CURSOR - 1, INPUT_LEN);
+                        }
+                    }
+                }
+
+                _ => {}
             }
+
+            track_scroll();
+            let (cx, cy) = input_screen_pos(INPUT_CURSOR);
+            framebuffer::set_cursor_pos(cx, cy);
+            draw_input_cursor();
         }
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-// Command dispatch
+// Pager
 // ══════════════════════════════════════════════════════════════
 
-fn execute_command(cmd: &str) {
-    let cmd = cmd.trim();
-    if cmd.is_empty() { return; }
+/// Wait for one key, sleeping between interrupts.
+fn wait_key() -> char {
+    loop {
+        if let Some(k) = keyboard::try_read_key() {
+            return k;
+        }
+        unsafe { asm!("hlt"); }
+    }
+}
 
-    // Reset Ctrl+C before running any command so previous ^C doesn’t bleed
-    CTRL_C.store(false, Ordering::Relaxed);
+/// Called by the framebuffer after each screenful of output.
+fn pager_hook() -> bool {
+    let (_, y) = framebuffer::cursor_pos();
+    framebuffer::set_cursor_pos(0, y);
+    framebuffer::draw_string(" --More-- ", BG, FG_DIM);
+    framebuffer::draw_string("  Space/Enter: next page   q: stop", FG_DIM, BG);
+    let k = wait_key();
+    framebuffer::set_cursor_pos(0, y);
+    framebuffer::clear_to_eol(BG);
+    match k {
+        'q' | 'Q' | '\x1B' | '\x03' => false,
+        _ => true,
+    }
+}
 
-    klog::record(klog::EventSource::Terminal, cmd);
+// ══════════════════════════════════════════════════════════════
+// Command parsing and dispatch
+// ══════════════════════════════════════════════════════════════
 
-    let (command, args) = match cmd.find(' ') {
-        Some(pos) => (&cmd[..pos], cmd[pos + 1..].trim()),
-        None => (cmd, ""),
-    };
+/// Characters that need the plum parser (pipes, chaining, redirection,
+/// variables, quoting, globs, substitution).
+fn needs_shell(line: &str) -> bool {
+    line.bytes().any(|b| matches!(b, b'|' | b';' | b'&' | b'<' | b'>' | b'$' | b'`'
+        | b'(' | b')' | b'\'' | b'"' | b'*' | b'?' | b'[' | b'~' | b'='))
+}
 
+fn split_first_word(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    match s.find(|c: char| c == ' ' || c == '\t') {
+        Some(pos) => (&s[..pos], s[pos + 1..].trim()),
+        None => (s, ""),
+    }
+}
+
+/// Run one input line. Simple console commands run directly; everything else
+/// (and every line with shell syntax) goes to the plum shell, which calls
+/// back into `console_handler` for console commands it meets.
+fn execute_command(line: &str) {
+    let line = line.trim();
+    if line.is_empty() { return; }
+
+    let (command, args) = split_first_word(line);
+    let paged = !NO_PAGER.contains(&command);
+    if paged {
+        framebuffer::pager_begin(pager_hook);
+    }
+
+    let direct = !needs_shell(line) && is_console_command(command);
+    if direct {
+        dispatch_console(command, args);
+    } else {
+        ospab_os::plum::run_line(line);
+    }
+
+    if paged {
+        framebuffer::pager_end();
+    }
+}
+
+/// Handler registered with plum for console commands used inside shell lines.
+fn console_handler(command: &str, args: &str) -> bool {
+    dispatch_console(command, args)
+}
+
+fn is_console_command(command: &str) -> bool {
+    TERMINAL_COMMANDS.contains(&command)
+}
+
+/// Run a command implemented in this file. Returns false if `command` is not one.
+fn dispatch_console(command: &str, args: &str) -> bool {
     match command {
         "help"    => cmd_help(args),
-        "echo"    => cmd_echo(args),
         "clear"   => cmd_clear(),
         "ver" | "version" => cmd_version(),
         "uname"   => cmd_uname(args),
-        "whoami"  => cmd_whoami(),
+        "whoami"  => puts("root\n"),
         "hostname"=> cmd_hostname(args),
-        "date"    => cmd_date(),
+        "date"    => cmd_date(args),
         "about"   => cmd_about(),
-        "meminfo" | "free" => cmd_meminfo(),
+        "free"    => cmd_free(),
+        "meminfo" => cmd_cat_proc("/proc/meminfo"),
         "uptime"  => cmd_uptime(),
         "dmesg"   => cmd_dmesg(),
         "lsmem"   => cmd_lsmem(),
-        "ifconfig"  => cmd_ifconfig(),
-        "ip"        => cmd_ip(args),
-        "netdiag"  => {
-            puts("Running network diagnostics (output to serial COM1)...\n");
+        "ifconfig"=> cmd_ifconfig(),
+        "netdiag" => {
+            puts("Running network diagnostics (full report on serial COM1)...\n");
             ospab_os::net::diag::run_full_diagnostic();
             ospab_os::net::diag::run_screen_summary();
         }
         "soundtest" => cmd_soundtest(),
-        "vol"      => cmd_vol(args),
-        "mute"     => cmd_mute(),
+        "vol"     => cmd_vol(args),
+        "mute"    => cmd_mute(),
         "ntpdate" => cmd_ntpdate(args),
         "sync"    => cmd_sync(),
         "dump_disk" => cmd_dump_disk(args),
         "changelog" => cmd_changelog(),
         "reboot"  => cmd_reboot(),
         "shutdown" | "poweroff" | "halt" => cmd_shutdown(),
-        "install" => cmd_install(),
+        "install" => crate::installer::run(),
         "history" => cmd_history(),
         "tutor"   => cmd_tutor(args),
         "grape"   => cmd_grape(args),
         "tomato"  => cmd_tomato(args),
-        "seed"    => cmd_seed(args),
-        "bash"    => cmd_bash(args),
-        "doom"    => cmd_doom(args),
-        "ping"    => cmd_ping(args),
-        "aai"     => cmd_aai(args),
-        "bench"   => cmd_bench(args),
+        "seed"    => ospab_os::userspace::seed::run(args),
+        "doom"    => cmd_doom(),
+        "bench"   => ospab_os::bench::run(args),
         "ring3test" => cmd_ring3test(),
-        _ => {
-            // Check for bash script or binary execution
-            if command.starts_with("./") || command.starts_with("/") {
-                let resolved = ospab_os::plum::resolve_path(command);
-                if resolved.ends_with(".sh") {
-                    cmd_bash(&resolved);
-                    return;
-                }
+        "testmode" => testmode::run(args),
+        _ => return false,
+    }
+    true
+}
 
-                // Extensionless path-like command: route through AXON by basename.
-                // Example: ./ls, /bin/cat
-                let basename = resolved.rsplit('/').next().unwrap_or("");
-                if !basename.is_empty() && !basename.contains('.') {
-                    if axon::dispatch(basename, args) {
+// ══════════════════════════════════════════════════════════════
+// help
+// ══════════════════════════════════════════════════════════════
+
+struct HelpSection {
+    title: &'static str,
+    cmds: &'static [(&'static str, &'static str)],
+}
+
+const HELP: &[HelpSection] = &[
+    HelpSection { title: "Shell", cmds: &[
+        ("help [cmd]",       "this list, or details for one command"),
+        ("tutor [topic]",    "short guided tour"),
+        ("clear",            "clear the screen (Ctrl+L)"),
+        ("history",          "previous commands (Up/Down)"),
+        ("echo [text]",      "print text; > file, >> file"),
+        ("a | b, a; b",      "pipes, sequences, && and ||"),
+        ("export / unset",   "set / remove a variable"),
+        ("env / set",        "show variables"),
+        ("alias / unalias",  "command aliases"),
+        ("type <cmd>",       "what kind of command it is"),
+        ("bash <file.sh>",   "run a script (also: source)"),
+        ("plum",             "shell info"),
+    ]},
+    HelpSection { title: "Files", cmds: &[
+        ("ls [-l] [path]",   "list a directory"),
+        ("cd / pwd",         "change / print directory"),
+        ("cat <file>",       "print a file"),
+        ("mkdir / touch",    "create directory / file"),
+        ("rm <path>",        "remove file or empty dir"),
+        ("cp / mv",          "copy / move"),
+        ("write <f> <text>", "write text to a file"),
+        ("find / tree",      "find DIR -name X; directory tree"),
+        ("stat / du / df",   "file info, usage"),
+        ("sync (save)",      "write RAM filesystem to disk now"),
+    ]},
+    HelpSection { title: "Text", cmds: &[
+        ("grep <pat> <f>",   "search lines"),
+        ("head / tail",      "first / last lines"),
+        ("wc / nl",          "count / number lines"),
+        ("sort / uniq",      "sort, drop duplicates"),
+        ("cut / awk",        "fields"),
+        ("diff <a> <b>",     "compare files"),
+        ("xxd <file>",       "hex dump"),
+        ("seq / printf",     "numbers, formatted output"),
+        ("rev / tee / yes",  "misc text tools"),
+    ]},
+    HelpSection { title: "System", cmds: &[
+        ("version / uname",  "kernel version"),
+        ("about",            "what this system is"),
+        ("uptime / date",    "time since boot, clock"),
+        ("hostname [name]",  "show or set host name"),
+        ("free / meminfo",   "memory usage"),
+        ("lsmem",            "physical memory regions"),
+        ("ps / top / kill",  "scheduler tasks"),
+        ("dmesg",            "kernel event log"),
+        ("lspci",            "PCI devices"),
+        ("changelog",        "release notes"),
+    ]},
+    HelpSection { title: "Storage", cmds: &[
+        ("lsblk",            "disks"),
+        ("fdisk -l",         "partition tables"),
+        ("mkfs / mount",     "AeternaFS format / mount"),
+        ("dump_disk",        "hex dump of the persistence sector"),
+        ("install",          "install to disk (GPT + FAT32)"),
+    ]},
+    HelpSection { title: "Network", cmds: &[
+        ("ifconfig / ip",    "interface, address, routes"),
+        ("ping <host>",      "ICMP echo (-c -i -s -W)"),
+        ("nslookup <name>",  "DNS lookup"),
+        ("curl <url>",       "HTTP/HTTPS GET"),
+        ("traceroute <h>",   "route to a host"),
+        ("netstat",          "sockets"),
+        ("ntpdate [srv]",    "set clock via SNTP"),
+        ("netdiag",          "NIC diagnostics"),
+    ]},
+    HelpSection { title: "Apps", cmds: &[
+        ("grape [file]",     "text editor"),
+        ("tomato",           "package manager"),
+        ("seed",             "service list"),
+        ("doom",             "DOOM (if the WAD was bundled)"),
+    ]},
+    HelpSection { title: "Hardware & tests", cmds: &[
+        ("soundtest",        "audio driver check + 440 Hz tone"),
+        ("vol [n] / mute",   "volume"),
+        ("bench [n]",        "TSC timing/jitter benchmark"),
+        ("verify_mem",       "heap allocation test"),
+        ("verify_sched",     "timer/scheduler test"),
+        ("verify_net",       "network self-test"),
+        ("verify_audio",     "audio self-test"),
+        ("ring3test",        "start one ring-3 test task"),
+        ("testmode [item]",  "preview panic/fault screens, self-tests"),
+        ("reboot / shutdown","power"),
+    ]},
+];
+
+const HELP_NAME_W: usize = 19;
+
+fn cmd_help(args: &str) {
+    let topic = args.trim();
+    if !topic.is_empty() {
+        help_detail(topic);
+        return;
+    }
+
+    let cols = framebuffer::screen_cols() as usize;
+    let two_col = cols >= 116;
+    let col_w = if two_col { cols / 2 } else { cols };
+    let desc_w = col_w.saturating_sub(HELP_NAME_W + 3).max(10);
+
+    framebuffer::draw_string("Commands", FG_OK, BG);
+    dim_print("  (help <cmd> for details; long output pauses at --More--)\n");
+
+    let mut i = 0;
+    while i < HELP.len() {
+        if two_col && i + 1 < HELP.len() {
+            let (a, b) = (&HELP[i], &HELP[i + 1]);
+            help_heading(a.title, col_w);
+            help_heading(b.title, col_w);
+            puts("\n");
+            let rows = a.cmds.len().max(b.cmds.len());
+            for r in 0..rows {
+                let used = match a.cmds.get(r) {
+                    Some(&(n, d)) => help_cell(n, d, desc_w),
+                    None => 0,
+                };
+                pad(used, col_w);
+                if let Some(&(n, d)) = b.cmds.get(r) {
+                    help_cell(n, d, desc_w);
+                }
+                puts("\n");
+            }
+            i += 2;
+        } else {
+            help_heading(HELP[i].title, 0);
+            puts("\n");
+            for &(n, d) in HELP[i].cmds {
+                help_cell(n, d, desc_w);
+                puts("\n");
+            }
+            i += 1;
+        }
+    }
+    dim_print("Keys: Tab completes, Up/Down history, Ctrl+A/E start/end, Ctrl+U/K/W delete, Ctrl+C cancel.\n");
+}
+
+/// Section heading, padded to `width` (0 = no padding).
+fn help_heading(title: &str, width: usize) {
+    framebuffer::draw_string("\u{2500}\u{2500} ", FG_DIM, BG);
+    framebuffer::draw_string(title, FG_WARN, BG);
+    puts(" ");
+    let used = 4 + title.chars().count();
+    let line = if width > 0 { width.saturating_sub(used + 2) } else { 20usize.saturating_sub(title.len()) };
+    for _ in 0..line {
+        framebuffer::draw_string("\u{2500}", FG_DIM, BG);
+    }
+    if width > 0 {
+        puts("  ");
+    }
+}
+
+/// One "  name   description" cell. Returns the number of columns used.
+fn help_cell(name: &str, desc: &str, desc_w: usize) -> usize {
+    puts("  ");
+    hl_print(name);
+    pad(name.len(), HELP_NAME_W);
+    let d: &str = if desc.len() > desc_w { &desc[..desc_w] } else { desc };
+    dim_print(d);
+    2 + name.len().max(HELP_NAME_W) + d.len()
+}
+
+fn help_line(usage: &str, lines: &[&str]) {
+    hl_print(usage);
+    puts("\n");
+    for l in lines {
+        dim_print("  ");
+        dim_print(l);
+        puts("\n");
+    }
+}
+
+fn help_detail(topic: &str) {
+    match topic {
+        "ping" => help_line("ping [-c count] [-i sec] [-s bytes] [-W sec] <host>", &[
+            "Send ICMP echo requests. Runs until Ctrl+C unless -c is given.",
+            "Works with any supported NIC: RTL8139, RTL8169, e1000, virtio-net.",
+            "Example: ping -c 4 10.0.2.2",
+        ]),
+        "ntpdate" => help_line("ntpdate [server]", &[
+            "Set the clock via SNTP. Without an argument tries the QEMU gateway",
+            "and then public NTP servers. 'date' shows the result.",
+        ]),
+        "ifconfig" | "ip" => help_line("ifconfig | ip [addr|link|route]", &[
+            "Interface address, MAC, link state, gateway and packet counters.",
+        ]),
+        "tutor" => help_line("tutor [topic]", &[
+            "Topics: intro fs disk persistence net mem kernel shell axon commands",
+        ]),
+        "grape" => help_line("grape [file]", &[
+            "Text editor. Ctrl+O save, Ctrl+X exit, Ctrl+K cut line,",
+            "Ctrl+W search, Ctrl+G help.",
+        ]),
+        "tomato" => help_line("tomato <op> [pkg]", &[
+            "Package manager: -S install, -R remove, -Q list, -Ss search, -Syu update.",
+            "tomato --tmt <cmd> works with .tmt binary packages.",
+        ]),
+        "seed" => help_line("seed [status|start|stop|restart|log] [service]", &[
+            "Service manager. Note: the listed services are table entries; the",
+            "kernel does not run them as separate processes yet.",
+        ]),
+        "doom" => help_line("doom", &[
+            "Runs DOOM if doom1.wad was present at build time.",
+            "Arrows/WASD move, Ctrl fire, Space use, Esc menu.",
+        ]),
+        "soundtest" => help_line("soundtest", &[
+            "Shows the active audio driver (AC97 / HDA / ES1371), IRQ, rate and",
+            "volume, dumps registers to serial COM1 and plays 0.5 s of 440 Hz.",
+        ]),
+        "vol" => help_line("vol [N | +N | -N]", &[
+            "Show or set master volume in percent.",
+        ]),
+        "sync" | "save" => help_line("sync", &[
+            "Write the in-memory filesystem changes to the persistence area",
+            "(LBA 2048) of the first disk. Changes are also written automatically",
+            "about 10 s after the last change while the shell is idle.",
+        ]),
+        "cat" => help_line("cat <file>", &[
+            "Print a file. Live kernel data: /proc/cpuinfo meminfo uptime",
+            "version tasks mounts cmdline.",
+        ]),
+        "uname" => help_line("uname [-a|-s|-n|-r|-m]", &[
+            "-a all, -s kernel name, -n host name, -r release, -m machine.",
+        ]),
+        "free" | "meminfo" => help_line("free | meminfo", &[
+            "free: physical frames and kernel heap. meminfo: /proc/meminfo.",
+        ]),
+        "date" => help_line("date [-e | -n | --unix]", &[
+            "Local date/time. The clock starts from the CMOS RTC at boot and",
+            "'ntpdate' corrects it. System time counts from the ospab epoch,",
+            "2012-08-09 00:00:00 UTC: -e seconds, -n nanoseconds, --unix Unix seconds.",
+        ]),
+        "dmesg" => help_line("dmesg", &[
+            "The last 32 kernel events (boot, faults, commands). Full boot",
+            "log is on serial COM1.",
+        ]),
+        "ring3test" => help_line("ring3test", &[
+            "Spawns a CPL3 task that calls getpid and exit; the result is",
+            "printed on serial COM1.",
+        ]),
+        "bench" => help_line("bench [iterations]", &[
+            "Times a fixed FMA workload with the TSC and reports jitter.",
+        ]),
+        _ => {
+            for sec in HELP {
+                for &(n, d) in sec.cmds {
+                    let names = n.split(|c| c == ' ' || c == '/' || c == '(' || c == ')');
+                    if names.into_iter().any(|w| w == topic) {
+                        help_line(n, &[d]);
                         return;
                     }
                 }
-
-                dim_print("[SYS] Executing binary: ");
-                puts(&resolved);
-                puts("\n");
-                // In a full implementation, this would invoke the ELF loader (sys_spawn)
-                return;
             }
-
-            // AXON coreutils
-            if axon::dispatch(command, args) {
-                return;
-            }
-            // Try plum shell preprocessing (alias/variable expansion).
-            // preprocess() returns None if it handled the command itself
-            // (plum builtin, alias expanding to a plum builtin, etc.).
-            // It returns Some(expanded) if nobody recognised the command.
-            let full_cmd = if args.is_empty() {
-                alloc::string::String::from(command)
-            } else {
-                alloc::format!("{} {}", command, args)
-            };
-            if ospab_os::plum::preprocess(&full_cmd).is_some() {
-                // Nothing handled it — show "command not found"
-                err_print(command);
-                err_print(": command not found\n");
-                dim_print("  Type 'help' for available commands.\n");
-            }
-            // else: plum handled it internally (alias, builtin, etc.)
+            err_print("help: no such command: ");
+            err_print(topic);
+            puts("\n");
         }
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-// Commands
+// Basic commands
 // ══════════════════════════════════════════════════════════════
-
-fn cmd_help(args: &str) {
-    if !args.is_empty() {
-        // Detailed help for a specific command
-        match args {
-            "ping" => {
-                puts("ping <ip> [count]\n");
-                dim_print("  Send ICMP echo requests to a host.\n");
-                dim_print("  Default: 4 pings. Requires RTL8139 NIC.\n");
-                dim_print("  Example: ping 10.0.2.2\n");
-                dim_print("           ping 8.8.8.8 8\n");
-                return;
-            }
-            "ntpdate" => {
-                puts("ntpdate [server-ip]\n");
-                dim_print("  Synchronize system clock via SNTP.\n");
-                dim_print("  Default server: 10.0.2.2 (QEMU gateway).\n");
-                dim_print("  Example: ntpdate\n");
-                dim_print("           ntpdate 10.0.2.2\n");
-                return;
-            }
-            "ifconfig" | "ip" => {
-                puts("ifconfig\n");
-                dim_print("  Show network interface configuration.\n");
-                dim_print("  Displays IP, MAC, gateway, netmask.\n");
-                return;
-            }
-            "tutor" => {
-                puts("tutor [topic]\n");
-                dim_print("  Interactive system tutorial.\n");
-                dim_print("  Topics: intro, fs, net, mem, kernel, commands\n");
-                dim_print("  Example: tutor intro\n");
-                return;
-            }
-            "grape" => {
-                puts("grape [file]\n");
-                dim_print("  Open text editor (nano-like interface).\n");
-                dim_print("  Ctrl+X: exit, Ctrl+O: save, Ctrl+K: cut line\n");
-                dim_print("  Ctrl+W: search, Ctrl+G: help screen\n");
-                dim_print("  Example: grape /etc/hostname\n");
-                dim_print("           grape /tmp/notes.txt\n");
-                return;
-            }
-            "tomato" => {
-                puts("tomato <operation> [target]\n");
-                dim_print("  Package manager (pacman-like).\n");
-                dim_print("  -S <pkg>   Install package\n");
-                dim_print("  -R <pkg>   Remove package\n");
-                dim_print("  -Q         List installed packages\n");
-                dim_print("  -Ss <q>    Search packages\n");
-                dim_print("  -Syu       Full system upgrade\n");
-                dim_print("  Example: tomato -S base\n");
-                return;
-            }
-            "seed" => {
-                puts("seed [command] [service]\n");
-                dim_print("  Init system and service manager.\n");
-                dim_print("  status           Show all services\n");
-                dim_print("  start <svc>      Start a service\n");
-                dim_print("  stop <svc>       Stop a service\n");
-                dim_print("  restart <svc>    Restart a service\n");
-                dim_print("  log              Show boot log\n");
-                dim_print("  Example: seed status\n");
-                return;
-            }
-            "doom" => {
-                puts("doom\n");
-                dim_print("  Run classic DOOM (shareware v1.9).\n");
-                dim_print("  The legendary 1993 FPS on bare metal!\n");
-                dim_print("  Controls: Arrow keys or WASD to move,\n");
-                dim_print("            Ctrl for strafe, Space to use.\n");
-                dim_print("  F1=help, F2=save, F3=load, ESC=quit.\n");
-                return;
-            }
-            "soundtest" => {
-                puts("soundtest\n");
-                dim_print("  Audio driver diagnostics + test tone.\n");
-                dim_print("  Reports active driver (AC97 / HDA / none),\n");
-                dim_print("  DMA ring state, IRQ line, volume, and\n");
-                dim_print("  hardware registers to serial COM1.\n");
-                dim_print("  Then plays a 440 Hz sine tone (0.5 s).\n");
-                dim_print("  Use: soundtest\n");
-                return;
-            }
-            "vol" => {
-                puts("vol [0-100]\n");
-                dim_print("  Show or set master volume.\n");
-                dim_print("  vol       — show current volume\n");
-                dim_print("  vol 80    — set volume to 80%\n");
-                dim_print("  vol +10   — increase by 10%\n");
-                dim_print("  vol -10   — decrease by 10%\n");
-                return;
-            }
-            "mute" => {
-                puts("mute\n");
-                dim_print("  Toggle mute (set volume to 0 / restore).\n");
-                return;
-            }
-            "aai" => {
-                puts("aai <subcommand> [args]\n");
-                dim_print("  Aeterna AI utility — powered by ANE (Aeterna Neural Engine).\n\n");
-                dim_print("  Subcommands:\n");
-                dim_print("    aai load <path>   Load a .tmt-ai model from the VFS\n");
-                dim_print("    aai info          Show loaded model metadata\n");
-                dim_print("    aai bench         GEMM benchmark (SIMD perf report)\n");
-                dim_print("    aai chat <prompt> Interactive inference with KV cache\n");
-                dim_print("    aai summarize <text> Entropy + stats analysis of text\n\n");
-                dim_print("  .tmt-ai format: TMT\x01 magic + JSON metadata + f32 weights\n");
-                dim_print("  Weights are zero-copy mapped via Huge Pages (Mmap syscall).\n");
-                dim_print("  SIMD auto-dispatched: AVX-512 → AVX2+FMA → scalar.\n\n");
-                dim_print("  Example:\n");
-                dim_print("    aai load /models/tiny.tmt-ai\n");
-                dim_print("    aai info\n");
-                dim_print("    aai chat Hello, world\n");
-                dim_print("  See: tutor ai\n");
-                return;
-            }
-            "ls" => {
-                puts("ls [path]\n");
-                dim_print("  List directory contents. Supports long format via 'ls -l'.\n");
-                dim_print("  Directories are blue, files are white.\n");
-                return;
-            }
-            "cd" => {
-                puts("cd <path>\n");
-                dim_print("  Change working directory. Supports '..' for parent and '~' for home.\n");
-                return;
-            }
-            "pwd" => {
-                puts("pwd\n");
-                dim_print("  Print current working directory absolute path.\n");
-                return;
-            }
-            "mkdir" => {
-                puts("mkdir <directory>\n");
-                dim_print("  Create a new directory in the VFS.\n");
-                return;
-            }
-            "touch" => {
-                puts("touch <filename>\n");
-                dim_print("  Create an empty file if it doesn't exist.\n");
-                return;
-            }
-            "rm" => {
-                puts("rm <file>\n");
-                dim_print("  Delete a file from the VFS. Works only on files or empty directories.\n");
-                return;
-            }
-            "save" | "sync" => {
-                puts("save / sync\n");
-                dim_print("  Persist all in-memory VFS (RamFS) changes to the physical boot disk.\n");
-                dim_print("  Changes are lost on reboot if not saved!\n");
-                return;
-            }
-            "changelog" => {
-                puts("changelog\n");
-                dim_print("  Display the recent changes and version history for AETERNA OS.\n");
-                return;
-            }
-            "cat" => {
-                puts("cat <path>\n");
-                dim_print("  Display file contents. Virtual files:\n");
-                dim_print("  /proc/version  /proc/uptime  /proc/meminfo\n");
-                dim_print("  /proc/cpuinfo  /etc/hostname  /etc/os-release\n");
-                return;
-            }
-            "uname" => {
-                puts("uname [-a | -r | -m]\n");
-                dim_print("  -a  Full system info\n");
-                dim_print("  -r  Kernel version\n");
-                dim_print("  -m  Architecture\n");
-                return;
-            }
-            _ => {
-                dim_print("No detailed help for '");
-                dim_print(args);
-                dim_print("'.\n");
-                return;
-            }
-        }
-    }
-
-    help_display();
-}
-
-// ── Help display helpers ───────────────────────────────────────────────────
-
-fn help_pad(len: usize, target: usize) {
-    for _ in 0..target.saturating_sub(len) { puts(" "); }
-}
-
-fn help_sec(title: &str) {
-    puts("\n");
-    framebuffer::draw_string("  --[ ", FG_DIM, BG);
-    framebuffer::draw_string(title, FG_WARN, BG);
-    framebuffer::draw_string(" ]\n", FG_DIM, BG);
-}
-
-fn help_row1(c1: &str, d1: &str) {
-    puts("  ");
-    framebuffer::draw_string(c1, FG, BG);
-    help_pad(c1.len(), 18);
-    framebuffer::draw_string(d1, FG_DIM, BG);
-    puts("\n");
-}
-
-struct HelpCommand {
-    name: &'static str,
-    desc: &'static str,
-}
-
-struct HelpCategory {
-    title: &'static str,
-    cmds: &'static [HelpCommand],
-}
-
-const HELP_PAGES: &[HelpCategory] = &[
-    HelpCategory {
-        title: "NAVIGATION & SHELL",
-        cmds: &[
-            HelpCommand { name: "help",          desc: "This guide (PgUp/PgDn to scroll)" },
-            HelpCommand { name: "help <cmd>",    desc: "Per-command detailed usage" },
-            HelpCommand { name: "clear",         desc: "Clear screen (Ctrl+L)" },
-            HelpCommand { name: "history",       desc: "Show command history (Up/Down)" },
-            HelpCommand { name: "tutor [topic]", desc: "Interactive system tutorial" },
-            HelpCommand { name: "bash <script>", desc: "Run shell script (.sh)" },
-            HelpCommand { name: "plum",          desc: "Shell info and builtins" },
-            HelpCommand { name: "exit / q",      desc: "Exit shell (if in subshell)" },
-        ],
-    },
-    HelpCategory {
-        title: "SYSTEM & HARDWARE INFO",
-        cmds: &[
-            HelpCommand { name: "version",       desc: "OS + kernel version info" },
-            HelpCommand { name: "changelog",     desc: "Recent changes in this version" },
-            HelpCommand { name: "uname -a",      desc: "System identification" },
-            HelpCommand { name: "uptime",        desc: "Total system uptime" },
-            HelpCommand { name: "date",          desc: "System date and time" },
-            HelpCommand { name: "whoami / host", desc: "User and hostname info" },
-            HelpCommand { name: "dmesg",         desc: "Kernel event log (klog)" },
-            HelpCommand { name: "about",         desc: "AETERNA ASCII art & credits" },
-            HelpCommand { name: "free / meminfo",desc: "Memory usage and regions" },
-            HelpCommand { name: "lspci",         desc: "PCI device inventory" },
-            HelpCommand { name: "lsblk",         desc: "Block device list" },
-        ],
-    },
-    HelpCategory {
-        title: "FILESYSTEM & STORAGE",
-        cmds: &[
-            HelpCommand { name: "ls [path]",     desc: "List directory contents" },
-            HelpCommand { name: "cd <path>",     desc: "Change working directory" },
-            HelpCommand { name: "pwd",           desc: "Print current directory" },
-            HelpCommand { name: "cat <file>",    desc: "View file contents" },
-            HelpCommand { name: "mkdir <dir>",   desc: "Create new directory" },
-            HelpCommand { name: "touch <file>",  desc: "Create empty file" },
-            HelpCommand { name: "rm <file>",     desc: "Delete file or empty dir" },
-            HelpCommand { name: "cp / mv",       desc: "Copy or move files/dirs" },
-            HelpCommand { name: "find <p> <q>",  desc: "Search for files by name" },
-            HelpCommand { name: "df / du",       desc: "Disk and directory usage" },
-            HelpCommand { name: "tree",          desc: "Show file tree structure" },
-            HelpCommand { name: "save / sync",   desc: "Persist VFS changes to disk" },
-            HelpCommand { name: "fdisk / mkfs",  desc: "Partition and format disks" },
-        ],
-    },
-    HelpCategory {
-        title: "TEXT & NETWORKING",
-        cmds: &[
-            HelpCommand { name: "grep <p> <f>",  desc: "Search text patterns in files" },
-            HelpCommand { name: "wc / head / tail", desc: "Line/word count and snippets" },
-            HelpCommand { name: "sort / uniq",   desc: "Sort lines and unique filter" },
-            HelpCommand { name: "cut / awk",     desc: "Field-based text processing" },
-            HelpCommand { name: "xxd / nl",      desc: "Hex dump and line numbering" },
-            HelpCommand { name: "diff <f1> <f2>", desc: "Compare two files" },
-            HelpCommand { name: "ifconfig / ip", desc: "Network interface status" },
-            HelpCommand { name: "ping <ip>",     desc: "ICMP network echo test" },
-            HelpCommand { name: "ntpdate [ip]",  desc: "Sync time via SNTP" },
-            HelpCommand { name: "netstat",       desc: "Active network connections" },
-            HelpCommand { name: "netdiag",       desc: "Full hardware NIC diagnostics" },
-        ],
-    },
-    HelpCategory {
-        title: "USERLAND TOOLS & AI",
-        cmds: &[
-            HelpCommand { name: "grape <file>",  desc: "Text editor (nano-style)" },
-            HelpCommand { name: "tomato",        desc: "Package manager (repos)" },
-            HelpCommand { name: "seed [cmd]",    desc: "Init & service manager" },
-            HelpCommand { name: "doom",          desc: "Classic DOOM (1993)" },
-            HelpCommand { name: "aai chat <t>",  desc: "AI - LLM inference (ANE)" },
-            HelpCommand { name: "aai load <f>",  desc: "Load .tmt-ai model weights" },
-            HelpCommand { name: "aai bench",     desc: "ANE SIMD performance report" },
-            HelpCommand { name: "ps / top / kill", desc: "Process management" },
-        ],
-    },
-    HelpCategory {
-        title: "DIAGNOSTICS & BENCHMARKS",
-        cmds: &[
-            HelpCommand { name: "verify_mem",    desc: "Heap integrity stress test" },
-            HelpCommand { name: "verify_sched",  desc: "Scheduler & PIT rate test" },
-            HelpCommand { name: "verify_net",    desc: "Network stack integrity" },
-            HelpCommand { name: "verify_audio",  desc: "HDA driver test tone (440Hz)" },
-            HelpCommand { name: "soundtest",     desc: "Audio register dump" },
-            HelpCommand { name: "vol / mute",    desc: "Master volume control" },
-            HelpCommand { name: "bench [n]",     desc: "System latency tax benchmark" },
-            HelpCommand { name: "dump_disk",     desc: "Raw sector hex dump (LBA 2048)" },
-            HelpCommand { name: "reboot / halt", desc: "System control" },
-        ],
-    },
-];
-
-fn help_display() {
-    let mut current_page = 0;
-    
-    loop {
-        framebuffer::clear(BG);
-        framebuffer::set_cursor_pos(0, 0);
-
-        // Header
-        framebuffer::draw_string("  AETERNA OS ", FG_OK, BG);
-        framebuffer::draw_string("-- Command Reference  ", FG, BG);
-        framebuffer::draw_string("[ Page ", FG_DIM, BG);
-        print_dec((current_page + 1) as u64);
-        framebuffer::draw_string(" of ", FG_DIM, BG);
-        print_dec(HELP_PAGES.len() as u64);
-        framebuffer::draw_string(" ]\n", FG_DIM, BG);
-        framebuffer::draw_string("  ================================================================\n", FG_DIM, BG);
-
-        let page = &HELP_PAGES[current_page];
-        help_sec(page.title);
-        
-        for cmd in page.cmds {
-            help_row1(cmd.name, cmd.desc);
-        }
-
-        puts("\n\n");
-        framebuffer::draw_string("  [Arrows/PgUp/Dn] ", FG_HL, BG);
-        framebuffer::draw_string("Scroll  ", FG_DIM, BG);
-        framebuffer::draw_string("[Space/Enter] ", FG_HL, BG);
-        framebuffer::draw_string("Next  ", FG_DIM, BG);
-        framebuffer::draw_string("[Esc/Q] ", FG_HL, BG);
-        framebuffer::draw_string("Exit", FG_DIM, BG);
-
-        // Wait for input
-        let key = keyboard::poll_key();
-        match key {
-            Some(keyboard::KEY_PGDN) | Some(keyboard::KEY_DOWN) | Some(keyboard::KEY_RIGHT) | Some(' ') | Some('\n') => {
-                if current_page < HELP_PAGES.len() - 1 {
-                    current_page += 1;
-                } else {
-                    break; // Exit on last page
-                }
-            }
-            Some(keyboard::KEY_PGUP) | Some(keyboard::KEY_UP) | Some(keyboard::KEY_LEFT) => {
-                if current_page > 0 {
-                    current_page -= 1;
-                }
-            }
-            Some('\x1B') | Some('q') | Some('Q') => break,
-            _ => {}
-        }
-    }
-    
-    framebuffer::clear(BG);
-    framebuffer::set_cursor_pos(0, 0);
-}
-
-fn cmd_echo(args: &str) {
-    // Support: echo text > file  and  echo text >> file
-    if let Some(pos) = args.find(">>") {
-        // Append mode
-        let text = args[..pos].trim();
-        let file = args[pos + 2..].trim();
-        if file.is_empty() {
-            err_print("echo: missing file after '>>'\n");
-            return;
-        }
-        let abs = resolve_path(file);
-        let mut data = alloc::vec::Vec::new();
-        data.extend_from_slice(text.as_bytes());
-        data.push(b'\n');
-        if ospab_os::fs::append_file(&abs, &data) {
-            // success — silent
-        } else {
-            err_print("echo: cannot write to '");
-            err_print(file);
-            err_print("'\n");
-        }
-        return;
-    }
-    if let Some(pos) = args.find('>') {
-        // Write mode
-        let text = args[..pos].trim();
-        let file = args[pos + 1..].trim();
-        if file.is_empty() {
-            err_print("echo: missing file after '>'\n");
-            return;
-        }
-        let abs = resolve_path(file);
-        let mut data = alloc::vec::Vec::new();
-        data.extend_from_slice(text.as_bytes());
-        data.push(b'\n');
-        if ospab_os::fs::write_file(&abs, &data) {
-            // success — silent
-        } else {
-            err_print("echo: cannot write to '");
-            err_print(file);
-            err_print("'\n");
-        }
-        return;
-    }
-    // Normal echo
-    puts(args);
-    puts("\n");
-}
 
 fn cmd_clear() {
     framebuffer::clear(BG);
@@ -1081,512 +1018,365 @@ fn cmd_clear() {
 }
 
 fn cmd_version() {
-    puts(crate::version::OS_VERSION);
-    puts(" (");
+    framebuffer::draw_string(crate::version::OS_VERSION, FG_OK, BG);
+    puts("  (kernel ");
     puts(crate::version::KERNEL_VERSION);
-    puts(")\n");
-    dim_print("Build: ");
-    puts(crate::version::BUILD_DATE);
-    puts(" nightly\n");
-    dim_print("Arch:  ");
+    puts(", ");
     puts(crate::version::ARCH);
+    puts(")\n");
+    dim_print("License: ");
+    dim_print(crate::version::LICENSE);
     puts("\n");
 }
 
 fn cmd_uname(args: &str) {
-    if args.contains("-a") || args.contains("--all") {
-        puts(crate::version::UNAME_FULL);
+    let a = args.trim();
+    let all = a.contains('a') && a.starts_with('-') || a == "--all";
+    let host = hostname();
+    if a.is_empty() || a == "-s" {
+        puts("AETERNA\n");
+    } else if all {
+        puts("AETERNA ");
+        puts(&host);
+        puts(" ");
+        puts(crate::version::VERSION_STR);
+        puts(" ");
+        puts(crate::version::ARCH);
+        puts(" ospab.os\n");
+    } else if a == "-n" {
+        puts(&host);
         puts("\n");
-    } else if args.contains("-r") {
+    } else if a == "-r" {
         puts(crate::version::VERSION_STR);
         puts("\n");
-    } else if args.contains("-m") {
+    } else if a == "-m" || a == "-p" {
         puts(crate::version::ARCH);
         puts("\n");
     } else {
-        puts("AETERNA\n");
+        err_print("uname: unknown option ");
+        err_print(a);
+        puts("\n");
+        dim_print("Usage: uname [-a|-s|-n|-r|-m]\n");
     }
-}
-
-// VFS commands (ls, cat, touch, mkdir, rm, cd, pwd) are now handled by
-// plum shell in src/userspace/plum/mod.rs — using VFS syscalls only.
-
-fn cmd_whoami() {
-    puts("root\n");
 }
 
 fn cmd_hostname(args: &str) {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        match ospab_os::fs::read_file("/etc/hostname") {
-            Some(data) => {
-                if let Ok(text) = core::str::from_utf8(&data) {
-                    puts(text.trim());
-                    puts("\n");
-                } else {
-                    puts("ospab\n");
-                }
-            }
-            None => puts("ospab\n"),
-        }
+        puts(&hostname());
+        puts("\n");
         return;
     }
-
     if trimmed == "-h" || trimmed == "--help" {
         puts("Usage: hostname [NEW_NAME]\n");
         return;
     }
-
-    let mut out = [0u8; 64];
-    let mut n = 0usize;
+    if trimmed.len() > 63 {
+        err_print("hostname: name too long (max 63)\n");
+        return;
+    }
     for &b in trimmed.as_bytes() {
-        if n >= 63 { break; }
         let valid = (b as char).is_ascii_alphanumeric() || b == b'-' || b == b'.';
         if !valid {
-            puts("hostname: invalid character (allowed: a-z A-Z 0-9 . -)\n");
+            err_print("hostname: invalid character (allowed: a-z A-Z 0-9 . -)\n");
             return;
         }
-        out[n] = b;
-        n += 1;
     }
-    if n == 0 {
-        puts("hostname: empty name\n");
+    let mut data = Vec::from(trimmed.as_bytes());
+    data.push(b'\n');
+    if !fs::write_file("/etc/hostname", &data) {
+        err_print("hostname: failed to write /etc/hostname\n");
         return;
     }
-
-    if !ospab_os::fs::write_file("/etc/hostname", &out[..n]) {
-        puts("hostname: failed to write /etc/hostname\n");
-        return;
-    }
-
     puts("hostname set to ");
     puts(trimmed);
     puts("\n");
 
     if ospab_os::net::is_up() {
-        puts("renewing DHCP with updated hostname...\n");
+        dim_print("renewing DHCP lease with the new name...\n");
         if ospab_os::net::dhcp_renew() {
-            puts("network updated\n");
+            dim_print("done\n");
         } else {
-            puts("warning: DHCP renew failed (hostname saved locally)\n");
+            framebuffer::draw_string("warning: DHCP renew failed (name saved locally)\n", FG_WARN, BG);
         }
     }
 }
 
-fn cmd_date() {
-    // If NTP time is synced, show real date
-    if ospab_os::net::sntp::is_synced() {
-        let unix_ts = ospab_os::net::sntp::unix_time();
-        let mut buf = [0u8; 32];
-        let len = ospab_os::net::sntp::format_datetime(unix_ts, &mut buf);
-        for i in 0..len {
-            framebuffer::draw_char(buf[i] as char, FG, BG);
-        }
-        puts("\n");
-        return;
-    }
+fn print_signed(v: i64) {
+    if v < 0 { puts("-"); }
+    print_dec(v.unsigned_abs());
+}
 
-    // Fallback: uptime-based
-    let ticks = ospab_os::arch::x86_64::idt::timer_ticks();
-    let total_secs = ticks / 100;
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-    puts("Sat Mar  1 00:");
-    if hours < 10 { puts("0"); }
-    print_dec(hours);
-    puts(":");
-    if mins < 10 { puts("0"); }
-    print_dec(mins);
-    puts(":");
-    if secs < 10 { puts("0"); }
-    print_dec(secs);
-    puts(" UTC 2026  (uptime: ");
-    print_dec(total_secs);
-    puts("s)\n");
-    dim_print("  (run 'ntpdate' to sync with NTP server)\n");
+/// `date`            — local date/time and the clock source
+/// `date -e | +%s`   — seconds since the ospab epoch (2012-08-09 00:00:00 UTC)
+/// `date -n`         — nanoseconds since the ospab epoch
+/// `date -x | --unix`— Unix seconds
+fn cmd_date(args: &str) {
+    use ospab_os::time;
+    let now = time::now();
+    match args.trim() {
+        "-e" | "+%s" => { print_signed(now.div_euclid(time::NS_PER_SEC)); puts("\n"); }
+        "-n"         => { print_signed(now); puts("\n"); }
+        "-x" | "--unix" => { print_signed(time::to_unix_secs(now)); puts("\n"); }
+        "" | "-l" => {
+            let tz = ospab_os::net::sntp::read_timezone_offset();
+            let mut buf = [0u8; 40];
+            let len = time::format(now, tz, &mut buf);
+            puts(core::str::from_utf8(&buf[..len]).unwrap_or("?"));
+            match time::source() {
+                time::Source::Ntp  => dim_print("  (NTP)\n"),
+                time::Source::Rtc  => dim_print("  (CMOS RTC; run 'ntpdate' to sync)\n"),
+                time::Source::None => dim_print("  (clock not set)\n"),
+            }
+        }
+        _ => puts("usage: date [-e | -n | --unix]\n"),
+    }
 }
 
 fn cmd_about() {
     puts("\n");
-    puts("    _   ___ _____ _____ ___ _  _   _\n");
-    puts("   /_\\ | __|_   _| __| _ | \\| | /_\\\n");
-    puts("  / _ \\| _|  | | | _||   | .` |/ _ \\\n");
-    puts(" /_/ \\_|___| |_| |___|_|_|_|\\_/_/ \\_\\\n");
-    puts("\n");
-    puts("  AETERNA Microkernel - ");
+    framebuffer::draw_string("  AETERNA", FG_OK, BG);
+    dim_print("  - the kernel of ospab.os\n\n");
+    puts("  ");
     puts(crate::version::OS_VERSION);
-    puts("\n");
-    dim_print("  Deterministic, capability-based, AI-native\n");
-    dim_print("  Compute-First scheduler | NUMA-aware memory\n");
-    dim_print("  License: BSL-1.1\n");
-    puts("\n");
+    puts(" with the AETERNA kernel, written from scratch in Rust (no_std).\n\n");
+    puts("  Goal: a capability-based microkernel, with drivers, network and\n");
+    puts("  filesystems as isolated user-space servers.\n\n");
+    framebuffer::draw_string("  Today:", FG_WARN, BG);
+    puts(" the kernel, drivers, network stack, this shell and every tool\n");
+    puts("  run together in ring 0 in one address space. Ring 3 works for test\n");
+    puts("  tasks only (see 'ring3test'). Capabilities are not enforced yet.\n");
+    puts("  One CPU is used (no SMP).\n\n");
+    dim_print("  License: ");
+    dim_print(crate::version::LICENSE);
+    dim_print("   Details: README.md, AUDIT.md, ROADMAP.md in the source tree.\n\n");
 }
 
-fn cmd_meminfo() {
-    let stats = ospab_os::mm::physical::stats();
+fn cmd_free() {
+    let used_f = ospab_os::mm::physical::frames_allocated();
+    let free_f = ospab_os::mm::physical::frames_free();
+    let total = (used_f + free_f) * 4096;
 
-    puts("           total       usable      reserved\n");
-    puts("Phys:  ");
-    print_size_padded(stats.total_bytes, 12);
-    print_size_padded(stats.usable_bytes, 12);
-    print_size_padded(stats.reserved_bytes, 12);
-    puts("\n");
-    puts("Regions: ");
-    print_dec(stats.region_count as u64);
+    dim_print("             total        used        free\n");
+    puts("Mem:   ");
+    print_size_padded(total, 12, true);
+    print_size_padded(used_f * 4096, 12, true);
+    print_size_padded(free_f * 4096, 12, true);
     puts("\n");
 
     if ospab_os::mm::heap::is_initialized() {
         let (used, free) = ospab_os::mm::heap::stats();
         let heap_total = ospab_os::mm::heap::heap_size() as u64;
         puts("Heap:  ");
-        print_size_padded(used as u64, 12);
-        print_size_padded(heap_total - used as u64, 12);
-        print_size_padded(heap_total, 12);
+        print_size_padded(heap_total, 12, true);
+        print_size_padded(used as u64, 12, true);
+        print_size_padded(free as u64, 12, true);
         puts("\n");
+    }
+    dim_print("Mem = 4 KiB frames managed by the physical allocator; the kernel heap\n");
+    dim_print("is carved out of those frames at boot, so it counts as used in Mem.\n");
+}
+
+fn cmd_cat_proc(path: &str) {
+    match fs::read_file(path) {
+        Some(data) => puts(core::str::from_utf8(&data).unwrap_or("(not UTF-8)\n")),
+        None => {
+            err_print(path);
+            err_print(": not available\n");
+        }
     }
 }
 
 fn cmd_uptime() {
     let ticks = ospab_os::arch::x86_64::idt::timer_ticks();
-    let seconds = ticks / 100;
-    let minutes = seconds / 60;
-    let hours = minutes / 60;
+    let seconds = ticks / TIMER_HZ;
+    let days = seconds / 86400;
+    let hours = (seconds / 3600) % 24;
+    let minutes = (seconds / 60) % 60;
 
     puts("up ");
-    if hours > 0 {
+    if days > 0 {
+        print_dec(days);
+        puts("d ");
+    }
+    if days > 0 || hours > 0 {
         print_dec(hours);
         puts("h ");
     }
-    print_dec(minutes % 60);
+    print_dec(minutes);
     puts("m ");
     print_dec(seconds % 60);
     puts("s");
-    dim_print(" (");
+    dim_print("  (");
     print_dec(ticks);
-    dim_print(" ticks)\n");
+    dim_print(" ticks at 100 Hz, ");
+    let tasks = count_tasks();
+    print_dec(tasks as u64);
+    dim_print(if tasks == 1 { " scheduler task)\n" } else { " scheduler tasks)\n" });
+}
+
+fn count_tasks() -> usize {
+    use ospab_os::core::scheduler::TaskSnapshot;
+    // SAFETY: plain data; get_tasks fills the prefix it reports.
+    let mut snaps: [TaskSnapshot; 64] = unsafe { core::mem::zeroed() };
+    ospab_os::core::scheduler::get_tasks(&mut snaps)
 }
 
 fn cmd_dmesg() {
-    puts("--- kernel event log ---\n");
     let mut buf = [klog::Event::empty_pub(); 32];
     let count = klog::last_events(&mut buf, 32);
     if count == 0 {
         dim_print("(no events recorded)\n");
         return;
     }
-    for i in 0..count {
-        framebuffer::draw_string("[", FG_DIM, BG);
-        let label = buf[i].source.label();
-        let color = match buf[i].source {
+    let total = klog::total_count();
+    if total > count {
+        dim_print("(last ");
+        print_dec(count as u64);
+        dim_print(" of ");
+        print_dec(total as u64);
+        dim_print(" events; full boot log is on serial COM1)\n");
+    }
+    for ev in &buf[..count] {
+        let label = ev.source.label().trim_end();
+        let color = match ev.source {
             klog::EventSource::Boot => FG_OK,
             klog::EventSource::Fault | klog::EventSource::Panic => FG_ERR,
+            klog::EventSource::Terminal => FG_HL,
             _ => FG_DIM,
         };
+        framebuffer::draw_string("[", FG_DIM, BG);
         framebuffer::draw_string(label, color, BG);
-        framebuffer::draw_string("] ", FG_DIM, BG);
-        puts(buf[i].message());
+        framebuffer::draw_string("]", FG_DIM, BG);
+        pad(label.len() + 2, 8);
+        puts(ev.message());
         puts("\n");
     }
 }
 
 fn cmd_lsmem() {
     let stats = ospab_os::mm::physical::stats();
-    puts("Memory regions:\n");
-    puts("  Total:    ");
-    print_size(stats.total_bytes);
-    puts("\n");
-    puts("  Usable:   ");
-    print_size(stats.usable_bytes);
-    puts("\n");
-    puts("  Reserved: ");
-    print_size(stats.reserved_bytes);
-    puts("\n");
-    puts("  Regions:  ");
-    print_dec(stats.region_count as u64);
-    puts("\n");
-
-    if ospab_os::mm::heap::is_initialized() {
-        let (used, _free) = ospab_os::mm::heap::stats();
-        puts("  Heap used: ");
-        print_size(used as u64);
-        puts(" / ");
-        print_size(ospab_os::mm::heap::heap_size() as u64);
+    let regions = ospab_os::mm::physical::get_usable_regions();
+    dim_print("Usable RAM regions (from the bootloader memory map):\n");
+    dim_print("  START               END                 SIZE\n");
+    for r in regions {
+        puts("  ");
+        print_hex_u64(r.base);
+        puts("  ");
+        print_hex_u64(r.base + r.length - 1);
+        puts("  ");
+        print_size(r.length);
         puts("\n");
     }
+    puts("Usable:     ");
+    print_size(stats.usable_bytes);
+    puts(" in ");
+    print_dec(stats.region_count as u64);
+    puts(" regions\n");
+    puts("Map total:  ");
+    print_size(stats.total_bytes);
+    dim_print("  (all memory-map entries, incl. reserved and device windows)\n");
 }
 
-fn cmd_lspci() {
-    puts("PCI devices:\n");
-    let mut found = 0u32;
-    for bus in 0u16..8 {
-        for dev in 0u16..32 {
-            let vendor = pci_read_vendor(bus as u8, dev as u8, 0);
-            if vendor != 0xFFFF && vendor != 0x0000 {
-                let device_id = pci_read_device(bus as u8, dev as u8, 0);
-                let class = pci_read_class(bus as u8, dev as u8, 0);
-                let subclass = pci_read_subclass(bus as u8, dev as u8, 0);
-                puts("  ");
-                print_hex_byte(bus as u8);
-                puts(":");
-                print_hex_byte(dev as u8);
-                puts(".0  ");
-                print_pci_class(class, subclass);
-                puts("  [");
-                print_hex_u16(vendor);
-                puts(":");
-                print_hex_u16(device_id);
-                puts("]\n");
-                found += 1;
-            }
-        }
-    }
-    if found == 0 {
-        dim_print("  No PCI devices found\n");
-    }
-}
-
-fn cmd_lsblk() {
-    let n = ospab_os::drivers::disk_count();
-    if n == 0 {
-        dim_print("  No block devices detected.\n");
-        dim_print("  To add a disk in QEMU:\n");
-        dim_print("    # Create image first (once):\n");
-        dim_print("    qemu-img create -f raw disk.img 4G\n");
-        dim_print("    # Then boot with:\n");
-        dim_print("    -drive file=disk.img,format=raw,if=none,id=d0 -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0\n");
-        return;
-    }
-    puts("NAME    TYPE   SIZE      MODEL\n");
-    dim_print("────────────────────────────────────────────────────\n");
-    for i in 0..n {
-        if let Some(d) = ospab_os::drivers::disk_info(i) {
-            let name = match d.kind {
-                ospab_os::drivers::DiskKind::Ahci => {
-                    let idx = ospab_os::drivers::disk_info_count_before(i, ospab_os::drivers::DiskKind::Ahci);
-                    match idx { 0 => "sda  ", 1 => "sdb  ", 2 => "sdc  ", _ => "sdX  " }
-                }
-                ospab_os::drivers::DiskKind::Ata => {
-                    let idx = ospab_os::drivers::disk_info_count_before(i, ospab_os::drivers::DiskKind::Ata);
-                    match idx { 0 => "hda  ", 1 => "hdb  ", 2 => "hdc  ", _ => "hdX  " }
-                }
-            };
-            puts("  ");
-            puts(name);
-            let kind_s = match d.kind {
-                ospab_os::drivers::DiskKind::Ahci => " SATA  ",
-                ospab_os::drivers::DiskKind::Ata  => " IDE   ",
-            };
-            puts(kind_s);
-            let gib = d.size_mb / 1024;
-            let rem = (d.size_mb % 1024) * 10 / 1024;
-            print_u64(gib);
-            puts(".");
-            print_u64(rem);
-            puts(" GiB  ");
-            puts(ospab_os::drivers::model_str(d));
-            puts("\n");
-        }
-    }
-}
-
-fn cmd_fdisk(args: &str) {
-    if args.is_empty() || args == "-l" {
-        let n = ospab_os::drivers::disk_count();
-        if n == 0 {
-            dim_print("  No disks found.\n");
-            dim_print("  Tip: attach a disk with -device ahci or -device piix3-ide in QEMU.\n");
-            return;
-        }
-        for i in 0..n {
-            if let Some(d) = ospab_os::drivers::disk_info(i) {
-                let name = match d.kind {
-                    ospab_os::drivers::DiskKind::Ahci => "sda",
-                    ospab_os::drivers::DiskKind::Ata  => "hda",
-                };
-                puts("Disk /dev/");
-                puts(name);
-                puts(": ");
-                let gib = d.size_mb / 1024;
-                let rem = (d.size_mb % 1024) * 10 / 1024;
-                print_u64(gib);
-                puts(".");
-                print_u64(rem);
-                puts(" GiB, ");
-                print_u64(d.size_mb as u64 * 1024 * 1024);
-                puts(" bytes, ");
-                print_u64(d.sectors);
-                puts(" sectors\n");
-                puts("Disk model: ");
-                puts(ospab_os::drivers::model_str(d));
-                puts("\n");
-                dim_print("Units: sectors of 512 bytes\n");
-                dim_print("Partition table not available (raw disk)\n\n");
-            }
-        }
-    } else {
-        dim_print("Usage: fdisk -l\n");
-    }
-}
-
-fn print_u64(mut n: u64) {
-    if n == 0 { puts("0"); return; }
-    let mut buf = [0u8; 20];
-    let mut pos = 0;
-    while n > 0 { buf[pos] = b'0' + (n % 10) as u8; n /= 10; pos += 1; }
-    for i in (0..pos).rev() {
-        framebuffer::draw_char(buf[i] as char, FG, BG);
-    }
-}
-
-fn pci_config_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    0x80000000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC)
-}
-
-fn pci_read_u32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let addr = pci_config_addr(bus, dev, func, offset);
-    unsafe {
-        let val: u32;
-        asm!(
-            "out dx, eax",
-            in("dx") 0x0CF8u16,
-            in("eax") addr,
-            options(nomem, nostack)
-        );
-        asm!(
-            "in eax, dx",
-            in("dx") 0x0CFCu16,
-            out("eax") val,
-            options(nomem, nostack)
-        );
-        val
-    }
-}
-
-fn pci_read_vendor(bus: u8, dev: u8, func: u8) -> u16 {
-    (pci_read_u32(bus, dev, func, 0) & 0xFFFF) as u16
-}
-
-fn pci_read_device(bus: u8, dev: u8, func: u8) -> u16 {
-    ((pci_read_u32(bus, dev, func, 0) >> 16) & 0xFFFF) as u16
-}
-
-fn pci_read_class(bus: u8, dev: u8, func: u8) -> u8 {
-    ((pci_read_u32(bus, dev, func, 8) >> 24) & 0xFF) as u8
-}
-
-fn pci_read_subclass(bus: u8, dev: u8, func: u8) -> u8 {
-    ((pci_read_u32(bus, dev, func, 8) >> 16) & 0xFF) as u8
-}
-
-fn print_pci_class(class: u8, subclass: u8) {
-    match (class, subclass) {
-        (0x00, _)     => puts("Unclassified        "),
-        (0x01, 0x00)  => puts("SCSI Controller     "),
-        (0x01, 0x01)  => puts("IDE Controller      "),
-        (0x01, 0x06)  => puts("SATA Controller     "),
-        (0x01, _)     => puts("Storage Controller  "),
-        (0x02, 0x00)  => puts("Ethernet Controller "),
-        (0x02, _)     => puts("Network Controller  "),
-        (0x03, 0x00)  => puts("VGA Controller      "),
-        (0x03, _)     => puts("Display Controller  "),
-        (0x04, _)     => puts("Multimedia Device   "),
-        (0x05, _)     => puts("Memory Controller   "),
-        (0x06, 0x00)  => puts("Host Bridge         "),
-        (0x06, 0x01)  => puts("ISA Bridge          "),
-        (0x06, 0x04)  => puts("PCI Bridge          "),
-        (0x06, _)     => puts("Bridge Device       "),
-        (0x07, _)     => puts("Communication Ctrl  "),
-        (0x08, _)     => puts("System Peripheral   "),
-        (0x0C, 0x03)  => puts("USB Controller      "),
-        (0x0C, _)     => puts("Serial Bus Ctrl     "),
-        _             => puts("Unknown Device      "),
-    }
-}
+// ══════════════════════════════════════════════════════════════
+// Files and disks
+// ══════════════════════════════════════════════════════════════
 
 fn cmd_changelog() {
-    match ospab_os::fs::read_file("/CHANGELOG.md") {
+    match fs::read_file("/CHANGELOG.md") {
         Some(data) => {
             if let Ok(text) = core::str::from_utf8(&data) {
                 puts(text);
+                if !text.ends_with('\n') { puts("\n"); }
             } else {
-                err_print("changelog: file is corrupted or not UTF-8\n");
+                err_print("changelog: /CHANGELOG.md is not UTF-8\n");
             }
         }
         None => {
-            puts("AETERNA Changelog - See: /CHANGELOG.md\n");
-            dim_print("No changelog found in VFS. Showing latest version info:\n");
+            dim_print("No /CHANGELOG.md in this image.\n");
             cmd_version();
         }
     }
 }
 
 fn cmd_sync() {
-    if !ospab_os::fs::disk_sync::is_dirty() {
-        dim_print("Nothing to sync — filesystem is already clean.\n");
+    if ospab_os::drivers::disk_count() == 0 {
+        framebuffer::draw_string("sync: no disk attached; files live in RAM only.\n", FG_WARN, BG);
         return;
     }
-    puts("Syncing filesystem...\n");
+    if !fs::disk_sync::is_dirty() {
+        dim_print("Nothing to write: no changes since the last sync.\n");
+        return;
+    }
+    puts("Writing filesystem to disk...\n");
     klog::record(klog::EventSource::Boot, "Sync requested");
-    if ospab_os::fs::disk_sync::sync_filesystem() {
-        dim_print("Filesystem synchronized to disk.\n");
+    if fs::disk_sync::sync_filesystem() {
+        framebuffer::draw_string("Done.\n", FG_OK, BG);
     } else {
-        err_print("Failed to sync filesystem.\n");
+        err_print("sync failed (see serial log).\n");
     }
 }
 
 fn cmd_dump_disk(_args: &str) {
-    use alloc::format;
-    puts("Reading sector 2048 (LBA 0x800)...\n");
-    let mut buf = [0u8; 512];
-    if ospab_os::drivers::read(0, 2048, 1, &mut buf) {
-        // Print first 16 bytes in hex
-        let mut hex = alloc::string::String::with_capacity(80);
-        for i in 0..16 {
-            let b = buf[i];
-            let hi = b >> 4;
-            let lo = b & 0x0F;
-            if i > 0 { hex.push(' '); }
-            hex.push(if hi < 10 { (b'0' + hi) as char } else { (b'a' + hi - 10) as char });
-            hex.push(if lo < 10 { (b'0' + lo) as char } else { (b'a' + lo - 10) as char });
-        }
-        hex.push('\n');
-        puts(&hex);
-        // Also print ASCII interpretation
-        let mut ascii = alloc::string::String::with_capacity(32);
-        ascii.push_str("ASCII: ");
-        for i in 0..16 {
-            let c = buf[i];
-            if c >= 0x20 && c < 0x7f {
-                ascii.push(c as char);
-            } else {
-                ascii.push('.');
+    let disk = match fs::disk_sync::primary_disk_index() {
+        Some(d) => d,
+        None => {
+            if ospab_os::drivers::disk_count() == 0 {
+                err_print("dump_disk: no disk attached\n");
+                return;
             }
+            0
         }
-        ascii.push('\n');
+    };
+    puts("Disk ");
+    print_dec(disk as u64);
+    puts(", sector 2048 (start of the persistence area), first 64 bytes:\n");
+    let mut buf = [0u8; 512];
+    if !ospab_os::drivers::read(disk, 2048, 1, &mut buf) {
+        err_print("dump_disk: read failed\n");
+        return;
+    }
+    for row in 0..4 {
+        let off = row * 16;
+        dim_print("  ");
+        print_hex_byte(off as u8);
+        dim_print(":  ");
+        for i in 0..16 {
+            print_hex_byte(buf[off + i]);
+            puts(if i == 7 { "  " } else { " " });
+        }
+        puts(" ");
+        let mut ascii = String::with_capacity(16);
+        for i in 0..16 {
+            let c = buf[off + i];
+            ascii.push(if (0x20..0x7f).contains(&c) { c as char } else { '.' });
+        }
         dim_print(&ascii);
+        puts("\n");
+    }
+    let magic = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    if magic == fs::disk_sync::SUPER_MAGIC {
+        framebuffer::draw_string("Persistence superblock present.\n", FG_OK, BG);
     } else {
-        err_print("Failed to read sector 2048.\n");
+        dim_print("No persistence superblock (disk never synced or not ours).\n");
     }
 }
 
 // ─── vol — volume control ────────────────────────────────────────────────────
 
-fn simple_parse_u8(s: &str) -> u8 {
+fn simple_parse_u8(s: &str) -> Option<u8> {
     let mut val: u16 = 0;
+    let mut any = false;
     for &b in s.as_bytes() {
-        if b >= b'0' && b <= b'9' {
+        if b.is_ascii_digit() {
             val = val * 10 + (b - b'0') as u16;
-            if val > 255 { return 255; }
+            any = true;
+            if val > 255 { return Some(255); }
         } else {
-            break;
+            return None;
         }
     }
-    val as u8
+    if any { Some(val as u8) } else { None }
 }
 
 /// Saved volume before mute (for toggle restore).
@@ -1596,29 +1386,31 @@ fn cmd_vol(args: &str) {
     use ospab_os::drivers::audio;
 
     if !audio::is_ready() {
-        framebuffer::draw_string("No audio driver active.\n", FG_ERR, BG);
+        err_print("vol: no audio driver active\n");
         return;
     }
 
     let arg = args.trim();
     if arg.is_empty() {
-        // Show current volume
-        let v = audio::volume();
         puts("Volume: ");
-        print_dec(v as u64);
+        print_dec(audio::volume() as u64);
         puts("%\n");
         return;
     }
 
-    // Parse argument: plain number, or +N / -N
     let new_vol = if let Some(rest) = arg.strip_prefix('+') {
-        let delta = simple_parse_u8(rest);
-        audio::volume().saturating_add(delta).min(100)
+        simple_parse_u8(rest).map(|d| audio::volume().saturating_add(d).min(100))
     } else if let Some(rest) = arg.strip_prefix('-') {
-        let delta = simple_parse_u8(rest);
-        audio::volume().saturating_sub(delta)
+        simple_parse_u8(rest).map(|d| audio::volume().saturating_sub(d))
     } else {
-        simple_parse_u8(arg).min(100)
+        simple_parse_u8(arg).map(|v| v.min(100))
+    };
+    let new_vol = match new_vol {
+        Some(v) => v,
+        None => {
+            err_print("vol: expected N, +N or -N (0-100)\n");
+            return;
+        }
     };
 
     audio::set_volume(new_vol);
@@ -1631,13 +1423,12 @@ fn cmd_mute() {
     use ospab_os::drivers::audio;
 
     if !audio::is_ready() {
-        framebuffer::draw_string("No audio driver active.\n", FG_ERR, BG);
+        err_print("mute: no audio driver active\n");
         return;
     }
 
     let cur = audio::volume();
     if cur == 0 {
-        // Unmute — restore previous volume
         let restore = unsafe { PRE_MUTE_VOL };
         let restore = if restore == 0 { 80 } else { restore };
         audio::set_volume(restore);
@@ -1645,7 +1436,6 @@ fn cmd_mute() {
         print_dec(restore as u64);
         puts("%)\n");
     } else {
-        // Mute — save current volume, set to 0
         unsafe { PRE_MUTE_VOL = cur; }
         audio::set_volume(0);
         puts("Muted\n");
@@ -1655,13 +1445,10 @@ fn cmd_mute() {
 // ─── soundtest — audio subsystem diagnostics + 440 Hz test tone ──────────────
 
 fn cmd_soundtest() {
-    extern crate alloc;
     use ospab_os::arch::x86_64::serial;
     use ospab_os::drivers::audio;
 
-    // ── header ───────────────────────────────────────────────────────────────
     serial::write_str("[SOUND] === Audio Subsystem Diagnostics ===\r\n");
-    puts("=== Audio Subsystem Diagnostics ===\n");
 
     let driver = audio::active_driver_name();
     let ready  = audio::is_ready();
@@ -1671,35 +1458,31 @@ fn cmd_soundtest() {
     serial::write_str("[SOUND] Ready         : ");
     serial::write_str(if ready { "yes" } else { "no" }); serial::write_str("\r\n");
 
-    puts("Active driver : "); puts(driver); puts("\n");
+    puts("Driver       : "); puts(driver); puts("\n");
+    puts("Status       : ");
     if ready {
-        framebuffer::draw_string("Status        : ready\n", FG_OK, BG);
+        framebuffer::draw_string("ready\n", FG_OK, BG);
     } else {
-        framebuffer::draw_string("Status        : NOT READY\n", FG_ERR, BG);
+        err_print("not ready\n");
     }
 
-    // ── IRQ line ─────────────────────────────────────────────────────────────
     let irq = audio::irq_line();
     serial::write_str("[SOUND] IRQ           : ");
     serial::write_str(ospab_os::format_u64(&mut nbuf, irq as u64));
     serial::write_str("\r\n");
-    puts("IRQ line      : "); print_dec(irq as u64); puts("\n");
+    puts("IRQ line     : "); print_dec(irq as u64); puts("\n");
 
-    // ── Sample rate ──────────────────────────────────────────────────────────
     let rate = audio::sample_rate();
-    puts("Sample rate   : "); print_dec(rate as u64); puts(" Hz\n");
+    puts("Sample rate  : "); print_dec(rate as u64); puts(" Hz\n");
 
-    // ── Volume ───────────────────────────────────────────────────────────────
     let vol = audio::volume();
-    puts("Volume        : "); print_dec(vol as u64); puts("%\n");
+    puts("Volume       : "); print_dec(vol as u64); puts("%\n");
 
-    // ── HDA DMA position ─────────────────────────────────────────────────────
     if driver == "HDA" && ready {
         let lpib = audio::hda::dma_position();
-        puts("DMA position  : "); print_dec(lpib as u64); puts(" / 32768\n");
+        puts("DMA position : "); print_dec(lpib as u64); puts(" / "); print_dec(audio::hda::ring_bytes() as u64); puts("\n");
     }
 
-    // ── AC97-specific DMA state ───────────────────────────────────────────────
     if driver == "AC97" && ready {
         let (civ, fill, in_flight) = audio::ac97::dma_status();
         serial::write_str("[SOUND] CIV=");
@@ -1709,33 +1492,32 @@ fn cmd_soundtest() {
         serial::write_str("  in_flight=");
         serial::write_str(ospab_os::format_u64(&mut nbuf, in_flight as u64));
         serial::write_str("\r\n");
-        puts("CIV="); print_dec(civ as u64);
+        puts("DMA          : CIV="); print_dec(civ as u64);
         puts(" FILL="); print_dec(fill as u64);
         puts(" in_flight="); print_dec(in_flight as u64); puts("\n");
     }
 
-    // ── full register dump (serial) ──────────────────────────────────────────
-    puts("Full register dump -> serial COM1.\n");
+    dim_print("Register dump written to serial COM1.\n");
     audio::dump_status();
     audio::dump_mem_map();
 
-    // ── no driver — abort ────────────────────────────────────────────────────
     if !ready {
-        puts("No audio driver ready — test tone skipped.\n");
+        puts("No audio driver ready; test tone skipped.\n");
         serial::write_str("[SOUND] No driver — test tone SKIPPED\r\n");
         serial::write_str("[SOUND] === End Diagnostics ===\r\n");
         return;
     }
 
-    // ── test tone ─────────────────────────────────────────────────────────────
-    //
-    // Use the driver's native sample rate (44100 Hz for AC97/HDA, 48000 Hz for ES1371).
-    // 16-sample sine table: sin(i·2π/16) × 16384  (50 % amplitude, integer-only)
+    // 16-sample sine table: sin(i·2π/16) × 16384 (50 % amplitude, integer-only)
     let sample_rate = audio::sample_rate();
+    if sample_rate == 0 {
+        err_print("soundtest: driver reports a sample rate of 0; tone skipped\n");
+        return;
+    }
 
-    puts("Generating 440 Hz test tone (0.5 s, ");
+    puts("Playing 440 Hz for 0.5 s (");
     print_dec(sample_rate as u64);
-    puts(" Hz, stereo 16-bit)...\n");
+    puts(" Hz, 16-bit stereo)...\n");
     serial::write_str("[SOUND] Generating 440 Hz test tone @ ");
     serial::write_str(ospab_os::format_u64(&mut nbuf, sample_rate as u64));
     serial::write_str(" Hz...\r\n");
@@ -1747,25 +1529,22 @@ fn cmd_soundtest() {
 
     // Phase increment Q16.16 = 440 × 16 × 65536 / sample_rate
     let phase_inc: u32 = ((440u64 * 16u64 * 65536u64) / sample_rate as u64) as u32;
-
-    // 0.5 seconds of frames
     let total_frames: usize = (sample_rate / 2) as usize;
     const CHUNK_FRAMES: usize = 1024;
     const CHUNK_BYTES:  usize = CHUNK_FRAMES * 4;
 
-    let mut phase:       u32  = 0;
+    let mut phase: u32 = 0;
     let mut total_bytes: usize = 0;
-    let mut remaining:   usize = total_frames;
-    let mut pcm: alloc::vec::Vec<u8> = alloc::vec![0u8; CHUNK_BYTES];
+    let mut remaining: usize = total_frames;
+    let mut pcm: Vec<u8> = alloc::vec![0u8; CHUNK_BYTES];
 
     while remaining > 0 {
-        let n = if remaining > CHUNK_FRAMES { CHUNK_FRAMES } else { remaining };
+        let n = remaining.min(CHUNK_FRAMES);
         for i in 0..n {
-            let idx = ((phase >> 16) as usize) & 0xF;
-            let s   = SIN16[idx];
-            let lo  = (s as u16 & 0xFF) as u8;
-            let hi  = ((s as u16) >> 8) as u8;
-            pcm[i * 4    ] = lo;
+            let s = SIN16[((phase >> 16) as usize) & 0xF];
+            let lo = (s as u16 & 0xFF) as u8;
+            let hi = ((s as u16) >> 8) as u8;
+            pcm[i * 4] = lo;
             pcm[i * 4 + 1] = hi;
             pcm[i * 4 + 2] = lo;
             pcm[i * 4 + 3] = hi;
@@ -1774,47 +1553,48 @@ fn cmd_soundtest() {
         let bytes = n * 4;
         audio::write_pcm(&pcm[..bytes]);
         total_bytes += bytes;
-        remaining   -= n;
+        remaining -= n;
     }
 
     serial::write_str("[SOUND] Bytes submitted : ");
     serial::write_str(ospab_os::format_u64(&mut nbuf, total_bytes as u64));
-    serial::write_str("\r\n");
-    serial::write_str("[SOUND] === End Diagnostics ===\r\n");
+    serial::write_str("\r\n[SOUND] === End Diagnostics ===\r\n");
 
-    puts("Bytes submitted : "); print_dec(total_bytes as u64); puts("\n");
-    
-    // Silence flush: Write 32 KiB of zeroes to fill the hardware ring buffer
-    // and stop the test tone from looping.
+    // Fill the hardware ring with silence so the tone does not loop.
     let silence = alloc::vec![0u8; 32768];
     audio::write_pcm(&silence);
 
-    framebuffer::draw_string("Test tone queued and flushed with silence.\n", FG_OK, BG);
-    puts("Tip: use 'vol <0-100>' to adjust volume.\n");
+    puts("Submitted ");
+    print_dec(total_bytes as u64);
+    puts(" bytes. ");
+    framebuffer::draw_string("Done.\n", FG_OK, BG);
 }
 
+// ─── power ───────────────────────────────────────────────────────────────────
+
 fn cmd_reboot() {
-    puts("Syncing and rebooting...\n");
-
-    // Only flush if there are pending writes — no-op otherwise.
-    if ospab_os::fs::disk_sync::is_dirty() {
-        ospab_os::fs::disk_sync::sync_filesystem();
+    if fs::disk_sync::is_dirty() {
+        puts("Writing pending filesystem changes...\n");
+        fs::disk_sync::sync_filesystem();
     }
-
     puts("Rebooting...\n");
     klog::record(klog::EventSource::Boot, "Reboot requested");
-    ospab_os::arch::x86_64::serial::write_str("[AETERNA] Rebooting...\r\n");
-    // Use ACPI reboot; falls back internally to 0xCF9/0x64/triple fault
+    ospab_os::arch::x86_64::serial::write_str("[POWER] Rebooting...\r\n");
+    // ACPI reset; falls back internally to 0xCF9 / 0x64 / triple fault
     acpi::reboot();
 }
 
 fn cmd_shutdown() {
-    puts("System shutting down...\n");
+    if fs::disk_sync::is_dirty() {
+        puts("Writing pending filesystem changes...\n");
+        fs::disk_sync::sync_filesystem();
+    }
+    puts("Shutting down...\n");
     klog::record(klog::EventSource::Boot, "Shutdown requested");
-    ospab_os::arch::x86_64::serial::write_str("[AETERNA] Shutting down...\r\n");
-    // ACPI shutdown writes PM1a_CNT SLP_TYP/SLP_EN and falls back to emulator ports
+    ospab_os::arch::x86_64::serial::write_str("[POWER] Shutting down...\r\n");
+    // ACPI S5 via PM1a_CNT, with emulator port fallbacks
     acpi::shutdown();
-    dim_print("\nSystem halted. You may turn off your computer.\n");
+    dim_print("\nACPI power-off did not take effect. It is now safe to turn off the machine.\n");
     loop { unsafe { asm!("cli; hlt"); } }
 }
 
@@ -1828,8 +1608,9 @@ fn cmd_history() {
         for i in start..HISTORY_COUNT {
             let slot = i % HISTORY_SIZE;
             let len = HISTORY_LENS[slot];
-            puts("  ");
-            print_dec((i + 1) as u64);
+            let n = i + 1;
+            pad(dec_len(n as u64), 5);
+            print_dec_color(n as u64, FG_DIM);
             puts("  ");
             puts(core::str::from_utf8_unchecked(&HISTORY[slot][..len]));
             puts("\n");
@@ -1837,17 +1618,19 @@ fn cmd_history() {
     }
 }
 
-fn cmd_install() {
-    crate::installer::run();
-}
-
 // ══════════════════════════════════════════════════════════════
 // Network commands
 // ══════════════════════════════════════════════════════════════
 
+fn net_down_message() {
+    err_print("Network is not up.\n");
+    dim_print("Supported NICs: RTL8139, RTL8169/8111, Intel e1000, virtio-net.\n");
+    dim_print("QEMU example: -netdev user,id=n0 -device e1000,netdev=n0\n");
+}
+
 fn cmd_ifconfig() {
     if !ospab_os::net::is_up() {
-        err_print("Network not available. Start QEMU with: -netdev user,id=n0 -device rtl8139,netdev=n0\n");
+        net_down_message();
         return;
     }
     let ip = unsafe { ospab_os::net::OUR_IP };
@@ -1855,576 +1638,100 @@ fn cmd_ifconfig() {
     let mask = unsafe { ospab_os::net::SUBNET_MASK };
     let mac = unsafe { ospab_os::net::OUR_MAC };
     let gw_mac = unsafe { ospab_os::net::GATEWAY_MAC };
-    let driver = ospab_os::net::nic_name(); // "RTL8139" / "Intel e1000" / "RTL8169/8111"
+    let driver = ospab_os::net::nic_name();
     let hw_link = ospab_os::net::link_up();
 
-    // Interface name line with driver
-    puts(driver);
-    puts("     Link encap:Ethernet\n");
-    puts("          HWaddr ");
+    hl_print("eth0");
+    puts(": ");
+    if hw_link {
+        framebuffer::draw_string("UP", FG_OK, BG);
+    } else {
+        err_print("NO-CARRIER");
+    }
+    dim_print("  driver ");
+    dim_print(driver);
+    puts("\n");
+    puts("      inet ");
+    print_ip(ip);
+    puts("  netmask ");
+    print_ip(mask);
+    puts("  broadcast ");
+    print_ip(ip_broadcast(ip, mask));
+    puts("\n");
+    puts("      ether ");
     print_mac(mac);
     puts("\n");
-    puts("          inet addr:");
-    print_ip(ip);
-    puts("  Mask:");
-    print_ip(mask);
-    puts("\n");
-    puts("          Gateway:");
+    puts("      gateway ");
     print_ip(gw);
-    puts("  GW MAC:");
+    puts("  (");
     print_mac(gw_mac);
-    // Annotate broadcast fallback
-    if gw_mac == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] {
-        dim_print(" (broadcast fallback)");
+    if gw_mac == [0xFF; 6] {
+        dim_print(", ARP not resolved, using broadcast");
     }
+    puts(")\n");
+    puts("      RX packets ");
+    print_dec(ospab_os::net::rx_packets());
+    puts("  bytes ");
+    print_dec(ospab_os::net::rx_bytes());
     puts("\n");
-    // Real flags derived from hardware state
-    if hw_link {
-        framebuffer::draw_string("          UP", FG_OK, BG);
-    } else {
-        err_print("          DOWN");
-    }
-    puts(" BROADCAST MULTICAST  MTU:1500\n");
-    // Byte/packet counters
-    let rx_p = ospab_os::net::rx_packets();
-    let tx_p = ospab_os::net::tx_packets();
-    let rx_b = ospab_os::net::rx_bytes();
-    let tx_b = ospab_os::net::tx_bytes();
-    puts("          RX packets:");
-    print_u64(rx_p);
-    puts("  bytes:");
-    print_u64(rx_b);
+    puts("      TX packets ");
+    print_dec(ospab_os::net::tx_packets());
+    puts("  bytes ");
+    print_dec(ospab_os::net::tx_bytes());
     puts("\n");
-    puts("          TX packets:");
-    print_u64(tx_p);
-    puts("  bytes:");
-    print_u64(tx_b);
-    puts("\n");
-}
-
-// ── ip addr / ip link / ip route ──────────────────────────────────────────
-
-fn subnet_prefix_len(mask: [u8; 4]) -> u8 {
-    mask.iter().map(|b| b.count_ones() as u8).sum()
 }
 
 fn ip_broadcast(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
     [ip[0] | !mask[0], ip[1] | !mask[1], ip[2] | !mask[2], ip[3] | !mask[3]]
 }
 
-fn ip_network(ip: [u8; 4], mask: [u8; 4]) -> [u8; 4] {
-    [ip[0] & mask[0], ip[1] & mask[1], ip[2] & mask[2], ip[3] & mask[3]]
-}
-
-fn cmd_ip(args: &str) {
-    if !ospab_os::net::is_up() {
-        err_print("Network not available. Start QEMU with: -netdev user,id=n0 -device rtl8139,netdev=n0\n");
-        return;
-    }
-    let sub = args.split_whitespace().next().unwrap_or("");
-    match sub {
-        "" | "a" | "addr" | "address" => cmd_ip_addr(),
-        "l" | "link" => cmd_ip_link(),
-        "r" | "route" => cmd_ip_route(),
-        _ => {
-            err_print("ip: unknown subcommand\n");
-            dim_print("Usage: ip {a[ddr] | l[ink] | r[oute]}\n");
-            dim_print("  ip a      — show addresses (ip addr show)\n");
-            dim_print("  ip l      — show links    (ip link show)\n");
-            dim_print("  ip r      — show routes   (ip route show)\n");
-        }
-    }
-}
-
-fn cmd_ip_addr() {
-    let ip   = unsafe { ospab_os::net::OUR_IP };
-    let mask = unsafe { ospab_os::net::SUBNET_MASK };
-    let mac  = unsafe { ospab_os::net::OUR_MAC };
-    let nic  = ospab_os::net::nic_name();
-    let up   = ospab_os::net::link_up();
-    let plen = subnet_prefix_len(mask);
-    let brd  = ip_broadcast(ip, mask);
-    let rx_p = ospab_os::net::rx_packets();
-    let tx_p = ospab_os::net::tx_packets();
-
-    // Loopback
-    dim_print("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
-    dim_print("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n");
-    dim_print("    inet 127.0.0.1/8 scope host lo\n\n");
-
-    // NIC
-    puts("2: ");
-    framebuffer::draw_string(nic, FG_HL, BG);
-    puts(": <BROADCAST,MULTICAST,");
-    if up {
-        framebuffer::draw_string("UP,LOWER_UP", FG_OK, BG);
-    } else {
-        err_print("NO-CARRIER");
-    }
-    puts("> mtu 1500 state ");
-    if up {
-        framebuffer::draw_string("UP", FG_OK, BG);
-    } else {
-        err_print("DOWN");
-    }
-    puts("\n");
-    puts("    link/ether ");
-    print_mac(mac);
-    puts(" brd ff:ff:ff:ff:ff:ff\n");
-    puts("    inet ");
-    print_ip(ip);
-    puts("/");
-    print_dec(plen as u64);
-    puts(" brd ");
-    print_ip(brd);
-    puts(" scope global ");
-    puts(nic);
-    puts("\n");
-    puts("    RX: ");
-    print_dec(rx_p);
-    puts(" pkts  TX: ");
-    print_dec(tx_p);
-    puts(" pkts\n");
-}
-
-fn cmd_ip_link() {
-    let mac = unsafe { ospab_os::net::OUR_MAC };
-    let nic = ospab_os::net::nic_name();
-    let up  = ospab_os::net::link_up();
-    let rx  = ospab_os::net::rx_packets();
-    let tx  = ospab_os::net::tx_packets();
-    let rxb = ospab_os::net::rx_bytes();
-    let txb = ospab_os::net::tx_bytes();
-
-    dim_print("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n");
-    dim_print("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\n");
-
-    puts("2: ");
-    framebuffer::draw_string(nic, FG_HL, BG);
-    puts(": <BROADCAST,MULTICAST,");
-    if up {
-        framebuffer::draw_string("UP,LOWER_UP", FG_OK, BG);
-    } else {
-        err_print("NO-CARRIER");
-    }
-    puts("> mtu 1500 state ");
-    if up {
-        framebuffer::draw_string("UP", FG_OK, BG);
-    } else {
-        err_print("DOWN");
-    }
-    puts("\n");
-    puts("    link/ether ");
-    print_mac(mac);
-    puts(" brd ff:ff:ff:ff:ff:ff\n");
-    puts("    RX: packets=");
-    print_dec(rx);
-    puts(" bytes=");
-    print_dec(rxb);
-    puts("\n    TX: packets=");
-    print_dec(tx);
-    puts(" bytes=");
-    print_dec(txb);
-    puts("\n");
-}
-
-fn cmd_ip_route() {
-    let ip   = unsafe { ospab_os::net::OUR_IP };
-    let gw   = unsafe { ospab_os::net::GATEWAY_IP };
-    let mask = unsafe { ospab_os::net::SUBNET_MASK };
-    let nic  = ospab_os::net::nic_name();
-    let plen = subnet_prefix_len(mask);
-    let net  = ip_network(ip, mask);
-
-    puts("default via ");
-    print_ip(gw);
-    puts(" dev ");
-    puts(nic);
-    puts("\n");
-
-    print_ip(net);
-    puts("/");
-    print_dec(plen as u64);
-    puts(" dev ");
-    puts(nic);
-    puts(" proto kernel scope link src ");
-    print_ip(ip);
-    puts("\n");
-
-    puts("127.0.0.0/8 dev lo scope host\n");
-}
-
-fn cmd_ping(args: &str) {
-    if !ospab_os::net::is_up() {
-        err_print("Network not available.\n");
-        dim_print("  Start QEMU with one of:\n");
-        dim_print("    -netdev user,id=n0 -device rtl8139,netdev=n0\n");
-        dim_print("    -netdev user,id=n0 -device e1000,netdev=n0\n");
-        return;
-    }
-    if args.is_empty() {
-        err_print("Usage: ping [-c count] [-i interval] [-s size] [-W timeout] <destination>\n");
-        dim_print("  Example: ping 10.0.2.2\n");
-        dim_print("  Example: ping -c 5 gateway\n");
-        return;
-    }
-
-    // ── Parse arguments ─────────────────────────────────────────────────────
-    let mut count: Option<u32> = None;       // None = infinite (until Ctrl+C)
-    let mut interval_us: u64 = 1_000_000;    // 1 second default
-    let mut payload: usize = 56;             // Linux default
-    let mut timeout_us: u64 = 3_000_000;     // 3 seconds default
-    let mut target_str: &str = "";
-
-    {
-        let mut words = args.split_whitespace();
-        while let Some(w) = words.next() {
-            match w {
-                "-c" => {
-                    if let Some(v) = words.next() {
-                        count = parse_u32(v);
-                        if count == Some(0) {
-                            err_print("ping: bad value for -c\n");
-                            return;
-                        }
-                    } else {
-                        err_print("ping: -c requires a value\n");
-                        return;
-                    }
-                }
-                "-i" => {
-                    if let Some(v) = words.next() {
-                        interval_us = match parse_seconds_us(v) {
-                            Some(us) if us > 0 => us,
-                            _ => { err_print("ping: bad value for -i\n"); return; }
-                        };
-                    } else {
-                        err_print("ping: -i requires a value\n");
-                        return;
-                    }
-                }
-                "-s" => {
-                    if let Some(v) = words.next() {
-                        payload = match parse_u32(v) {
-                            Some(n) if n <= 1458 => n as usize,
-                            _ => { err_print("ping: -s must be 0..1458\n"); return; }
-                        };
-                    } else {
-                        err_print("ping: -s requires a value\n");
-                        return;
-                    }
-                }
-                "-W" => {
-                    if let Some(v) = words.next() {
-                        timeout_us = match parse_seconds_us(v) {
-                            Some(us) if us > 0 => us,
-                            _ => { err_print("ping: bad value for -W\n"); return; }
-                        };
-                    } else {
-                        err_print("ping: -W requires a value\n");
-                        return;
-                    }
-                }
-                _ if w.starts_with('-') => {
-                    err_print("ping: unknown option: ");
-                    err_print(w);
-                    puts("\n");
-                    return;
-                }
-                _ => {
-                    target_str = w;
-                }
-            }
-        }
-    }
-
-    if target_str.is_empty() {
-        err_print("ping: missing destination\n");
-        return;
-    }
-
-    // ── Resolve destination ─────────────────────────────────────────────────
-    let ip = match parse_ip(target_str) {
-        Some(ip) => ip,
-        None => match ospab_os::net::resolver::resolve_host(target_str) {
-            Ok(ip) => {
-                puts("Resolved ");
-                puts(target_str);
-                puts(" -> ");
-                print_ip(ip);
-                puts("\n");
-                ip
-            }
-            Err(_) => {
-                err_print("Cannot resolve: ");
-                err_print(target_str);
-                puts("\n");
-                return;
-            }
-        },
-    };
-
-    // ── ARP warm-up ─────────────────────────────────────────────────────────
-    if ospab_os::net::arp::cache_lookup(ip).is_none() {
-        ospab_os::net::arp::send_request(ip);
-        let arp_end = ospab_os::arch::x86_64::tsc::tsc_stamp_us() + 500_000;
-        while ospab_os::arch::x86_64::tsc::tsc_stamp_us() < arp_end {
-            ospab_os::net::poll_rx();
-            if ospab_os::net::arp::cache_lookup(ip).is_some() { break; }
-            ospab_os::core::scheduler::sys_yield();
-        }
-    }
-
-    // ── Header ──────────────────────────────────────────────────────────────
-    // PING 10.0.2.2 (10.0.2.2) 56(84) bytes of data.
-    let total_ip = 20 + 8 + payload;
-    puts("PING ");
-    print_ip(ip);
-    puts(" (");
-    print_ip(ip);
-    puts(") ");
-    print_dec(payload as u64);
-    puts("(");
-    print_dec(total_ip as u64);
-    puts(") bytes of data.\n");
-
-    ospab_os::net::poll_rx();
-    CTRL_C.store(false, Ordering::Relaxed);
-
-    let mut sent: u64      = 0;
-    let mut received: u64  = 0;
-    let mut seq: u16       = 1;
-    let mut interrupted    = false;
-
-    // RTT statistics in µs
-    let mut rtt_min: u64   = u64::MAX;
-    let mut rtt_max: u64   = 0;
-    let mut rtt_sum: u64   = 0;
-    let mut rtt_sum_sq: u64 = 0;
-
-    loop {
-        // Respect -c count
-        if let Some(max) = count {
-            if sent >= max as u64 { break; }
-        }
-        if check_ctrl_c() { interrupted = true; break; }
-
-        // Send
-        ospab_os::net::icmp::send_ping_sized(ip, seq, payload);
-        sent += 1;
-
-        // Wait for reply (TSC-based, low-latency polling path)
-        let mut reply = None;
-        let wait_start = ospab_os::arch::x86_64::tsc::tsc_stamp_us();
-        loop {
-            if check_ctrl_c() { interrupted = true; break; }
-            ospab_os::net::poll_rx();
-            if let Some(r) = ospab_os::net::icmp::poll_reply() {
-                reply = Some(r);
-                break;
-            }
-            let elapsed = ospab_os::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(wait_start);
-            if elapsed >= timeout_us {
-                ospab_os::net::icmp::cancel_wait();
-                break;
-            }
-            if elapsed > 20_000 {
-                // after 20ms, allow scheduler to run to avoid busy-spinning forever
-                ospab_os::core::scheduler::sys_yield();
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-        if interrupted { break; }
-
-        // Display
-        match reply {
-            Some(r) => {
-                received += 1;
-                let rtt = r.rtt_us;
-                if rtt < rtt_min { rtt_min = rtt; }
-                if rtt > rtt_max { rtt_max = rtt; }
-                rtt_sum += rtt;
-                rtt_sum_sq += rtt.saturating_mul(rtt);
-
-                // "64 bytes from 10.0.2.2: icmp_seq=1 ttl=64 time=1.23 ms"
-                print_dec(r.nbytes);
-                puts(" bytes from ");
-                print_ip(r.src_ip);
-                puts(": icmp_seq=");
-                print_dec(r.seq as u64);
-                puts(" ttl=");
-                print_dec(r.ttl as u64);
-                puts(" time=");
-                print_rtt_ms(rtt);
-                puts(" ms\n");
-            }
-            None => {
-                err_print("Request timeout for icmp_seq ");
-                print_dec(seq as u64);
-                puts("\n");
-            }
-        }
-
-        seq = seq.wrapping_add(1);
-
-        // Check count limit after display
-        if let Some(max) = count {
-            if sent >= max as u64 { break; }
-        }
-        if check_ctrl_c() { interrupted = true; break; }
-
-        // Inter-packet delay
-        let delay_start = ospab_os::arch::x86_64::tsc::tsc_stamp_us();
-        while ospab_os::arch::x86_64::tsc::tsc_stamp_us().saturating_sub(delay_start) < interval_us {
-            if check_ctrl_c() { interrupted = true; break; }
-            ospab_os::net::poll_rx();
-            ospab_os::core::scheduler::sys_yield();
-        }
-        if interrupted { break; }
-    }
-
-    // ── Summary ─────────────────────────────────────────────────────────────
-    if interrupted {
-        framebuffer::draw_string("^C\n", FG_DIM, BG);
-    }
-
-    let lost = sent.saturating_sub(received);
-    let loss_pct = if sent > 0 { lost * 100 / sent } else { 0 };
-
-    puts("\n--- ");
-    print_ip(ip);
-    puts(" ping statistics ---\n");
-    print_dec(sent);
-    puts(" packets transmitted, ");
-    print_dec(received);
-    puts(" received, ");
-    print_dec(loss_pct);
-    puts("% packet loss\n");
-
-    if received > 0 {
-        let avg = rtt_sum / received;
-        let mean_sq = rtt_sum_sq / received;
-        let sq_mean = avg.saturating_mul(avg);
-        let variance = mean_sq.saturating_sub(sq_mean);
-        let mdev = isqrt_u64(variance);
-        if rtt_min == u64::MAX { rtt_min = 0; }
-
-        puts("rtt min/avg/max/mdev = ");
-        print_rtt_ms(rtt_min);
-        puts("/");
-        print_rtt_ms(avg);
-        puts("/");
-        print_rtt_ms(rtt_max);
-        puts("/");
-        print_rtt_ms(mdev);
-        puts(" ms\n");
-    }
-}
-
-/// Print RTT in microseconds as "X.XX" milliseconds.
-fn print_rtt_ms(rtt_us: u64) {
-    let ms_int  = rtt_us / 1_000;
-    let ms_frac = (rtt_us % 1_000) / 10; // 2 decimal places
-    print_dec(ms_int);
-    framebuffer::draw_char('.', FG, BG);
-    framebuffer::draw_char((b'0' + ((ms_frac / 10) % 10) as u8) as char, FG, BG);
-    framebuffer::draw_char((b'0' + (ms_frac % 10) as u8) as char, FG, BG);
-}
-
-/// Parse "N" or "N.NNN" seconds → microseconds.
-fn parse_seconds_us(s: &str) -> Option<u64> {
-    let bytes = s.as_bytes();
-    let mut int_part: u64 = 0;
-    let mut frac: u64 = 0;
-    let mut frac_digits: u32 = 0;
-    let mut in_frac = false;
-    let mut has = false;
-    for &b in bytes {
-        if b == b'.' && !in_frac {
-            in_frac = true;
-        } else if b >= b'0' && b <= b'9' {
-            has = true;
-            if in_frac {
-                if frac_digits < 6 { frac = frac * 10 + (b - b'0') as u64; frac_digits += 1; }
-            } else {
-                int_part = int_part * 10 + (b - b'0') as u64;
-            }
-        } else { break; }
-    }
-    if !has { return None; }
-    while frac_digits < 6 { frac *= 10; frac_digits += 1; }
-    Some(int_part * 1_000_000 + frac)
-}
-
-/// Integer square root.
-fn isqrt_u64(n: u64) -> u64 {
-    if n == 0 { return 0; }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x { x = y; y = (x + n / x) / 2; }
-    x
-}
-
 fn cmd_ntpdate(args: &str) {
     if !ospab_os::net::is_up() {
-        err_print("Network not available.\n");
+        net_down_message();
         return;
     }
 
-    // Determine which server(s) to try
-    let result = if args.is_empty() {
-        // No argument: try all fallbacks (QEMU gateway first, then real NTP servers)
+    let server = args.trim();
+    let result = if server.is_empty() {
         puts("Querying NTP servers...\n");
         ospab_os::net::sntp::sync_system_time()
     } else {
-        // Explicit server IP or hostname
-        let server_ip = match parse_ip(args) {
+        let server_ip = match parse_ip(server) {
             Some(ip) => ip,
-            None => match ospab_os::net::resolver::resolve_host(args) {
-                Ok(ip) => {
-                    puts("Resolved ");
-                    puts(args);
-                    puts(" -> ");
-                    print_ip(ip);
-                    puts("\n");
-                    ip
-                }
+            None => match ospab_os::net::resolver::resolve_host(server) {
+                Ok(ip) => ip,
                 Err(_) => {
-                    err_print("Cannot resolve: ");
-                    err_print(args);
+                    err_print("ntpdate: cannot resolve ");
+                    err_print(server);
                     puts("\n");
                     return;
                 }
             },
         };
-        puts("Querying NTP server ");
+        puts("Querying ");
+        puts(server);
+        puts(" (");
         print_ip(server_ip);
-        puts("...\n");
+        puts(")...\n");
         ospab_os::net::sntp::sync_time(server_ip)
     };
 
     match result {
         Ok(unix_ts) => {
-            framebuffer::draw_string("[  OK  ] ", FG_OK, BG);
-            puts("Time synchronized: ");
+            framebuffer::draw_string("Clock set: ", FG_OK, BG);
             let mut buf = [0u8; 32];
             let len = ospab_os::net::sntp::format_datetime_with_tz(
                 unix_ts,
                 ospab_os::net::sntp::read_timezone_offset(),
                 &mut buf,
             );
-            for i in 0..len {
-                framebuffer::draw_char(buf[i] as char, FG, BG);
-            }
+            puts(core::str::from_utf8(&buf[..len]).unwrap_or("?"));
             puts("\n");
         }
         Err(e) => {
-            err_print("NTP sync failed: ");
+            err_print("ntpdate: ");
             err_print(e.as_str());
             puts("\n");
-            dim_print("Tip: Make sure QEMU is started with -netdev user,...\n");
-            dim_print("     Try: ntpdate time1.google.com\n");
         }
     }
 }
@@ -2432,43 +1739,29 @@ fn cmd_ntpdate(args: &str) {
 // ─── IP parsing helpers ───
 
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
-    let bytes = s.as_bytes();
     let mut ip = [0u8; 4];
     let mut octet = 0u32;
     let mut octet_idx = 0usize;
     let mut has_digit = false;
 
-    for &b in bytes {
+    for &b in s.as_bytes() {
         if b == b'.' {
             if !has_digit || octet > 255 || octet_idx >= 3 { return None; }
             ip[octet_idx] = octet as u8;
             octet_idx += 1;
             octet = 0;
             has_digit = false;
-        } else if b >= b'0' && b <= b'9' {
+        } else if b.is_ascii_digit() {
             octet = octet * 10 + (b - b'0') as u32;
+            if octet > 255 { return None; }
             has_digit = true;
         } else {
             return None;
         }
     }
-    if !has_digit || octet > 255 || octet_idx != 3 { return None; }
+    if !has_digit || octet_idx != 3 { return None; }
     ip[3] = octet as u8;
     Some(ip)
-}
-
-fn parse_u32(s: &str) -> Option<u32> {
-    let mut val = 0u32;
-    let mut has = false;
-    for &b in s.as_bytes() {
-        if b >= b'0' && b <= b'9' {
-            val = val * 10 + (b - b'0') as u32;
-            has = true;
-        } else {
-            break;
-        }
-    }
-    if has { Some(val) } else { None }
 }
 
 fn print_ip(ip: [u8; 4]) {
@@ -2486,31 +1779,19 @@ fn print_mac(mac: [u8; 6]) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// grape — Text editor (nano-like)
+// Applications
 // ══════════════════════════════════════════════════════════════
 
 fn cmd_grape(args: &str) {
     let path = args.trim();
     if path.is_empty() {
-        // Open empty buffer
         ospab_os::userspace::grape::edit("");
     } else {
-        // Resolve path relative to CWD
-        let abs = resolve_path(path);
-        ospab_os::userspace::grape::edit(&abs);
+        ospab_os::userspace::grape::edit(&resolve_path(path));
     }
-    // After editor exits, redraw prompt area
-    framebuffer::set_cursor_pos(0, 0);
-    puts("AETERNA Microkernel ");
-    puts(crate::version::VERSION_STR);
-    puts(" (");
-    puts(crate::version::ARCH);
-    puts(")\n\n");
+    // The editor owns the whole screen; start clean when it returns.
+    cmd_clear();
 }
-
-// ══════════════════════════════════════════════════════════════
-// tomato — Package manager
-// ══════════════════════════════════════════════════════════════
 
 fn cmd_tomato(args: &str) {
     // `tomato --tmt <subcmd>` routes to the binary package (.tmt) subsystem
@@ -2521,562 +1802,279 @@ fn cmd_tomato(args: &str) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════
-// seed — Init system / service manager
-// ══════════════════════════════════════════════════════════════
-
-fn cmd_seed(args: &str) {
-    ospab_os::userspace::seed::run(args);
-}
-
-fn cmd_bash(args: &str) {
-    ospab_os::plum::preprocess(&alloc::format!("bash {}", args));
-}
-
-// ══════════════════════════════════════════════════════════════
-// DOOM — The Classic Game (1993)
-// ══════════════════════════════════════════════════════════════
-
-fn cmd_doom(_args: &str) {
-    puts("\n");
-    dim_print("Loading DOOM engine... (shareware v1.9)\n");
-    
-    // Run DOOM and block until exit
+fn cmd_doom() {
+    dim_print("Starting DOOM...\n");
     ospab_os::doom::run();
-    
-    // After exit, we're back in the terminal
-    puts("\n");
-    dim_print("Welcome back to AETERNA.\n");
-}
-
-fn cmd_bench(args: &str) {
-    ospab_os::bench::run(args);
-}
-
-fn cmd_aai(args: &str) {
-    let mut row = 5usize;
-    let parts: alloc::vec::Vec<&str> = args.split_whitespace().collect();
-    let mut dispatch_args: alloc::vec::Vec<&str> = alloc::vec!["aai"];
-    for p in &parts { dispatch_args.push(p); }
-    ospab_os::userspace::aai::aai_dispatch(&dispatch_args, &mut row);
+    // DOOM draws over the whole framebuffer; clear it on return.
+    cmd_clear();
 }
 
 fn cmd_ring3test() {
-    puts("Launching Ring 3 smoke test...\n");
-    dim_print("Spawns a CPL3 task (getpid -> exit) that runs on the next scheduler tick.\n");
+    puts("Starting a ring-3 test task (getpid, then exit)...\n");
     match ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
         Some(pid) => {
-            puts("Ring 3 task spawned, pid ");
+            puts("Spawned pid ");
             print_dec(pid as u64);
-            puts(" — watch the serial log for [SYSCALL] exit(");
+            puts(". It runs on the next scheduler tick; the result appears on\n");
+            puts("serial COM1 as [SYSCALL] exit(");
             print_dec(pid as u64);
             puts(").\n");
         }
-        None => err_print("ring3test: failed to prepare Ring 3 task\n"),
+        None => err_print("ring3test: could not prepare the ring-3 task\n"),
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-// Tutor — Interactive system tutorial
+// tutor
 // ══════════════════════════════════════════════════════════════
 
 fn cmd_tutor(args: &str) {
-    let topic = if args.is_empty() { "intro" } else { args };
+    let topic = if args.trim().is_empty() { "intro" } else { args.trim() };
 
     match topic {
         "intro"       => tutor_intro(),
         "fs"          => tutor_fs(),
+        "disk"        => tutor_disk(),
+        "persistence" => tutor_persistence(),
         "net"         => tutor_net(),
         "mem"         => tutor_mem(),
         "kernel"      => tutor_kernel(),
-        "commands" | "cmd" => tutor_commands(),
-        "disk"        => tutor_disk(),
-        "persistence" => tutor_persistence(),
-        "axon"        => tutor_axon(),
         "shell"       => tutor_shell(),
-        "ai" | "ane" | "aai" => tutor_ai(),
+        "axon"        => tutor_axon(),
+        "commands" | "cmd" => cmd_help(""),
         "topics" | "help" | "?" => tutor_topics(),
         _ => {
-            puts("Unknown topic: ");
-            puts(topic);
-            puts("\n\nType '");
-            framebuffer::draw_string("tutor topics", FG_OK, BG);
-            puts("' for a list of all topics.\n");
+            err_print("tutor: unknown topic '");
+            err_print(topic);
+            err_print("'\n");
+            tutor_topics();
         }
     }
 }
 
-fn tutor_intro() {
+fn tutor_title(t: &str) {
     puts("\n");
-    framebuffer::draw_string("  ┌─────────────────────────────────────────┐\n", FG_DIM, BG);
-    framebuffer::draw_string("  │", FG_DIM, BG);
-    framebuffer::draw_string("  Welcome to ospab.os (AETERNA)          ", FG_OK, BG);
-    framebuffer::draw_string("│\n", FG_DIM, BG);
-    framebuffer::draw_string("  └─────────────────────────────────────────┘\n\n", FG_DIM, BG);
-
-    puts("  ospab.os is an experimental operating system built from\n");
-    puts("  scratch in Rust. It runs on the AETERNA microkernel —\n");
-    puts("  a capability-based, AI-native kernel designed for\n");
-    puts("  deterministic, high-performance computing.\n\n");
-
-    framebuffer::draw_string("  What you can do right now:\n\n", FG_WARN, BG);
-    puts("  1. Welcome & system overview         ");
-    dim_print("(ls, cd, cat)\n");
-    puts("  2. Check hardware and memory            ");
-    dim_print("(lspci, free, lsmem)\n");
-    puts("  3. View kernel events                   ");
-    dim_print("(dmesg)\n");
-    puts("  4. Ping network hosts                   ");
-    dim_print("(ping 10.0.2.2)\n");
-    puts("  5. Sync time from the internet          ");
-    dim_print("(ntpdate)\n");
-    puts("  6. Install the OS to virtual disk       ");
-    dim_print("(install)\n");
-    puts("  7. Run neural inference on bare metal   ");
-    dim_print("(aai chat ...)\n\n");
-
-    framebuffer::draw_string("  Quick start:\n", FG_WARN, BG);
-    puts("  Type 'help' for all commands\n");
-    puts("  Type 'tutor <topic>' to learn more ");
-    dim_print("(fs, net, mem, kernel, ai)\n");
-    puts("  Use Up/Down arrows to browse command history\n");
-    puts("  Press Ctrl+L to clear the screen\n\n");
+    framebuffer::draw_string(t, FG_OK, BG);
+    puts("\n");
+    let n = t.chars().count();
+    for _ in 0..n {
+        framebuffer::draw_string("\u{2500}", FG_DIM, BG);
+    }
+    puts("\n");
 }
 
-fn tutor_fs() {
+fn tutor_head(t: &str) {
     puts("\n");
-    framebuffer::draw_string("  Filesystem Tutorial\n", FG_OK, BG);
-    puts("  ════════════════════\n\n");
-
-    puts("  AETERNA uses a virtual filesystem (VFS). Files like\n");
-    puts("  /proc/meminfo are generated live by the kernel.\n\n");
-
-    framebuffer::draw_string("  Directory Structure:\n\n", FG_WARN, BG);
-    puts("  /           Root directory\n");
-    puts("  /boot       Kernel and bootloader files\n");
-    puts("  /dev        Device files (null, zero, console, fb0)\n");
-    puts("  /etc        Configuration (hostname, os-release)\n");
-    puts("  /proc       Process and system info (live data)\n");
-    puts("  /sys        Sysfs — kernel objects\n");
-    puts("  /tmp        Temporary files\n");
-    puts("  /home       User home directories\n\n");
-
-    framebuffer::draw_string("  Try these commands:\n\n", FG_WARN, BG);
-    dim_print("  ls /proc           — see available proc files\n");
-    dim_print("  cat /proc/meminfo  — live memory statistics\n");
-    dim_print("  cat /proc/cpuinfo  — CPU information\n");
-    dim_print("  cat /etc/os-release — OS identity\n\n");
+    framebuffer::draw_string(t, FG_WARN, BG);
+    puts("\n");
 }
 
-fn tutor_net() {
+/// "  command      explanation"
+fn tutor_try(cmd: &str, what: &str) {
+    puts("  ");
+    hl_print(cmd);
+    pad(cmd.len(), 34);
+    dim_print(what);
     puts("\n");
-    framebuffer::draw_string("  Networking Tutorial\n", FG_OK, BG);
-    puts("  ═══════════════════\n\n");
-
-    puts("  AETERNA has a built-in TCP/IP stack (IPv4) with:\n");
-    puts("  - RTL8139 NIC driver (PCI auto-detected)\n");
-    puts("  - Ethernet, ARP, IPv4, ICMP, UDP\n");
-    puts("  - SNTP time synchronization\n\n");
-
-    framebuffer::draw_string("  QEMU Setup:\n\n", FG_WARN, BG);
-    puts("  Start QEMU with networking enabled:\n");
-    dim_print("  qemu-system-x86_64 -cdrom ospab.iso -m 512M \\\n");
-    dim_print("    -netdev user,id=n0 -device rtl8139,netdev=n0\n\n");
-
-    puts("  QEMU user-mode networking gives you:\n");
-    puts("  - IP:      10.0.2.15 (your VM)\n");
-    puts("  - Gateway: 10.0.2.2  (NAT to host)\n");
-    puts("  - DNS:     10.0.2.3\n\n");
-
-    framebuffer::draw_string("  Available Commands:\n\n", FG_WARN, BG);
-    dim_print("  ifconfig          — show network configuration\n");
-    dim_print("  ping 10.0.2.2     — ping the gateway\n");
-    dim_print("  ping 8.8.8.8      — ping Google DNS (via NAT)\n");
-    dim_print("  ntpdate           — sync time via NTP\n\n");
-
-    puts("  Note: QEMU SLIRP NAT allows outbound connections.\n");
-    puts("  Ping may not work to all hosts (QEMU limitation).\n\n");
-}
-
-fn tutor_mem() {
-    puts("\n");
-    framebuffer::draw_string("  Memory Subsystem Tutorial\n", FG_OK, BG);
-    puts("  ══════════════════════════\n\n");
-
-    puts("  AETERNA manages memory in several layers:\n\n");
-
-    framebuffer::draw_string("  1. Physical Memory Manager\n", FG_WARN, BG);
-    puts("     Bitmap allocator managing 4K frames.\n");
-    puts("     Regions from Limine bootloader memory map.\n\n");
-
-    framebuffer::draw_string("  2. Kernel Heap (128 MiB)\n", FG_WARN, BG);
-    puts("     Linked-list allocator for dynamic allocation.\n");
-    puts("     Used by alloc::Vec, alloc::String, etc.\n\n");
-
-    framebuffer::draw_string("  3. HHDM (Higher Half Direct Map)\n", FG_WARN, BG);
-    puts("     All physical memory mapped at offset\n");
-    puts("     0xFFFF800000000000. No page table walks needed.\n\n");
-
-    framebuffer::draw_string("  Commands to explore:\n\n", FG_WARN, BG);
-    dim_print("  free              — physical + heap overview\n");
-    dim_print("  lsmem             — detailed region info\n");
-    dim_print("  cat /proc/meminfo — meminfo like Linux\n\n");
-}
-
-fn tutor_kernel() {
-    puts("\n");
-    framebuffer::draw_string("  AETERNA Kernel Architecture\n", FG_OK, BG);
-    puts("  ═══════════════════════════\n\n");
-
-    puts("  AETERNA is a microkernel written in Rust (no_std).\n\n");
-
-    framebuffer::draw_string("  Core Principles:\n", FG_WARN, BG);
-    puts("  - Capability-based security\n");
-    puts("  - Deterministic scheduling (Compute-First)\n");
-    puts("  - AI-native primitives (tensor, DMA engine)\n");
-    puts("  - NUMA-aware memory allocation\n");
-    puts("  - Single address space (SASOS)\n\n");
-
-    framebuffer::draw_string("  Boot Sequence:\n", FG_WARN, BG);
-    puts("  1. Limine loads kernel ELF at high address\n");
-    puts("  2. _start() → GDT, IDT, PIC, SSE init\n");
-    puts("  3. Memory map → physical allocator → heap\n");
-    puts("  4. Scheduler + syscall interface\n");
-    puts("  5. Network stack (if NIC present)\n");
-    puts("  6. Terminal — interactive shell\n\n");
-
-    framebuffer::draw_string("  Module Map:\n", FG_WARN, BG);
-    puts("  arch/x86_64/   — platform code (GDT, IDT, PIC)\n");
-    puts("  mm/            — memory management\n");
-    puts("  core/          — scheduler, IPC, syscall\n");
-    puts("  net/           — network stack (RTL8139, IPv4)\n");
-    puts("  executive/     — object manager, processes\n");
-    puts("  hpc/           — high-perf computing units\n\n");
-}
-
-fn tutor_commands() {
-    framebuffer::clear(BG);
-    framebuffer::set_cursor_pos(0, 0);
-
-    framebuffer::draw_string("  AETERNA Shell", FG_OK, BG);
-    framebuffer::draw_string(" -- Complete Command Reference\n", FG, BG);
-    framebuffer::draw_string("  =======================================================\n\n", FG_DIM, BG);
-
-    // Shell Keys
-    framebuffer::draw_string("  Shell Keys:\n", FG_WARN, BG);
-    dim_print("  Up/Down       Browse history    Ctrl+L   Clear screen\n");
-    dim_print("  Ctrl+C        Cancel input      Tab      4 spaces\n\n");
-
-    // Filesystem
-    framebuffer::draw_string("  Filesystem:\n", FG_WARN, BG);
-    dim_print("  ls [path]     List directory         cd <path>    Change directory\n");
-    dim_print("  cat <file>    View file              pwd          Working directory\n");
-    dim_print("  mkdir <dir>   Create directory       touch <file> Create file\n");
-    dim_print("  rm <file>     Delete file            save         Persist to disk\n");
-    dim_print("  echo t > f    Write text to file     write <f> t  Write text\n\n");
-
-    // System Info
-    framebuffer::draw_string("  System Info:\n", FG_WARN, BG);
-    dim_print("  version       OS + kernel version    uname [-a]   System info\n");
-    dim_print("  about         AETERNA ASCII art       whoami       Current user\n");
-    dim_print("  hostname      System hostname         date         Date + uptime\n");
-    dim_print("  uptime        Uptime counter          dmesg        Kernel log\n\n");
-
-    // Hardware & Memory
-    framebuffer::draw_string("  Hardware & Memory:\n", FG_WARN, BG);
-    dim_print("  free          Memory overview         meminfo      Detailed stats\n");
-    dim_print("  lsmem         Memory region list      lspci        PCI devices\n");
-    dim_print("  lsblk         Block devices           soundtest    Audio diag\n");
-    dim_print("  vol [0-100]   Volume control          mute         Toggle mute\n\n");
-
-    // Disk & Storage
-    framebuffer::draw_string("  Disk & Storage:\n", FG_WARN, BG);
-    dim_print("  fdisk <dev>   Partition info          mkfs         Format partition\n");
-    dim_print("  mount         Mount filesystem        sync         Flush to disk\n");
-    dim_print("  dump_disk     Hex dump LBA 2048       install      OS installer\n\n");
-
-    // Networking
-    framebuffer::draw_string("  Networking:\n", FG_WARN, BG);
-    dim_print("  ifconfig      Interface config        ping <ip>    ICMP test\n");
-    dim_print("  ntpdate [ip]  NTP time sync           netdiag      Full NIC diag\n\n");
-
-    // System Control
-    framebuffer::draw_string("  System Control:\n", FG_WARN, BG);
-    dim_print("  reboot        Reboot system           shutdown     Power off\n");
-    dim_print("  poweroff      Alias for shutdown      halt         Stop CPU\n");
-    dim_print("  ps            Process list            top          Process activity\n");
-    dim_print("  history       Command history         clear        Clear screen\n\n");
-
-    // Userland Apps
-    framebuffer::draw_string("  Userland Apps:\n", FG_WARN, BG);
-    dim_print("  grape <file>  Text editor (nano-like)\n");
-    dim_print("  tomato        Package manager  (-S pkg  -R pkg  -Q  -Syu)\n");
-    dim_print("  seed [cmd]    Init system / service manager  (seed status)\n");
-    dim_print("  doom          Classic DOOM shareware v1.9\n");
-    dim_print("  bash <script> Run shell script\n");
-    dim_print("  plum          Shell info and builtins\n\n");
-
-    // AI — ANE
-    framebuffer::draw_string("  AI -- Aeterna Neural Engine (ANE):\n", FG_WARN, BG);
-    dim_print("  aai load <f>  Load .tmt-ai model (zero-copy)\n");
-    dim_print("  aai info      Model metadata + param count\n");
-    dim_print("  aai bench     SIMD GEMM performance benchmark\n");
-    dim_print("  aai chat <t>  Run inference + stream tokens at 100 Hz\n");
-    dim_print("  aai summarize Entropy + stats (chars/words/uniq-bytes/H)\n");
-    dim_print("  See: tutor ai  for full ANE deep-dive\n\n");
-
-    // Shell Builtins (plum)
-    framebuffer::draw_string("  Shell Builtins (plum):\n", FG_WARN, BG);
-    dim_print("  export VAR=v  Set env variable        alias n=cmd  Create alias\n");
-    dim_print("  env           Show all variables      set          Show/set vars\n");
-    dim_print("  unset <var>   Remove variable         unalias <n>  Remove alias\n");
-    dim_print("  type <cmd>    Find command type       source <f>   Run script\n\n");
-
-    // AXON Coreutils
-    framebuffer::draw_string("  AXON Coreutils (text & file utilities):\n", FG_WARN, BG);
-    dim_print("  wc   head   tail   grep   sort   uniq   cut   awk   diff\n");
-    dim_print("  cp   mv     find   du     tree   stat   xxd   nl    df\n");
-    dim_print("  kill which  printf xargs\n");
-    dim_print("  See: tutor axon  for full details and examples\n");
-}
-
-// ══════════════════════════════════════════════════════════════
-// Output helpers
-// ══════════════════════════════════════════════════════════════
-
-fn tutor_ai() {
-    puts("\n");
-    framebuffer::draw_string("  ANE — Aeterna Neural Engine\n", FG_OK, BG);
-    puts("  ════════════════════════════\n\n");
-
-    puts("  ANE is a no_std, bare-metal neural inference library\n");
-    puts("  built into the AETERNA kernel. No Python, no framework —\n");
-    puts("  tensors and GEMM kernels running directly on the CPU.\n\n");
-
-    framebuffer::draw_string("  Architecture:\n", FG_WARN, BG);
-    puts("  lib/ane/tensor.rs    — N-D Tensor, GEMM, ReLU, Softmax\n");
-    puts("  lib/ane/layers.rs    — Linear, LayerNorm, MHA, Embedding\n");
-    puts("  lib/ane/optimizers.rs— AdamW + SGD with SIMD kernels\n");
-    puts("  lib/ane/compiler.rs  — Op-fusion graph compiler\n\n");
-
-    framebuffer::draw_string("  SIMD Dispatch (auto-detected at runtime):\n", FG_WARN, BG);
-    dim_print("  AVX-512   — 16-wide f32 FMADD (best performance)\n");
-    dim_print("  AVX2+FMA  — 8-wide f32 FMADD   (standard modern CPU)\n");
-    dim_print("  Scalar    — 16×16 tiled GEMM    (always available)\n\n");
-
-    framebuffer::draw_string("  aai — command-line frontend:\n", FG_WARN, BG);
-    dim_print("  aai load /models/tiny.tmt-ai   Load model file\n");
-    dim_print("  aai info                       Show metadata\n");
-    dim_print("  aai bench                      GEMM perf report\n");
-    dim_print("  aai chat Hello, AETERNA!       Inference + streaming\n");
-    dim_print("  aai summarize <text>           Entropy + text statistics\n\n");
-
-    framebuffer::draw_string("  .tmt-ai model format:\n", FG_WARN, BG);
-    puts("  Offset 0:    Magic  b\"TMT\\x01\"\n");
-    puts("  Offset 4:    Version u32 LE\n");
-    puts("  Offset 8:    Meta-len u32 LE\n");
-    puts("  Offset 12:   UTF-8 JSON {name, arch, d_model, n_layers,\n");
-    puts("                           n_heads, vocab_size, ctx_len}\n");
-    puts("  Offset ~64:  Raw f32 weights (64-byte aligned)\n\n");
-
-    framebuffer::draw_string("  KV-Cache (Phase 3):\n", FG_WARN, BG);
-    puts("  Ring-buffer holding key/value pairs per layer.\n");
-    puts("  Allocated once at model load (no GC pressure).\n");
-    puts("  Token streaming at 100 Hz via PIT IRQ 0.\n\n");
-
-    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
-    puts("  1. Create a model:   ");
-    dim_print("(place .tmt-ai in /models/)\n");
-    puts("  2. Load it:          ");
-    dim_print("aai load /models/tiny.tmt-ai\n");
-    puts("  3. Inspect:          ");
-    dim_print("aai info\n");
-    puts("  4. Benchmark SIMD:   ");
-    dim_print("aai bench\n");
-    puts("  5. Chat:             ");
-    dim_print("aai chat Tell me about AETERNA\n");
-    puts("  6. Analyse text:     ");
-    dim_print("aai summarize Hello, AETERNA!\n\n");
 }
 
 fn tutor_topics() {
+    tutor_title("tutor topics");
+    tutor_try("tutor intro", "what this system is and is not");
+    tutor_try("tutor fs", "the in-memory filesystem and /proc");
+    tutor_try("tutor disk", "storage drivers and disk tools");
+    tutor_try("tutor persistence", "how files survive a reboot");
+    tutor_try("tutor net", "network stack and tools");
+    tutor_try("tutor mem", "physical memory and the kernel heap");
+    tutor_try("tutor kernel", "kernel structure and boot");
+    tutor_try("tutor shell", "line editing, variables, aliases");
+    tutor_try("tutor axon", "the AXON file and text tools");
+    tutor_try("tutor commands", "same as 'help'");
     puts("\n");
-    framebuffer::draw_string("  AETERNA Interactive Tutorial\n", FG_OK, BG);
-    puts("  ═══════════════════════════════\n\n");
-    framebuffer::draw_string("  Usage: ", FG_WARN, BG);
-    puts("tutor <topic>\n\n");
-    framebuffer::draw_string("  Topics:\n\n", FG_WARN, BG);
-    dim_print("  intro       — Welcome & system overview\n");
-    dim_print("  fs          — Virtual filesystem (VFS + RamFS)\n");
-    dim_print("  disk        — Disk I/O, AHCI/ATA, LBA layout\n");
-    dim_print("  persistence — How files survive reboots\n");
-    dim_print("  net         — Networking (IP, ICMP, UDP)\n");
-    dim_print("  mem         — Physical + heap memory\n");
-    dim_print("  kernel      — AETERNA architecture\n");
-    dim_print("  ai          — ANE neural engine + aai commands\n");
-    dim_print("  axon        — AXON userland coreutils\n");
-    dim_print("  shell       — Shell features (plum)\n");
-    dim_print("  commands    — Full command reference\n\n");
-    framebuffer::draw_string("  Quick examples:\n", FG_WARN, BG);
-    dim_print("  tutor fs          — filesystem walkthrough\n");
-    dim_print("  tutor ai          — neural engine & aai tool\n");
-    dim_print("  tutor persistence — see how sync/recovery works\n");
-    dim_print("  tutor axon        — learn new coreutils commands\n\n");
+}
+
+fn tutor_intro() {
+    tutor_title("Welcome to ospab.os");
+    puts("ospab.os is a hobby operating system written from scratch in Rust. Its\n");
+    puts("kernel, AETERNA, is meant to become a capability-based microkernel.\n");
+    puts("Right now it is one big kernel: drivers, the network stack, this shell\n");
+    puts("and all tools run in ring 0 and share one address space.\n");
+
+    tutor_head("Things to try");
+    tutor_try("ls /  ;  cat /etc/os-release", "look around the filesystem");
+    tutor_try("cat /proc/cpuinfo", "live data from the kernel");
+    tutor_try("free  ;  lsmem", "memory");
+    tutor_try("lspci  ;  lsblk", "hardware the kernel found");
+    tutor_try("ifconfig  ;  ping -c 3 10.0.2.2", "network (needs a NIC)");
+    tutor_try("ntpdate  ;  date", "set the clock from the internet");
+    tutor_try("grape /tmp/notes.txt", "text editor");
+    tutor_try("dmesg", "kernel event log");
+
+    tutor_head("More");
+    puts("'help' lists every command, 'tutor topics' lists the other lessons.\n");
+    puts("Tab completes commands and paths; Up/Down recall history.\n\n");
+}
+
+fn tutor_fs() {
+    tutor_title("Filesystem");
+    puts("Files live in RAM. The root '/' is a copy-on-write overlay: a read-only\n");
+    puts("RamFS with the default files, plus a writable RamFS for your changes.\n");
+    puts("Only the writable layer is saved to disk (see 'tutor persistence').\n");
+    puts("/proc is generated by the kernel on every read.\n");
+    puts("There are no users or permissions yet; everything runs as root.\n");
+
+    tutor_head("Try");
+    tutor_try("ls /", "top-level directories");
+    tutor_try("ls /proc", "live kernel files");
+    tutor_try("cat /proc/meminfo", "memory counters");
+    tutor_try("cat /proc/tasks", "scheduler task list");
+    tutor_try("echo hi > /tmp/a.txt", "write a file");
+    tutor_try("cat /tmp/a.txt", "read it back");
+    tutor_try("tree /etc", "directory tree");
+    puts("\n");
 }
 
 fn tutor_disk() {
-    puts("\n");
-    framebuffer::draw_string("  Disk I/O Tutorial\n", FG_OK, BG);
-    puts("  ══════════════════\n\n");
+    tutor_title("Disks");
+    puts("Storage drivers: ATA PIO (IDE), AHCI (SATA) and NVMe. GPT partition\n");
+    puts("tables can be read and written by the installer.\n");
 
-    puts("  AETERNA supports two storage backends:\n\n");
+    tutor_head("Try");
+    tutor_try("lsblk", "list disks");
+    tutor_try("fdisk -l", "partition tables");
+    tutor_try("dump_disk", "raw view of the persistence sector");
+    tutor_try("install", "install to a disk (GPT + FAT32)");
 
-    framebuffer::draw_string("  1. ATA PIO (IDE)\n", FG_WARN, BG);
-    puts("     Port I/O based. Sector read/write via ports 0x1F0–0x3F6.\n");
-    puts("     Max 128 sectors per request (u8 count field).\n\n");
-
-    framebuffer::draw_string("  2. AHCI SATA (DMA)\n", FG_WARN, BG);
-    puts("     Memory-mapped ABAR. Zero-copy DMA write via PRD tables.\n");
-    puts("     Supports 48-bit LBA. AHCI preferred over ATA.\n\n");
-
-    framebuffer::draw_string("  Disk Layout:\n", FG_WARN, BG);
-    puts("     LBA 0–2047   — Boot area (MBR, GPT, ISO)\n");
-    puts("     LBA 2048+    — AETERNA_FS persistence data\n\n");
-
-    framebuffer::draw_string("  Commands:\n\n", FG_WARN, BG);
-    dim_print("  dump_disk         — Hex dump of LBA 2048 superblock\n");
-    dim_print("  sync              — Force flush RamFS to disk\n");
-    dim_print("  df                — Show disk/filesystem usage\n\n");
-
-    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
-    puts("  1. Create a file:   ");
-    dim_print("touch /tmp/test.txt\n");
-    puts("  2. Write to it:     ");
-    dim_print("echo hello > /tmp/test.txt\n");
-    puts("  3. Force sync:      ");
-    dim_print("sync\n");
-    puts("  4. Check superblock: ");
-    dim_print("dump_disk\n\n");
+    tutor_head("QEMU: attach a disk");
+    dim_print("  qemu-img create -f raw disk.img 1G\n");
+    dim_print("  ... -drive file=disk.img,format=raw,if=none,id=d0 \\\n");
+    dim_print("      -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0\n\n");
 }
 
 fn tutor_persistence() {
+    tutor_title("Persistence");
+    puts("Without a disk, everything you change is lost at reboot.\n");
+    puts("With a disk, the writable filesystem layer is serialised into one flat\n");
+    puts("image starting at sector (LBA) 2048 of the disk:\n");
+    dim_print("  superblock: magic \"AETERNA\\0\", sector count, \"AETERNA_FS\", version, entries\n");
+    dim_print("  entries:    path, type (file/dir), file data\n");
+    puts("The image is written about 10 seconds after the last change, while the\n");
+    puts("shell waits for input, or at once with 'sync'. reboot and shutdown also\n");
+    puts("write pending changes. At boot the image is read back into RAM.\n");
+
+    tutor_head("Try (with a disk attached)");
+    tutor_try("echo hello > /home/root/note.txt", "change something");
+    tutor_try("sync", "write it now");
+    tutor_try("dump_disk", "see the superblock");
+    tutor_try("reboot", "then: cat /home/root/note.txt");
     puts("\n");
-    framebuffer::draw_string("  Filesystem Persistence Tutorial\n", FG_OK, BG);
-    puts("  ═════════════════════════════════\n\n");
-
-    puts("  AETERNA persists the entire RamFS to disk using\n");
-    puts("  the AETERNA_FS binary format.\n\n");
-
-    framebuffer::draw_string("  Binary Format:\n", FG_WARN, BG);
-    puts("  Offset  Size  Field\n");
-    dim_print("  0       8     SUPER_MAGIC  = 0x41455445524E41\n");
-    dim_print("  8       4     sector_count (u32 LE)\n");
-    dim_print("  12      10    \"AETERNA_FS\" marker\n");
-    dim_print("  22      4     VERSION = 1\n");
-    dim_print("  26      4     COUNT (number of entries)\n");
-    dim_print("  30+     var   path_len(2) + path + type(1) + data...\n\n");
-
-    framebuffer::draw_string("  Auto-sync:\n", FG_WARN, BG);
-    puts("  Every write/mkdir/touch/rm automatically syncs\n");
-    puts("  to disk when storage is available.\n\n");
-
-    framebuffer::draw_string("  Boot Recovery:\n", FG_WARN, BG);
-    puts("  On boot:\n");
-    puts("  1. Read 1 sector at LBA 2048\n");
-    puts("  2. Validate SUPER_MAGIC\n");
-    puts("  3. Extract sector_count from bytes 8-11\n");
-    puts("  4. Read sector_count sectors in 128-sector batches\n");
-    puts("  5. Deserialize → restore RamFS tree\n\n");
-
-    framebuffer::draw_string("  Try it:\n", FG_WARN, BG);
-    puts("  Write a file and reboot:\n");
-    dim_print("  echo 'hello world' > /home/root/note.txt\n");
-    dim_print("  reboot\n");
-    puts("  After reboot:\n");
-    dim_print("  cat /home/root/note.txt   (should show 'hello world')\n\n");
 }
 
-fn tutor_axon() {
+fn tutor_net() {
+    tutor_title("Networking");
+    puts("The kernel has its own IPv4 stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP,\n");
+    puts("DHCP, DNS, SNTP and a TLS client. NIC drivers: RTL8139, RTL8169/8111,\n");
+    puts("Intel e1000 and virtio-net. There is no IPv6 and no loopback device.\n");
+
+    tutor_head("QEMU");
+    dim_print("  -netdev user,id=n0 -device e1000,netdev=n0\n");
+    puts("QEMU's user network gives the guest 10.0.2.15, gateway 10.0.2.2 and\n");
+    puts("DNS 10.0.2.3. It forwards TCP/UDP to the internet; ping beyond the\n");
+    puts("gateway depends on the host.\n");
+
+    tutor_head("Try");
+    tutor_try("ifconfig", "address and counters");
+    tutor_try("ping -c 3 10.0.2.2", "reach the gateway");
+    tutor_try("nslookup example.com", "DNS");
+    tutor_try("curl http://example.com", "HTTP");
+    tutor_try("ntpdate", "set the clock");
     puts("\n");
-    framebuffer::draw_string("  AXON Coreutils Tutorial\n", FG_OK, BG);
-    puts("  ════════════════════════\n\n");
+}
 
-    puts("  AXON is the AETERNA coreutils — a complete set of\n");
-    puts("  POSIX-inspired file and text utilities.\n\n");
+fn tutor_mem() {
+    tutor_title("Memory");
+    puts("Physical memory is managed in 4 KiB frames by a bitmap allocator,\n");
+    puts("built from the bootloader's memory map. The kernel heap (");
+    print_size(ospab_os::mm::heap::heap_size() as u64);
+    puts(") is a\nlinked-list allocator on frames taken at boot.\n");
+    puts("All physical memory is also mapped at a fixed offset (the HHDM), here ");
+    match ospab_os::arch::x86_64::boot::hhdm_offset() {
+        Some(off) => print_hex_u64(off),
+        None => puts("unknown"),
+    }
+    puts(".\n");
+    puts("Each task has its own page tables; the upper half (kernel) is shared.\n");
 
-    framebuffer::draw_string("  Text Processing:\n", FG_WARN, BG);
-    dim_print("  wc <file>          — count lines/words/bytes\n");
-    dim_print("  head [-n N] <file> — show first N lines\n");
-    dim_print("  tail [-n N] <file> — show last N lines\n");
-    dim_print("  grep <pat> <file>  — search for pattern\n");
-    dim_print("  sort <file>        — sort lines\n");
-    dim_print("  uniq <file>        — remove duplicate lines\n");
-    dim_print("  cut -f1 -d: <file> — extract field N\n");
-    dim_print("  awk '{print $2}' <file>  — field-based processing\n");
-    dim_print("  diff <file1> <file2>    — compare files\n\n");
+    tutor_head("Try");
+    tutor_try("free", "frames and heap in use");
+    tutor_try("lsmem", "usable RAM regions");
+    tutor_try("cat /proc/meminfo", "all counters");
+    tutor_try("verify_mem", "heap allocation test");
+    puts("\n");
+}
 
-    framebuffer::draw_string("  File Utilities:\n", FG_WARN, BG);
-    dim_print("  cp <src> <dst>     — copy file\n");
-    dim_print("  mv <src> <dst>     — move/rename file\n");
-    dim_print("  find <dir> <name>  — search for files\n");
-    dim_print("  du <dir>           — disk usage by file\n");
-    dim_print("  tree <dir>         — visual directory tree\n");
-    dim_print("  stat <path>        — file info\n");
-    dim_print("  xxd <file>         — hex dump\n");
-    dim_print("  nl <file>          — number lines\n\n");
+fn tutor_kernel() {
+    tutor_title("Kernel");
+    puts("AETERNA is written in Rust (no_std) for x86-64 and boots with Limine.\n");
 
-    framebuffer::draw_string("  System Utils:\n", FG_WARN, BG);
-    dim_print("  ps                 — show processes\n");
-    dim_print("  df                 — disk/fs usage\n");
-    dim_print("  kill [-N] <pid>    — send signal to process\n");
-    dim_print("  which <cmd>        — find where a command lives\n");
-    dim_print("  env                — show environment variables\n");
-    dim_print("  printf <fmt> ...   — formatted output\n");
-    dim_print("  xargs <cmd> items  — build and run commands\n\n");
+    tutor_head("What exists");
+    puts("  GDT/TSS, IDT, APIC timer, preemptive scheduler, SYSCALL/SYSRET,\n");
+    puts("  per-task page tables, bitmap frame allocator, kernel heap, ACPI\n");
+    puts("  power off/reset, PCI, storage, network and audio drivers.\n");
 
-    framebuffer::draw_string("  Try this pipeline:\n", FG_WARN, BG);
-    dim_print("  cat /etc/os-release\n");
-    dim_print("  wc /etc/os-release\n");
-    dim_print("  grep VERSION /etc/os-release\n");
-    dim_print("  awk '{print $1}' /etc/os-release\n\n");
+    tutor_head("What does not exist yet");
+    puts("  Ring-3 programs loaded from files (ELF loader), process isolation,\n");
+    puts("  enforced capabilities, drivers as user-space servers, SMP.\n");
+    puts("  The shell and tools are kernel code. See ROADMAP.md.\n");
+
+    tutor_head("Source layout");
+    tutor_try("arch/x86_64/", "CPU setup, interrupts, framebuffer, keyboard");
+    tutor_try("core/", "scheduler, syscalls, IPC, capabilities");
+    tutor_try("mm/", "frames, page tables, heap");
+    tutor_try("drivers/  net/  vfs/", "drivers, network stack, filesystems");
+    tutor_try("src/", "kernel entry, this terminal, installer");
+    tutor_try("userland/", "grape, tomato, seed (still built into the kernel)");
+    puts("\n");
 }
 
 fn tutor_shell() {
+    tutor_title("Shell");
+    puts("This terminal runs your line; file commands and variables come from the\n");
+    puts("plum shell module.\n");
+
+    tutor_head("Keys");
+    tutor_try("Up / Down", "history");
+    tutor_try("Tab", "complete command or path");
+    tutor_try("Left/Right Home/End", "move (also Ctrl+B/F/A/E)");
+    tutor_try("Ctrl+U / Ctrl+K / Ctrl+W", "delete to start / to end / word");
+    tutor_try("Ctrl+C", "cancel the line or stop ping");
+    tutor_try("Ctrl+L", "clear the screen");
+
+    tutor_head("Variables, aliases, chaining");
+    tutor_try("export NAME=world", "set a variable");
+    tutor_try("echo hello $NAME", "use it");
+    tutor_try("alias ll='ls -l'", "define an alias");
+    tutor_try("cd /tmp ; ls", "run two commands");
+    tutor_try("echo text >> file", "append to a file");
+    puts("Pipes (|) are not supported.\n");
+    puts("/etc/plum/plumrc is run when the shell starts.\n\n");
+}
+
+fn tutor_axon() {
+    tutor_title("AXON tools");
+    puts("AXON is the set of file and text tools built into the kernel. They\n");
+    puts("read and write files directly; there are no pipes.\n");
+
+    tutor_head("Try");
+    tutor_try("wc /etc/os-release", "lines, words, bytes");
+    tutor_try("grep NAME /etc/os-release", "matching lines");
+    tutor_try("head -n 3 /etc/hosts", "first lines");
+    tutor_try("sort /etc/hosts", "sorted");
+    tutor_try("cut -d= -f1 /etc/os-release", "first field");
+    tutor_try("xxd /etc/hostname", "hex dump");
+    tutor_try("cp /etc/hosts /tmp/h", "copy");
+    tutor_try("find / -name hosts", "find by name");
     puts("\n");
-    framebuffer::draw_string("  Shell (plum) Tutorial\n", FG_OK, BG);
-    puts("  ══════════════════════\n\n");
-
-    puts("  ospab.os uses 'plum' as its interactive shell.\n");
-    puts("  It supports environment variables, aliases, and\n");
-    puts("  command chaining with ';'.\n\n");
-
-    framebuffer::draw_string("  Key Bindings:\n", FG_WARN, BG);
-    puts("  Up/Down      Browse command history\n");
-    puts("  Ctrl+L       Clear screen\n");
-    puts("  Ctrl+C       Cancel current input\n");
-    puts("  Tab          Insert 4 spaces\n");
-    puts("  Backspace    Delete last character\n\n");
-
-    framebuffer::draw_string("  Environment Variables:\n", FG_WARN, BG);
-    dim_print("  export KEY=VALUE   — set a variable\n");
-    dim_print("  echo $KEY          — expand a variable\n");
-    dim_print("  env                — show all variables\n\n");
-
-    framebuffer::draw_string("  Aliases:\n", FG_WARN, BG);
-    dim_print("  alias ll='ls -la'  — create an alias\n");
-    dim_print("  unalias ll         — remove an alias\n\n");
-
-    framebuffer::draw_string("  Command Chaining:\n", FG_WARN, BG);
-    dim_print("  mkdir /tmp/t ; touch /tmp/t/f.txt ; ls /tmp/t\n\n");
-
-    framebuffer::draw_string("  Redirection:\n", FG_WARN, BG);
-    dim_print("  echo hello > /tmp/out.txt  — write to file\n");
-    dim_print("  echo more >> /tmp/out.txt  — append to file\n\n");
-
-    framebuffer::draw_string("  Startup script:\n", FG_WARN, BG);
-    puts("  /etc/plum/plumrc is sourced at shell start.\n");
-    puts("  Write your aliases and ENV there with:\n");
-    dim_print("  echo 'export PS1=\"\\$> \"' >> /etc/plum/plumrc\n\n");
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -3095,9 +2093,30 @@ fn err_print(s: &str) {
     framebuffer::draw_string(s, FG_ERR, BG);
 }
 
-fn print_dec(mut val: u64) {
+fn hl_print(s: &str) {
+    framebuffer::draw_string(s, FG_HL, BG);
+}
+
+/// Print spaces so that a field of `len` columns fills `target` columns.
+fn pad(len: usize, target: usize) {
+    for _ in 0..target.saturating_sub(len) {
+        framebuffer::draw_char(' ', FG, BG);
+    }
+}
+
+fn dec_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 10 { v /= 10; n += 1; }
+    n
+}
+
+fn print_dec(val: u64) {
+    print_dec_color(val, FG);
+}
+
+fn print_dec_color(mut val: u64, color: u32) {
     if val == 0 {
-        framebuffer::draw_char('0', FG, BG);
+        framebuffer::draw_char('0', color, BG);
         return;
     }
     let mut buf = [0u8; 20];
@@ -3108,7 +2127,7 @@ fn print_dec(mut val: u64) {
         i += 1;
     }
     for j in (0..i).rev() {
-        framebuffer::draw_char(buf[j] as char, FG, BG);
+        framebuffer::draw_char(buf[j] as char, color, BG);
     }
 }
 
@@ -3118,65 +2137,40 @@ fn print_hex_byte(val: u8) {
     framebuffer::draw_char(HEX[(val & 0xF) as usize] as char, FG, BG);
 }
 
-fn print_hex_u16(val: u16) {
-    print_hex_byte((val >> 8) as u8);
-    print_hex_byte(val as u8);
+fn print_hex_u64(val: u64) {
+    puts("0x");
+    for i in (0..8).rev() {
+        print_hex_byte((val >> (i * 8)) as u8);
+    }
 }
 
 fn print_size(bytes: u64) {
-    let mut tmp = [0u8; 20];
-    let len = format_size(bytes, &mut tmp);
-    for i in 0..len {
-        framebuffer::draw_char(tmp[i] as char, FG, BG);
-    }
+    let s = format_size(bytes);
+    puts(&s);
 }
 
-fn print_size_padded(bytes: u64, pad: usize) {
-    let mut tmp = [0u8; 20];
-    let len = format_size(bytes, &mut tmp);
-    for i in 0..len {
-        framebuffer::draw_char(tmp[i] as char, FG, BG);
-    }
-    if len < pad {
-        for _ in 0..(pad - len) {
-            framebuffer::draw_char(' ', FG, BG);
-        }
-    }
+/// Print a size in a field of `width` columns (right-aligned if `right`).
+fn print_size_padded(bytes: u64, width: usize, right: bool) {
+    let s = format_size(bytes);
+    if right { pad(s.len(), width); }
+    puts(&s);
+    if !right { pad(s.len(), width); }
 }
 
-fn format_size(bytes: u64, buf: &mut [u8; 20]) -> usize {
-    let (val, suffix) = if bytes >= 1024 * 1024 * 1024 {
-        (bytes / (1024 * 1024 * 1024), b" GiB")
-    } else if bytes >= 1024 * 1024 {
-        (bytes / (1024 * 1024), b" MiB")
-    } else if bytes >= 1024 {
-        (bytes / 1024, b" KiB")
+/// Human-readable size with one decimal for MiB and GiB ("1.5 GiB").
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        let tenths = bytes * 10 / GIB;
+        alloc::format!("{}.{} GiB", tenths / 10, tenths % 10)
+    } else if bytes >= MIB {
+        let tenths = bytes * 10 / MIB;
+        alloc::format!("{}.{} MiB", tenths / 10, tenths % 10)
+    } else if bytes >= KIB {
+        alloc::format!("{} KiB", bytes / KIB)
     } else {
-        (bytes, b" B\0\0")
-    };
-
-    let mut pos = 0;
-    if val == 0 {
-        buf[pos] = b'0';
-        pos += 1;
-    } else {
-        let mut digits = [0u8; 10];
-        let mut n = val;
-        let mut dcount = 0;
-        while n > 0 {
-            digits[dcount] = b'0' + (n % 10) as u8;
-            n /= 10;
-            dcount += 1;
-        }
-        for j in (0..dcount).rev() {
-            buf[pos] = digits[j];
-            pos += 1;
-        }
+        alloc::format!("{} B", bytes)
     }
-    for &b in suffix.iter() {
-        if b == 0 { break; }
-        buf[pos] = b;
-        pos += 1;
-    }
-    pos
 }

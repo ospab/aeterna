@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Kernel heap allocator for AETERNA microkernel.
 Uses linked_list_allocator backed by physical memory from Limine.
@@ -51,7 +51,7 @@ pub fn init() {
                 ALLOCATOR.lock().init(virt_base as *mut u8, try_size);
                 HEAP_INITIALIZED = true;
             }
-            serial("[AETERNA] Heap initialized: ");
+            serial("[MM] Heap initialized: ");
             // Print size in MiB
             let mib = try_size / (1024 * 1024);
             let mut buf = [0u8; 4];
@@ -65,8 +65,8 @@ pub fn init() {
         try_size /= 2;
     }
 
-    serial("[AETERNA] FATAL: Cannot allocate heap (even 4 MiB)\r\n");
-    serial("[AETERNA] Available memory insufficient\r\n");
+    serial("[MM] FATAL: Cannot allocate heap (even 4 MiB)\r\n");
+    serial("[MM] Available memory insufficient\r\n");
 }
 
 /// Tiny u32→decimal helper (no alloc needed)

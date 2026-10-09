@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Limine boot protocol (from ospab.os v1).
 */
@@ -248,6 +248,13 @@ pub struct MemmapIterator {
     index: usize,
 }
 
+impl MemmapIterator {
+    /// Iterator over a pointer array (used by the other boot providers).
+    pub(super) fn from_raw(entries: *mut *mut MemmapEntry, count: usize) -> Self {
+        MemmapIterator { entries, count, index: 0 }
+    }
+}
+
 impl Iterator for MemmapIterator {
     type Item = &'static MemmapEntry;
 
@@ -335,6 +342,13 @@ pub struct ModuleIterator {
     modules: *mut *mut LimineFile,
     count: usize,
     index: usize,
+}
+
+impl ModuleIterator {
+    /// Iterator over a pointer array (used by the other boot providers).
+    pub(super) fn from_raw(modules: *mut *mut LimineFile, count: usize) -> Self {
+        ModuleIterator { modules, count, index: 0 }
+    }
 }
 
 impl Iterator for ModuleIterator {

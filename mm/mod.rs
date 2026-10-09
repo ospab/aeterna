@@ -4,3 +4,4 @@ pub mod physical;
 pub mod r#virtual;
 pub mod numa;
 pub mod heap;
+pub mod usercopy;

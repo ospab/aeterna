@@ -1,149 +1,73 @@
-﻿# AETERNA — Development Roadmap
+# Дорожная карта: от монолита к микроядру
 
-This document tracks the phased development plan for the AETERNA microkernel and ospab.os userland. Each phase has a defined scope and measurable completion criteria.
+Решение (октябрь 2026): AETERNA становится **настоящим микроядром**. Текущее состояние кода — в
+[AUDIT.md](AUDIT.md). Каждый этап заканчивается проверкой в QEMU и VMware Workstation.
 
----
+## Что останется в ядре
 
-## Phase 0 — Hardware Foundation ✅ Complete
+Только то, что нельзя вынести:
 
-- [x] Limine boot protocol — BIOS + UEFI hybrid ISO
-- [x] x86-64 Long Mode, CR4 SSE/FPU enable (`0x660`)
-- [x] GDT with TSS, IDT with 256 handlers, PIC remapped to IRQ 32–47
-- [x] PIT IRQ 0 at 100 Hz, PS/2 keyboard IRQ 1
-- [x] Serial COM1 (115200 8N1), UEFI framebuffer (8×16 VGA font, 32-bit BGRA)
-- [x] Build system — `build.sh` (cargo + xorriso hybrid ISO)
+- физические страницы и адресные пространства;
+- потоки, планировщик, переключение контекста;
+- IPC: синхронные сообщения (вызов/ответ) + асинхронные уведомления;
+- передача и разделение памяти между процессами через IPC;
+- прерывания, которые доставляются драйверам как уведомления;
+- capability: у каждого процесса таблица дескрипторов, любое действие требует дескриптора.
 
----
+Всё остальное — серверы в ring 3: драйверы, сеть (с OSTP), файловые системы, консоль, init.
 
-## Phase 1 — Memory Management ✅ Complete
+## Этапы
 
-- [x] Physical frame allocator — bitmap, reads Limine memory map
-- [x] 128 MiB kernel heap — `linked_list_allocator`, `#[global_allocator]`
-- [x] 4-level page tables (PML4) — walk, map, unmap
-- [x] Higher-half direct map (HHDM) from Limine physical offset
-- [x] `alloc` crate — `Vec`, `BTreeMap`, `String` throughout kernel
+### Этап 0. Фундамент ядра
+Без этого ring 3 опасен. Пункты 1–6 из AUDIT.md.
 
----
+1. ✅ Физический аллокатор с освобождением (bitmap), обнуление выделенных страниц.
+2. ✅ Свой стек ядра у каждого потока; `TSS.RSP0` и стек SYSCALL переключаются вместе с потоком.
+   Блокирующий системный вызов становится безопасным. Заодно: состояние FPU/SSE у каждой
+   задачи, единое правило `swapgs` на входе/выходе ring 3, round-robin при равных приоритетах.
+3. ✅ Кольцо не зависит от приоритета: `spawn_named` создаёт только потоки ядра,
+   ring 3 — только `spawn_user_task`.
+4. ✅ `copy_from_user` / `copy_to_user` во всех системных вызовах с указателями, SMEP + SMAP
+   (если процессор умеет); `mmap`/`munmap` работают с памятью самого процесса.
+5. Процесс как объект: ✅ адресное пространство, стек ядра и собственные страницы освобождаются
+   при выходе; ⬜ таблица дескрипторов (вместе с этапом 2), ⬜ FD-таблица на процесс.
+6. ⬜ Блокировки вместо `static mut`.
+6а. ⬜ XSAVE вместо FXSAVE: ядро включает AVX, а при переключении сохраняет только SSE.
 
-## Phase 2 — Storage Drivers ✅ Complete
+Проверка: при загрузке выполняются тесты ring 3 (smoke, два процесса одновременно с блокировкой
+в ядре, проверка указателей и `mmap`) и проверка, что после них не осталось занятых страниц.
 
-- [x] ATA PIO — polling, 28-bit LBA, read/write/identify
-- [x] AHCI SATA — PCI BAR5, HBA reset, NCQ, DMA, flush cache
-- [x] NVMe — PCI BAR0, admin + I/O queues, PRP, namespace identify, flush
-- [x] PCI bus enumeration — type 0/1 headers, BAR decode
+### Этап 1. Программы в ring 3
+7. ✅ ELF-загрузчик в ядре (`core/elf.rs`): сегменты с правами R-X / R-- / RW- и NX,
+   стек с `argc`/`argv`/`auxv`.
+8. ✅ `user/x86_64-unknown-oos.json` + **liboos** (`user/liboos`: `_start`, системные вызовы,
+   куча через `mmap`, `print!`, panic). Программы собираются отдельным workspace `user/`.
+9. ✅ Первая программа `user/hello` на Rust запускается из ядра при загрузке (пока встроена
+   через `include_bytes!`; загрузка из файловой системы — этап 3).
 
----
+### Этап 2. IPC и capability
+10. Объекты ядра и дескрипторы: процесс, поток, адресное пространство, канал, память, прерывание.
+11. Синхронный IPC вызов/ответ с передачей дескрипторов; уведомления.
+12. Разделяемая память через дескрипторы (замена текущего SMR с сырыми физическими адресами).
+13. Прерывания и MMIO/порты как дескрипторы — основа для драйверов в ring 3.
 
-## Phase 3 — Virtual Filesystem ✅ Complete
+### Этап 3. Вынос сервисов из ядра
+Порядок — от простого к сложному, по одному, ядро после каждого шага остаётся рабочим:
 
-- [x] VFS trait — open, read, write, mkdir, unlink, rename, readdir, stat
-- [x] RamFS — `BTreeMap<String, RamNode>`, `spin::Mutex`
-- [x] Standard directories — /etc, /proc, /dev, /home, /tmp, /sys, /boot, /var
-- [x] 27+ nodes at boot (hosts, motd, plumrc, seed config, …)
-- [x] Deferred disk sync — dirty flag + 182-tick PIT timer → LBA 2048
-- [x] Boot recovery — deserialise RamFS from LBA 2048 on next boot
-- [x] C FFI — rust_vfs_open/read/write/close/seek/rename/access for DOOM
+14. `seed` — первый настоящий процесс, запускает остальных и перезапускает упавших.
+15. Консоль: клавиатура + фреймбуфер → сервер консоли. `plum` становится программой.
+16. Хранилище: AHCI/NVMe → драйверы-серверы; VFS → сервер файловой системы.
+17. Сеть: драйверы NIC → серверы; сетевой стек → сетевой сервер.
+18. Звук, мышь, остальное. DOOM — обычная программа.
+19. В ядре не остаётся драйверов (кроме таймера, контроллера прерываний и отладочного serial).
 
----
+### Этап 4. Свой загрузчик
+20. UEFI-загрузчик на Rust вместо Limine; образ диска GPT + FAT32 собирается без WSL.
 
-## Phase 4 — Network Stack ✅ Complete
+### Этап 5. OSTP
+21. `ostp-core` в режиме `no_std + alloc`.
+22. OSTP как туннельный интерфейс в сетевом сервере.
 
-- [x] RTL8139 — PCI NIC, DMA TX/RX ring buffers, interrupt receive
-- [x] Intel e1000 — PRO/1000 Gigabit, descriptor rings, EEPROM MAC
-- [x] Ethernet frame dispatch, ARP with TTL cache, IPv4 with checksum
-- [x] ICMP echo — `ping -c N` with TSC-based RTT in microseconds
-- [x] UDP datagrams, SNTP one-shot sync over UDP/123
-
----
-
-## Phase 5 — Audio Drivers ✅ Complete
-
-- [x] AC97 — Intel ICH, DMA BDL ring, 44100 Hz VRA, `soundtest` command
-- [x] ES1371 — Ensoniq AudioPCI / Creative CT5880 (VMware Workstation)
-
----
-
-## Phase 6 — Userland Tools ✅ Complete
-
-- [x] **plum** — POSIX shell: variables, export, alias, source, if/for/while, functions, arithmetic, command substitution
-- [x] **grape** — full-screen nano-style editor: search, cut/paste, scroll, block cursor
-- [x] **tomato** — pacman-like package manager: -S/-R/-Q/-Qi/-Ss/-Sy/-Syu, 10-package repo
-- [x] **seed** — init system (logical PID 1), 9 services, start/stop/restart/enable/disable/log
-- [x] **tutor** — interactive guide: intro, fs, net, mem, kernel, commands
-- [x] 30+ terminal built-ins, history, tab completion, Ctrl+C, Ctrl+L
-
----
-
-## Phase 7 — DOOM Port ✅ Complete
-
-- [x] doomgeneric bare-metal — 640×400 on UEFI framebuffer, 32-bit BGRA
-- [x] Freestanding C runtime (malloc/free/printf/memcpy/qsort) via `#[no_mangle]` FFI
-- [x] PS/2 keyboard input, F1–F10 menu navigation
-- [x] VFS save/load at /doom/doomsavN.dsg, persisted by deferred sync
-
----
-
-## Phase 8 — UEFI Disk Installer ✅ Complete
-
-- [x] Protective MBR + GPT (primary + backup) with CRC32 verification
-- [x] FAT32 ESP — dynamic SPC (≥ 65525 clusters for EDK2)
-- [x] FAT32 LFN entries — UCS-2LE for `limine.conf`, short name LIMINE~1CON
-- [x] Installs: BOOTX64.EFI, /boot/KERNEL, /limine.conf
-- [x] Auto-detects NVMe → AHCI → ATA in priority order
-- [x] Read-back verification at every stage, full serial trace on COM1
-
----
-
-## Phase 9 — Process Isolation 🔷 In Progress
-
-- [ ] ELF64 loader — PT_LOAD segments mapped to Ring 3 virtual address space
-- [ ] Ring 3 execution — sysret/iretq, separate user stack per process
-- [ ] Syscall ABI — SYSCALL/SYSRET via MSR, register argument convention
-- [ ] Process Control Block — PID allocator, parent/child tree, exit status
-- [ ] fork / exec / wait — POSIX-compatible process lifecycle
-- [ ] Signal delivery — SIGKILL, SIGTERM, SIGCHLD
-- [ ] plum moves to Ring 3 — kernel access through syscalls only
-
----
-
-## Phase 10 — Capability Enforcement 🔷 Planned
-
-- [ ] Capability token type system — typed, non-forgeable handles
-- [ ] Per-process capability table — inherited on fork, explicitly revocable
-- [ ] Syscall dispatcher rewrite — all paths validate capability before servicing
-- [ ] Scoped capabilities: filesystem subtrees, network ports, DMA regions
-
----
-
-## Phase 11 — TCP/IP 🔷 Planned
-
-- [ ] TCP state machine — SYN, SYN-ACK, ACK, FIN, RST, retransmit timer
-- [ ] Per-connection send/receive buffers, sliding window
-- [ ] DNS resolver — UDP/53, TTL-based cache
-
----
-
-## Phase 12 — Preemptive Scheduler 🔷 Planned
-
-- [ ] TCB (Thread Control Block) — GP + FPU register save area, kernel stack
-- [ ] PID/TID HashMap, IRQ 0 context switch via PIT
-- [ ] Priority classes — real-time, interactive, background
-- [ ] Timer wheel, nanosleep syscall
-
----
-
-## Phase 13 — USB Stack 🔷 Planned
-
-- [ ] xHCI host controller — register init, TRB command ring
-- [ ] USB HID class — keyboard as PS/2 fallback
-- [ ] USB Mass Storage — BOT protocol, block device interface
-
----
-
-## Design Invariants
-
-1. **No `std`** — kernel and all userland code compile with `#![no_std]`. All heap allocation via `alloc`.
-2. **No panics in interrupt handlers** — fault paths log and halt; no unwinding in ring-0 interrupt context.
-3. **Deferred I/O** — RamFS writes are buffered; callers must not assume disk persistence until the next sync cycle or an explicit `sys_sync()`.
-4. **Capability-first** — no subsystem is designed around ambient authority. All cross-boundary access will require an explicit capability token.
-5. **Zero warnings** — every commit must pass `cargo build --release` with zero warnings. WIP modules suppress warnings at module scope, not crate scope.
+## Отложено
+- SMP (несколько ядер процессора) — после этапа 2.
+- Полноценный `std` для программ — после этапа 3.

@@ -117,8 +117,9 @@ pub fn handle_arp(data: &[u8]) {
 
     match opcode {
         ARP_OP_REQUEST => {
-            // Someone is asking for our MAC
+            // Someone is asking for our MAC (learn theirs while at it)
             if target_ip == our_ip {
+                cache_update(sender_ip, sender_mac);
                 send_reply(sender_mac, sender_ip);
             }
         }

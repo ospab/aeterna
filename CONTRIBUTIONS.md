@@ -199,4 +199,4 @@ qemu-system-x86_64 -cdrom isos/ospab-os-v2-103.iso -m 256M -serial stdio
 ## License
 
 By contributing to AETERNA / ospab.os, you agree that your contributions will be
-licensed under the **Boost Software License 1.1** (see [LICENSE](LICENSE)).
+licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0-only) (see [LICENSE](LICENSE)).

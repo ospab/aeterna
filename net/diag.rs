@@ -125,12 +125,14 @@ pub fn dump_pci_nics() {
 
     for bus in 0u16..256 {
         for dev in 0u8..32 {
-            let id = pci_r32(bus as u8, dev, 0, 0x00);
+          let multi = pci_r8(bus as u8, dev, 0, 0x0E) & 0x80 != 0;
+          for func in 0u8..(if multi { 8 } else { 1 }) {
+            let id = pci_r32(bus as u8, dev, func, 0x00);
             let vid = (id & 0xFFFF) as u16;
             if vid == 0xFFFF || vid == 0x0000 { continue; }
             let did = ((id >> 16) & 0xFFFF) as u16;
 
-            let class_reg = pci_r32(bus as u8, dev, 0, 0x08);
+            let class_reg = pci_r32(bus as u8, dev, func, 0x08);
             let class    = ((class_reg >> 24) & 0xFF) as u8;
             let subclass = ((class_reg >> 16) & 0xFF) as u8;
 
@@ -141,19 +143,19 @@ pub fn dump_pci_nics() {
                 s("  [");
                 if is_nic { s("NIC"); } else { s("VIRTIO"); }
                 s("] ");
-                hex8(bus as u8); sb(b':'); hex8(dev); s(".0  ");
+                hex8(bus as u8); sb(b':'); hex8(dev); sb(b'.'); sb(b'0' + func); s("  ");
                 s("VID=0x"); hex16(vid);
                 s(" DID=0x"); hex16(did);
                 s(" Class="); hex8(class); sb(b'/'); hex8(subclass);
 
                 // Read interrupt line + pin
-                let irq_line = pci_r8(bus as u8, dev, 0, 0x3C);
-                let irq_pin  = pci_r8(bus as u8, dev, 0, 0x3D);
+                let irq_line = pci_r8(bus as u8, dev, func, 0x3C);
+                let irq_pin  = pci_r8(bus as u8, dev, func, 0x3D);
                 s(" IRQ="); dec(irq_line as u64);
                 s(" PIN="); dec(irq_pin as u64);
 
                 // Read command register
-                let cmd = pci_r16(bus as u8, dev, 0, 0x04);
+                let cmd = pci_r16(bus as u8, dev, func, 0x04);
                 s(" CMD=0x"); hex16(cmd);
                 if cmd & 0x01 != 0 { s(" IO"); }
                 if cmd & 0x02 != 0 { s(" MMIO"); }
@@ -161,12 +163,12 @@ pub fn dump_pci_nics() {
                 if cmd & 0x0400 != 0 { s(" IntDis"); }
 
                 // BAR0
-                let bar0 = pci_r32(bus as u8, dev, 0, 0x10);
+                let bar0 = pci_r32(bus as u8, dev, func, 0x10);
                 s(" BAR0=0x"); hex32(bar0);
 
                 // VirtIO specific: subsystem ID tells us the device type
                 if is_virtio {
-                    let subsys = pci_r16(bus as u8, dev, 0, 0x2E);
+                    let subsys = pci_r16(bus as u8, dev, func, 0x2E);
                     s(" SubsysID=0x"); hex16(subsys);
                     match subsys {
                         1 => s(" (Network)"),
@@ -178,9 +180,20 @@ pub fn dump_pci_nics() {
                     virtio_count += 1;
                 }
 
+                let drv = match (vid, did) {
+                    (0x10EC, 0x8139) => "rtl8139",
+                    (0x10EC, 0x8169) | (0x10EC, 0x8168) | (0x10EC, 0x8161) | (0x10EC, 0x8136) => "rtl8169",
+                    (0x8086, _) if is_nic => "e1000 (if ID in driver table)",
+                    (0x1AF4, 0x1000) => "virtio_net (legacy)",
+                    (0x1022, 0x2000) => "pcnet",
+                    (0x15AD, 0x07B0) => "vmxnet3",
+                    _ => "NO DRIVER",
+                };
+                s(" driver="); s(drv);
                 nl();
                 if is_nic { nic_count += 1; }
             }
+          }
         }
     }
 
@@ -218,12 +231,15 @@ pub fn dump_active_nic() {
     s("  RX packets: "); dec(crate::userspace::net::rx_packets()); nl();
     s("  TX packets: "); dec(crate::userspace::net::tx_packets()); nl();
 
-    match unsafe { crate::userspace::net::ACTIVE_NIC } {
-        0 => dump_rtl8139_regs(),
-        1 => dump_e1000_regs(),
-        2 => dump_rtl8169_regs(),
-        3 => dump_virtio_net_active(),
-        _ => { s("  Unknown NIC ID\r\n"); }
+    use crate::userspace::net as n;
+    s("  Model: "); s(n::nic_model()); nl();
+    s("  Link (driver report): "); s(if n::link_up() { "up" } else { "DOWN" }); nl();
+    match unsafe { n::ACTIVE_NIC } {
+        n::NIC_RTL8139 => dump_rtl8139_regs(),
+        n::NIC_E1000   => dump_e1000_regs(),
+        n::NIC_RTL8169 => dump_rtl8169_regs(),
+        n::NIC_VIRTIO  => dump_virtio_net_active(),
+        _ => { s("  (no register dump implemented for this driver)\r\n"); }
     }
 
     dump_tcp_status();
@@ -880,7 +896,7 @@ pub fn run_screen_summary() {
 
     // Driver name
     p("  Driver  : ");
-    p(crate::userspace::net::nic_name());
+    p(crate::userspace::net::nic_model());
     p("\n");
 
     // MAC address
@@ -910,13 +926,10 @@ pub fn run_screen_summary() {
     p(&alloc::format!("{}\n", tx));
 
     // Link status check for e1000
-    if crate::userspace::net::nic_name() == "Intel e1000" {
-        let (r0, _, _, _) = crate::userspace::net::diag();
-        if r0 & 2 == 0 {
-            wn("  Link    : DOWN (e1000 STATUS.LU=0)\n");
-        } else {
-            ok("  Link    : Up\n");
-        }
+    if crate::userspace::net::link_up() {
+        ok("  Link    : up (driver report)\n");
+    } else {
+        wn("  Link    : DOWN (driver report)\n");
     }
 
     // TCP Connections

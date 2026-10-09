@@ -2,42 +2,59 @@
  * AHCI (Advanced Host Controller Interface) SATA driver for AETERNA
  *
  * Supports:
- *   Any PCI device class=0x01 (Mass Storage), subclass=0x06 (SATA), prog-if=0x01 (AHCI 1.0)
+ *   Any PCI function class=0x01 (Mass Storage), subclass=0x06 (SATA),
+ *   prog-if=0x01 (AHCI 1.0), on any bus/device/function (q35's ICH9 AHCI
+ *   lives at 00:1f.2, VMware's SATA controller sits behind a bridge).
  *
  * Works with:
- *   QEMU:      -device ich9-ahci  (or -device ahci)
+ *   QEMU:      -machine q35 (built-in ICH9 AHCI) or -device ahci / ich9-ahci
  *   VMware:    SATA controller (AHCI mode)
- *   Bare metal: All modern SATA controllers (Intel AHCI, AMD AHCI)
+ *   Bare metal: Intel / AMD AHCI controllers
  *
  * Implements:
- *   - Port detection
- *   - Read/Write using FIS (Frame Information Structure)
- *   - 28-bit and 48-bit LBA
- *   - One command slot per port (simple, no NCQ)
- */#![allow(dead_code)]
+ *   - BIOS/OS handoff, HBA reset, staggered spin-up, COMRESET fallback
+ *   - Port detection (DET=3), ATA signature check (ATAPI/PM/SEMB skipped)
+ *   - IDENTIFY, READ/WRITE DMA (EXT), FLUSH CACHE (EXT)
+ *   - 48-bit LBA with 28-bit fallback, transfers chunked to the PRD limits
+ *   - Task-file error detection, timeouts and port recovery
+ *   - One command slot per port (polling, no interrupts, no NCQ)
+ */
+#![allow(dead_code)]
 use core::ptr;
+use core::sync::atomic::{fence, Ordering};
 
 use crate::mm::r#virtual::{self as vmm, FLAG_NX, FLAG_PCD, FLAG_PWT, FLAG_WRITABLE};
 
-// ─── PCI scan for AHCI ────────────────────────────────────────────────────
+// ─── PCI class codes ──────────────────────────────────────────────────────
 const PCI_CLASS_STORAGE: u8  = 0x01;
 const PCI_SUBCLASS_SATA: u8  = 0x06;
 const PCI_PROGIF_AHCI:   u8  = 0x01;
 
 // ─── AHCI HBA registers (offset from ABAR) ────────────────────────────────
-const HBA_CAP:     u32 = 0x00; // Host Capabilities
-const HBA_GHC:     u32 = 0x04; // Global Host Control
-const HBA_IS:      u32 = 0x08; // Interrupt Status
-const HBA_PI:      u32 = 0x0C; // Ports Implemented bitmask
-const HBA_VS:      u32 = 0x10; // Version
+const HBA_CAP:  u32 = 0x00; // Host Capabilities
+const HBA_GHC:  u32 = 0x04; // Global Host Control
+const HBA_IS:   u32 = 0x08; // Interrupt Status
+const HBA_PI:   u32 = 0x0C; // Ports Implemented bitmask
+const HBA_VS:   u32 = 0x10; // Version
+const HBA_CAP2: u32 = 0x24; // Host Capabilities Extended
+const HBA_BOHC: u32 = 0x28; // BIOS/OS Handoff Control and Status
+
+const CAP_S64A: u32 = 1 << 31; // 64-bit addressing
+const CAP_SSS:  u32 = 1 << 27; // Staggered spin-up
+const CAP2_BOH: u32 = 1 << 0;  // BIOS/OS handoff supported
+
+const BOHC_BOS: u32 = 1 << 0;  // BIOS owned semaphore
+const BOHC_OOS: u32 = 1 << 1;  // OS owned semaphore
+const BOHC_BB:  u32 = 1 << 4;  // BIOS busy
 
 // Global Host Control bits
 const GHC_AE: u32 = 1 << 31; // AHCI Enable
+const GHC_IE: u32 = 1 << 1;  // Interrupt Enable
 const GHC_HR: u32 = 1 << 0;  // HBA Reset
 
-// Per-port registers (offset = HBA_PORT_BASE + port * 0x80)
+// Per-port registers (offset = PORT_BASE_OFFSET + port * PORT_SIZE)
 const PORT_BASE_OFFSET: u32 = 0x100;
-const PORT_SIZE:         u32 = 0x80;
+const PORT_SIZE:        u32 = 0x80;
 
 const PORT_CLB:  u32 = 0x00; // Command List Base Address (low)
 const PORT_CLBU: u32 = 0x04; // Command List Base Address (high)
@@ -48,501 +65,660 @@ const PORT_IE:   u32 = 0x14; // Interrupt Enable
 const PORT_CMD:  u32 = 0x18; // Command and Status
 const PORT_TFD:  u32 = 0x20; // Task File Data
 const PORT_SIG:  u32 = 0x24; // Signature
-const PORT_SSTS: u32 = 0x28; // SATA Status
-const PORT_SERR: u32 = 0x30; // SATA Error
+const PORT_SSTS: u32 = 0x28; // SATA Status (SCR0)
+const PORT_SCTL: u32 = 0x2C; // SATA Control (SCR2)
+const PORT_SERR: u32 = 0x30; // SATA Error (SCR1)
 const PORT_CI:   u32 = 0x38; // Command Issue
 
 // PORT_CMD bits
-const PORT_CMD_ST:   u32 = 1 << 0;  // Start
-const PORT_CMD_FRE:  u32 = 1 << 4;  // FIS Receive Enable
-const PORT_CMD_FR:   u32 = 1 << 14; // FIS Receive Running
-const PORT_CMD_CR:   u32 = 1 << 15; // Command List Running
+const PORT_CMD_ST:  u32 = 1 << 0;  // Start
+const PORT_CMD_SUD: u32 = 1 << 1;  // Spin-Up Device
+const PORT_CMD_POD: u32 = 1 << 2;  // Power On Device
+const PORT_CMD_FRE: u32 = 1 << 4;  // FIS Receive Enable
+const PORT_CMD_FR:  u32 = 1 << 14; // FIS Receive Running
+const PORT_CMD_CR:  u32 = 1 << 15; // Command List Running
+const PORT_CMD_ICC_MASK:   u32 = 0xF << 28;
 const PORT_CMD_ICC_ACTIVE: u32 = 1 << 28;
 
-// PORT_SSTS: device detected & comms established
+// PORT_IS error bits (TFES | HBFS | HBDS | IFS)
+const PORT_IS_TFES: u32 = 1 << 30;
+const PORT_IS_ERR_MASK: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27);
+
+// PORT_TFD status bits
+const TFD_ERR: u32 = 1 << 0;
+const TFD_DRQ: u32 = 1 << 3;
+const TFD_BSY: u32 = 1 << 7;
+
+// PORT_SSTS
 const SSTS_DET_PRESENT: u32 = 0x3;
-const SSTS_IPM_ACTIVE:  u32 = 0x100;
+
+// Device signatures
+const SIG_ATA:   u32 = 0x0000_0101;
+const SIG_ATAPI: u32 = 0xEB14_0101;
+const SIG_SEMB:  u32 = 0xC33C_0101;
+const SIG_PM:    u32 = 0x9669_0101;
 
 // ATA command codes
-const ATA_CMD_READ_DMA_EX:  u8 = 0x25; // 48-bit LBA read DMA
-const ATA_CMD_WRITE_DMA_EX: u8 = 0x35; // 48-bit LBA write DMA
-const ATA_CMD_IDENTIFY:     u8 = 0xEC;
+const ATA_CMD_READ_DMA:       u8 = 0xC8; // 28-bit LBA
+const ATA_CMD_WRITE_DMA:      u8 = 0xCA;
+const ATA_CMD_READ_DMA_EX:    u8 = 0x25; // 48-bit LBA
+const ATA_CMD_WRITE_DMA_EX:   u8 = 0x35;
+const ATA_CMD_FLUSH_CACHE:    u8 = 0xE7;
+const ATA_CMD_FLUSH_CACHE_EX: u8 = 0xEA;
+const ATA_CMD_IDENTIFY:       u8 = 0xEC;
 
 // FIS types
-const FIS_TYPE_REG_H2D: u8 = 0x27; // Host to Device Register FIS
-const FIS_TYPE_REG_D2H: u8 = 0x34; // Device to Host Register FIS
-const FIS_TYPE_DMA_ACT: u8 = 0x39;
-const FIS_TYPE_DMA_SETUP: u8 = 0x41;
-const FIS_TYPE_DATA: u8 = 0x46;
-const FIS_TYPE_BIST: u8 = 0x58;
-const FIS_TYPE_PIO_SETUP: u8 = 0x5F;
-const FIS_TYPE_DEV_BITS: u8 = 0xA1;
+const FIS_TYPE_REG_H2D: u8 = 0x27;
 
 const SECTOR_SIZE: usize = 512;
-const MAX_PORTS: usize = 32;
 
-// Map AHCI MMIO as uncacheable to avoid register writes being cached
+// Uncached MMIO window for ABARs (one 64 KiB slot per controller)
 const AHCI_UC_VIRT_BASE: u64 = 0xFFFF_FF10_0000_0000;
-const AHCI_MMIO_PAGES: u64 = 2; // 8 KiB covers HBA + ports
+const AHCI_UC_SLOT:      u64 = 0x1_0000;
+const AHCI_ABAR_SPAN:    u64 = 0x1100; // generic regs + 32 ports
 
-// ─── FIS structures ────────────────────────────────────────────────────────
-#[repr(C, packed)]
-#[derive(Copy, Clone, Default)]
-struct FisRegH2D {
-    fis_type: u8,  // FIS_TYPE_REG_H2D
-    flags:    u8,  // bit 7 = 1 for command, 0 for control
-    command:  u8,
-    feature_lo: u8,
-    lba0: u8, lba1: u8, lba2: u8, device: u8,
-    lba3: u8, lba4: u8, lba5: u8, feature_hi: u8,
-    count_lo: u8, count_hi: u8,
-    icc: u8, control: u8,
-    _rsv: [u8; 4],
-}
+const MAX_CTRLS: usize = 4;
+const MAX_ACTIVE_PORTS: usize = 8;
 
-#[repr(C, packed)]
-#[derive(Copy, Clone, Default)]
-struct FisRegD2H {
-    fis_type: u8,
-    flags: u8,
-    status: u8, error: u8,
-    lba0: u8, lba1: u8, lba2: u8, device: u8,
-    lba3: u8, lba4: u8, lba5: u8, _rsv0: u8,
-    count_lo: u8, count_hi: u8,
-    _rsv1: [u8; 6],
-}
+// Timeouts (microseconds)
+const T_STOP_US:     u64 = 500_000;
+const T_LINK_US:     u64 = 20_000;
+const T_COMRESET_US: u64 = 1_000_000;
+const T_BUSY_US:     u64 = 2_000_000;
+const T_CMD_US:      u64 = 10_000_000;
 
-// ─── Command List Entry (CMDHDR) — 32 bytes ─────────────────────────────────
-#[repr(C, packed)]
-#[derive(Copy, Clone, Default)]
-struct CmdHeader {
-    flags:      u16, // bits [4:0]=CFL (cmd FIS length/4), bit 6=write
-    prdtl:      u16, // Physical Region Descriptor Table Length (# entries)
-    prdbc:      u32, // PRD byte count
-    ctba_lo:    u32, // Command Table Base Address low
-    ctba_hi:    u32, // Command Table Base Address high
-    _rsv:       [u32; 4],
-}
+// Bounce buffer: 256 sectors per command
+const DATA_BUF_SIZE: usize = 128 * 1024;
+const BOUNCE_SECTORS: u32 = (DATA_BUF_SIZE / SECTOR_SIZE) as u32;
+// One PRD entry covers at most 4 MiB → 8192 sectors per zero-copy command
+const DMA_MAX_SECTORS: u32 = 8192;
 
-// ─── Physical Region Descriptor Entry — 16 bytes ─────────────────────────
-#[repr(C, packed)]
-#[derive(Copy, Clone, Default)]
-struct PrdEntry {
-    dba_lo: u32, // Data Base Address low
-    dba_hi: u32, // Data Base Address high
-    _rsv:   u32,
-    dbc:    u32, // Byte count minus 1, bit 31 = interrupt on completion
-}
-
-// ─── Command Table ─────────────────────────────────────────────────────────
-// cfis: 64 bytes (FIS), acmd: 16 bytes (ATAPI), _rsv: 48 bytes, prdt: N entries
+// ─── DMA structures ───────────────────────────────────────────────────────
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
-struct CmdTable {
-    cfis:   [u8; 64],
-    acmd:   [u8; 16],
-    _rsv:   [u8; 48],
-    prdt:   [PrdEntry; 1], // We use 1 PRD entry per command
+struct CmdHeader {
+    flags: u16, // [4:0]=CFL (dwords), bit 6=W
+    prdtl: u16, // PRD table length (entries)
+    prdbc: u32, // PRD byte count (written by HBA)
+    ctba_lo: u32,
+    ctba_hi: u32,
+    _rsv: [u32; 4],
 }
 
-// ─── FIS receive area (256 bytes minimum) ────────────────────────────────
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct PrdEntry {
+    dba_lo: u32,
+    dba_hi: u32,
+    _rsv: u32,
+    dbc: u32, // byte count - 1 (bit 0 must be 1), bit 31 = IOC
+}
+
+/// Command table: must be 128-byte aligned (CTBA bits 6:0 are reserved).
+#[repr(C, align(128))]
+#[derive(Copy, Clone)]
+struct CmdTable {
+    cfis: [u8; 64],
+    acmd: [u8; 16],
+    _rsv: [u8; 48],
+    prdt: [PrdEntry; 1],
+}
+
+/// Received-FIS area: 256 bytes, 256-byte aligned.
 #[repr(C, align(256))]
 #[derive(Copy, Clone)]
 struct FisArea([u8; 256]);
 
-// ─── Per-port DMA memory ──────────────────────────────────────────────────
-// Each port needs: 1 CmdHeader (1K aligned, 32 bytes) + 1 CmdTable (128-byte aligned)
-// We allocate per-port data buffers too
-
+/// Command list: 32 headers, 1 KiB aligned.
 #[repr(C, align(1024))]
 #[derive(Copy, Clone)]
-struct PortCmdList([CmdHeader; 32]); // 32 slots, 1K aligned
+struct PortCmdList([CmdHeader; 32]);
 
-const MAX_ACTIVE_PORTS: usize = 4;
+#[repr(C, align(4096))]
+struct DataBuf([u8; DATA_BUF_SIZE]);
 
-static mut CMD_LISTS: [PortCmdList; MAX_ACTIVE_PORTS] = [PortCmdList([CmdHeader {
-    flags: 0, prdtl: 0, prdbc: 0, ctba_lo: 0, ctba_hi: 0, _rsv: [0; 4]
-}; 32]); MAX_ACTIVE_PORTS];
+const EMPTY_HDR: CmdHeader = CmdHeader { flags: 0, prdtl: 0, prdbc: 0, ctba_lo: 0, ctba_hi: 0, _rsv: [0; 4] };
+const EMPTY_PRD: PrdEntry = PrdEntry { dba_lo: 0, dba_hi: 0, _rsv: 0, dbc: 0 };
 
+// These live in the kernel image (physically contiguous); x86 DMA is cache
+// coherent, so write-back memory is fine for descriptors and buffers.
+static mut CMD_LISTS: [PortCmdList; MAX_ACTIVE_PORTS] = [PortCmdList([EMPTY_HDR; 32]); MAX_ACTIVE_PORTS];
 static mut FIS_AREAS: [FisArea; MAX_ACTIVE_PORTS] = [FisArea([0u8; 256]); MAX_ACTIVE_PORTS];
-
 static mut CMD_TABLES: [CmdTable; MAX_ACTIVE_PORTS] = [CmdTable {
-    cfis: [0u8; 64], acmd: [0u8; 16], _rsv: [0u8; 48],
-    prdt: [PrdEntry { dba_lo: 0, dba_hi: 0, _rsv: 0, dbc: 0 }]
+    cfis: [0u8; 64], acmd: [0u8; 16], _rsv: [0u8; 48], prdt: [EMPTY_PRD],
 }; MAX_ACTIVE_PORTS];
-
-// Data transfer buffer: 128K (enough for 256 sectors at once)
-const DATA_BUF_SIZE: usize = 131072;
-static mut DATA_BUF: [u8; DATA_BUF_SIZE] = [0u8; DATA_BUF_SIZE];
+static mut DATA_BUF: DataBuf = DataBuf([0u8; DATA_BUF_SIZE]);
 
 // ─── Global state ─────────────────────────────────────────────────────────
 #[derive(Copy, Clone)]
 pub struct AhciDrive {
     pub present:   bool,
+    pub ctrl:      u8,   // controller index into HBAS
     pub port_idx:  u8,   // HBA port index (0-31)
-    pub alloc_idx: u8,   // Our alloc index (0-3) into the static arrays above
-    pub sectors:   u64,  // Total sectors (48-bit LBA)
+    pub alloc_idx: u8,   // slot in the static DMA arrays
+    pub lba48:     bool,
+    pub sectors:   u64,
     pub size_mb:   u64,
     pub model:     [u8; 41],
 }
 
 static mut DRIVES: [AhciDrive; MAX_ACTIVE_PORTS] = [AhciDrive {
-    present: false, port_idx: 0, alloc_idx: 0, sectors: 0, size_mb: 0,
-    model: [0u8; 41]
+    present: false, ctrl: 0, port_idx: 0, alloc_idx: 0, lba48: false,
+    sectors: 0, size_mb: 0, model: [0u8; 41],
 }; MAX_ACTIVE_PORTS];
 
 static mut DRIVE_COUNT: usize = 0;
-static mut HBA_VIRT: usize = 0; // Virtual address of ABAR (via HHDM)
+static mut HBAS: [usize; MAX_CTRLS] = [0; MAX_CTRLS];
+static mut HBA_CAPS: [u32; MAX_CTRLS] = [0; MAX_CTRLS];
+static mut HBA_COUNT: usize = 0;
 static mut INITIALIZED: bool = false;
 
-// ─── MMIO helpers ──────────────────────────────────────────────────────────
-fn hba_read(off: u32) -> u32 {
-    let addr = unsafe { HBA_VIRT + off as usize };
-    unsafe { ptr::read_volatile(addr as *const u32) }
+// ─── MMIO helpers ─────────────────────────────────────────────────────────
+#[inline]
+fn hba_read(c: usize, off: u32) -> u32 {
+    unsafe { ptr::read_volatile((HBAS[c] + off as usize) as *const u32) }
 }
-fn hba_write(off: u32, val: u32) {
-    let addr = unsafe { HBA_VIRT + off as usize };
-    unsafe { ptr::write_volatile(addr as *mut u32, val); }
+#[inline]
+fn hba_write(c: usize, off: u32, val: u32) {
+    unsafe { ptr::write_volatile((HBAS[c] + off as usize) as *mut u32, val) }
 }
-fn port_read(port: u32, reg: u32) -> u32 {
-    hba_read(PORT_BASE_OFFSET + port * PORT_SIZE + reg)
+#[inline]
+fn port_read(c: usize, port: u32, reg: u32) -> u32 {
+    hba_read(c, PORT_BASE_OFFSET + port * PORT_SIZE + reg)
 }
-fn port_write(port: u32, reg: u32, val: u32) {
-    hba_write(PORT_BASE_OFFSET + port * PORT_SIZE + reg, val)
+#[inline]
+fn port_write(c: usize, port: u32, reg: u32, val: u32) {
+    hba_write(c, PORT_BASE_OFFSET + port * PORT_SIZE + reg, val)
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────
 fn virt_to_phys(vaddr: usize) -> u64 {
-    // Uses actual kernel load address from Limine (handles KASLR/relocation)
+    // Kernel-image statics: phys = virt - (kernel virt base - kernel phys base)
     let offset = crate::arch::x86_64::boot::kernel_virt_offset();
     (vaddr as u64).wrapping_sub(offset)
 }
-fn phys_to_virt(phys: u64) -> usize {
-    let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);
-    (phys + hhdm) as usize
+
+#[inline]
+fn now_us() -> u64 { crate::arch::x86_64::tsc::tsc_stamp_us() }
+
+fn sleep_us(us: u64) {
+    let start = now_us();
+    while now_us().wrapping_sub(start) < us {
+        unsafe { core::arch::asm!("pause"); }
+    }
 }
 
-fn virt_to_phys_hhdm(vaddr: usize) -> u64 {
-    // Convert a higher-half direct mapping (HHDM) pointer back to physical
-    let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);
-    (vaddr as u64).wrapping_sub(hhdm)
+/// Poll `cond` until it returns true or `timeout_us` elapses.
+fn wait_until<F: FnMut() -> bool>(timeout_us: u64, mut cond: F) -> bool {
+    let start = now_us();
+    loop {
+        if cond() { return true; }
+        if now_us().wrapping_sub(start) >= timeout_us { return cond(); }
+        for _ in 0..64 { unsafe { core::arch::asm!("pause"); } }
+    }
 }
 
-fn delay(n: u32) {
-    for _ in 0..n { unsafe { core::arch::asm!("pause"); } }
-}
+fn log(s: &str) { crate::arch::x86_64::serial::write_str(s); }
 
 // ─── PCI scan ─────────────────────────────────────────────────────────────
-fn pci_read(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
-    let addr: u32 = 0x80000000 | ((bus as u32) << 16) | ((dev as u32) << 11)
-        | ((func as u32) << 8) | ((off as u32) & 0xFC);
-    unsafe {
-        let v: u32;
-        core::arch::asm!("out dx, eax", in("dx") 0x0CF8u16, in("eax") addr, options(nomem, nostack));
-        core::arch::asm!("in eax, dx",  in("dx") 0x0CFCu16, out("eax") v, options(nomem, nostack));
-        v
-    }
-}
-fn pci_write(bus: u8, dev: u8, func: u8, off: u8, val: u32) {
-    let addr: u32 = 0x80000000 | ((bus as u32) << 16) | ((dev as u32) << 11)
-        | ((func as u32) << 8) | ((off as u32) & 0xFC);
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") 0x0CF8u16, in("eax") addr, options(nomem, nostack));
-        core::arch::asm!("out dx, eax", in("dx") 0x0CFCu16, in("eax") val, options(nomem, nostack));
-    }
-}
-
 pub fn init() -> usize {
-    for bus in 0u8..16 {
+    unsafe {
+        if INITIALIZED { return DRIVE_COUNT; }
+        DRIVE_COUNT = 0;
+        HBA_COUNT = 0;
+    }
+
+    for bus in 0u16..256 {
+        let bus = bus as u8;
         for dev in 0u8..32 {
-            let id = pci_read(bus, dev, 0, 0);
-            if id == 0xFFFFFFFF { continue; }
-            let class_info = pci_read(bus, dev, 0, 0x08);
-            let class    = ((class_info >> 24) & 0xFF) as u8;
-            let subclass = ((class_info >> 16) & 0xFF) as u8;
-            let prog_if  = ((class_info >> 8)  & 0xFF) as u8;
-            if class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_SATA && prog_if == PCI_PROGIF_AHCI {
-                // Enable Bus Master + MMIO
-                let cmd = pci_read(bus, dev, 0, 0x04);
-                pci_write(bus, dev, 0, 0x04, cmd | 0x06); // MMIO + Bus Master
-
-                // Read ABAR (BAR5 = AHCI base memory register)
-                let bar5 = pci_read(bus, dev, 0, 0x24);
-                let abar_phys = (bar5 & !0xF) as u64;
-                if abar_phys == 0 { continue; }
-
-                // Map ABAR as UC/WC-disabled to ensure register writes hit hardware
-                let abar_page = abar_phys & !0xFFF;
-                let mut mapped = true;
-                for page in 0..AHCI_MMIO_PAGES {
-                    let v = AHCI_UC_VIRT_BASE + page * 4096;
-                    let p = abar_page + page * 4096;
-                    if !vmm::map_page_current(v, p, FLAG_WRITABLE | FLAG_PCD | FLAG_PWT | FLAG_NX) {
-                        mapped = false;
-                        break;
-                    }
-                }
-                if !mapped {
-                    crate::arch::x86_64::serial::write_str("[AHCI] Failed to map ABAR UC\r\n");
-                    continue;
-                }
-                unsafe { HBA_VIRT = (AHCI_UC_VIRT_BASE + (abar_phys & 0xFFF)) as usize; }
-
-                crate::arch::x86_64::serial::write_str("[AHCI] Controller at bus=");
-                serial_dec(bus as u64); crate::arch::x86_64::serial::write_byte(b',');
-                crate::arch::x86_64::serial::write_str(" ABAR=0x");
-                serial_hex32(abar_phys as u32);
-                crate::arch::x86_64::serial::write_str("\r\n");
-
-                if init_hba() {
-                    unsafe { INITIALIZED = true; }
-                    return unsafe { DRIVE_COUNT };
+            if crate::pci::vendor_id(bus, dev, 0) == 0xFFFF { continue; }
+            let nfunc = if crate::pci::header_type(bus, dev, 0) & 0x80 != 0 { 8 } else { 1 };
+            for func in 0u8..nfunc {
+                if crate::pci::vendor_id(bus, dev, func) == 0xFFFF { continue; }
+                let (class, subclass, prog_if) = crate::pci::class_code(bus, dev, func);
+                if class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_SATA
+                    && prog_if == PCI_PROGIF_AHCI
+                {
+                    if unsafe { HBA_COUNT } >= MAX_CTRLS { continue; }
+                    init_controller(bus, dev, func);
                 }
             }
         }
     }
-    0
+
+    unsafe {
+        INITIALIZED = HBA_COUNT > 0;
+        log("[AHCI] ");
+        serial_dec(HBA_COUNT as u64);
+        log(" controller(s), ");
+        serial_dec(DRIVE_COUNT as u64);
+        log(" SATA disk(s)\r\n");
+        DRIVE_COUNT
+    }
 }
 
-fn init_hba() -> bool {
-    // Enable AHCI
-    let ghc = hba_read(HBA_GHC);
-    hba_write(HBA_GHC, ghc | GHC_AE);
+fn init_controller(bus: u8, dev: u8, func: u8) {
+    log("[AHCI] Controller ");
+    serial_hex8(bus); log(":"); serial_hex8(dev); log("."); serial_dec(func as u64);
+    log(" id=");
+    serial_hex16(crate::pci::vendor_id(bus, dev, func));
+    log(":");
+    serial_hex16(crate::pci::device_id(bus, dev, func));
 
-    // Reset HBA
-    hba_write(HBA_GHC, hba_read(HBA_GHC) | GHC_HR);
-    let mut timeout = 1000000u32;
-    while hba_read(HBA_GHC) & GHC_HR != 0 && timeout > 0 {
-        timeout -= 1; delay(1);
+    // Memory space + bus master; mask INTx (we poll)
+    let cmd = crate::pci::command(bus, dev, func);
+    crate::pci::set_command(bus, dev, func, cmd | 0x0006 | 0x0400);
+
+    // ABAR = BAR5 (always 32-bit memory BAR)
+    let bar5 = crate::pci::config_read32(bus, dev, func, 0x24);
+    let abar_phys = (bar5 & 0xFFFF_FFF0) as u64;
+    log(" ABAR=0x"); serial_hex32(abar_phys as u32); log("\r\n");
+    if bar5 & 1 != 0 || abar_phys == 0 {
+        log("[AHCI]   ABAR not assigned, skipping\r\n");
+        return;
     }
-    if timeout == 0 { return false; }
 
-    // Re-enable AHCI
-    hba_write(HBA_GHC, hba_read(HBA_GHC) | GHC_AE);
+    // Map the ABAR uncached (PCD|PWT) into this controller's slot
+    let ci = unsafe { HBA_COUNT };
+    let slot_va = AHCI_UC_VIRT_BASE + ci as u64 * AHCI_UC_SLOT;
+    let page_off = abar_phys & 0xFFF;
+    let pages = (page_off + AHCI_ABAR_SPAN + 0xFFF) / 0x1000;
+    for p in 0..pages {
+        if !vmm::map_page_current(slot_va + p * 0x1000, (abar_phys & !0xFFF) + p * 0x1000,
+                                  FLAG_WRITABLE | FLAG_PCD | FLAG_PWT | FLAG_NX) {
+            log("[AHCI]   failed to map ABAR\r\n");
+            return;
+        }
+    }
+    unsafe {
+        HBAS[ci] = (slot_va + page_off) as usize;
+        HBA_COUNT += 1;
+    }
 
-    let pi = hba_read(HBA_PI); // Ports implemented bitmask
-    crate::arch::x86_64::serial::write_str("[AHCI] Ports implemented: 0x");
-    serial_hex32(pi);
-    crate::arch::x86_64::serial::write_str("\r\n");
+    if !init_hba(ci) {
+        log("[AHCI]   HBA init failed\r\n");
+    }
+}
 
-    let mut alloc_idx = 0usize;
+fn bios_handoff(c: usize) {
+    if hba_read(c, HBA_CAP2) & CAP2_BOH == 0 { return; }
+    let bohc = hba_read(c, HBA_BOHC);
+    if bohc & BOHC_BOS == 0 { return; }
+    log("[AHCI]   BIOS/OS handoff\r\n");
+    hba_write(c, HBA_BOHC, bohc | BOHC_OOS);
+    // BIOS must clear BOS within 25 ms; if it sets BB, give it up to 2 s
+    wait_until(25_000, || hba_read(c, HBA_BOHC) & BOHC_BOS == 0);
+    if hba_read(c, HBA_BOHC) & BOHC_BB != 0 {
+        wait_until(2_000_000, || hba_read(c, HBA_BOHC) & BOHC_BB == 0);
+    }
+}
+
+fn init_hba(c: usize) -> bool {
+    bios_handoff(c);
+
+    // AHCI mode on, then full HBA reset (clears all port state)
+    hba_write(c, HBA_GHC, hba_read(c, HBA_GHC) | GHC_AE);
+    let pi_before = hba_read(c, HBA_PI);
+    hba_write(c, HBA_GHC, hba_read(c, HBA_GHC) | GHC_HR);
+    if !wait_until(1_000_000, || hba_read(c, HBA_GHC) & GHC_HR == 0) {
+        log("[AHCI]   HBA reset timeout\r\n");
+        return false;
+    }
+    hba_write(c, HBA_GHC, (hba_read(c, HBA_GHC) | GHC_AE) & !GHC_IE);
+    // Some firmware-initialised HBAs need PI rewritten after reset
+    if hba_read(c, HBA_PI) == 0 && pi_before != 0 {
+        hba_write(c, HBA_PI, pi_before);
+    }
+    hba_write(c, HBA_IS, 0xFFFF_FFFF);
+
+    let cap = hba_read(c, HBA_CAP);
+    unsafe { HBA_CAPS[c] = cap; }
+    let pi = hba_read(c, HBA_PI);
+    let vs = hba_read(c, HBA_VS);
+    log("[AHCI]   VS=0x"); serial_hex32(vs);
+    log(" CAP=0x"); serial_hex32(cap);
+    log(" PI=0x"); serial_hex32(pi);
+    log("\r\n");
+
+    // Spin up every implemented port (staggered spin-up HBAs leave them
+    // off after reset), then let links settle once for all ports in
+    // parallel: wait while any port still reports DET=1 (device seen,
+    // PHY not up yet), bounded to 1 s. Empty ports (DET=0) cost nothing.
+    if cap & CAP_SSS != 0 {
+        for port in 0u32..32 {
+            if pi & (1 << port) == 0 { continue; }
+            let cmd = port_read(c, port, PORT_CMD);
+            port_write(c, port, PORT_CMD, cmd | PORT_CMD_SUD | PORT_CMD_POD);
+        }
+    }
+    sleep_us(10_000);
+    let settled = wait_until(1_000_000, || {
+        (0u32..32).all(|p| pi & (1 << p) == 0 || det(c, p) != 1)
+    });
+    if !settled {
+        log("[AHCI]   link settle timeout (some port stuck at DET=1)\r\n");
+    }
+
     for port in 0u32..32 {
         if pi & (1 << port) == 0 { continue; }
-        if alloc_idx >= MAX_ACTIVE_PORTS { break; }
-
-        // Check if device is present
-        let ssts = port_read(port, PORT_SSTS);
-        let det = ssts & 0xF;
-        let ipm = (ssts >> 8) & 0xF;
-
-        if det != SSTS_DET_PRESENT { continue; }
-        if ipm != 1 { continue; } // 1 = active / spun up
-
-        let sig = port_read(port, PORT_SIG);
-        crate::arch::x86_64::serial::write_str("[AHCI] Port ");
-        serial_dec(port as u64);
-        crate::arch::x86_64::serial::write_str(": sig=0x");
-        serial_hex32(sig);
-        crate::arch::x86_64::serial::write_str("\r\n");
-
-        // Skip ATAPI (0xEB140101), PM (0x96690101), SEMB
-        if sig == 0xEB140101 || sig == 0xC33C0101 {
-            crate::arch::x86_64::serial::write_str("[AHCI]   -> ATAPI/other, skipping\r\n");
-            continue;
-        }
-
-        if init_port(port, alloc_idx) {
-            if identify_port(port, alloc_idx) {
-                unsafe { DRIVE_COUNT += 1; }
-                alloc_idx += 1;
-            }
-        }
-    }
-
-    true
-}
-
-fn stop_port(port: u32) {
-    let cmd = port_read(port, PORT_CMD);
-    port_write(port, PORT_CMD, cmd & !(PORT_CMD_ST | PORT_CMD_FRE));
-    // Wait for CR and FR to clear
-    let mut timeout = 500_000u32;
-    loop {
-        let c = port_read(port, PORT_CMD);
-        if c & (PORT_CMD_CR | PORT_CMD_FR) == 0 { break; }
-        timeout -= 1;
-        if timeout == 0 { break; }
-        delay(1);
-    }
-}
-
-fn start_port(port: u32) {
-    // Wait until CR clear
-    let mut timeout = 500_000u32;
-    while port_read(port, PORT_CMD) & PORT_CMD_CR != 0 && timeout > 0 {
-        timeout -= 1; delay(1);
-    }
-    let cmd = port_read(port, PORT_CMD);
-    port_write(port, PORT_CMD, cmd | PORT_CMD_FRE | PORT_CMD_ST);
-}
-
-fn wait_ci_clear(port: u32, mask: u32, label: &str) -> bool {
-    // 100 Hz → 10 ms per tick; 1000 ms = 100 ticks
-    let start_ms = crate::arch::x86_64::idt::timer_ticks();
-
-    loop {
-        let ci = port_read(port, PORT_CI);
-        if ci & mask == 0 { return true; }
-
-        let is = port_read(port, PORT_IS);
-        if is & (1 << 30) != 0 {
-            crate::arch::x86_64::serial::write_str("[AHCI] Task File Error while waiting for CI (" );
-            crate::arch::x86_64::serial::write_str(label);
-            crate::arch::x86_64::serial::write_str(")\r\n");
-            return false;
-        }
-
-        if crate::arch::x86_64::idt::timer_ticks().wrapping_sub(start_ms) >= 100 {
-            let serr = port_read(port, PORT_SERR);
-            crate::arch::x86_64::serial::write_str("[AHCI] CI stuck after 1000ms (" );
-            crate::arch::x86_64::serial::write_str(label);
-            crate::arch::x86_64::serial::write_str(") IS=0x");
-            serial_hex32(is);
-            crate::arch::x86_64::serial::write_str(" SERR=0x");
-            serial_hex32(serr);
-            crate::arch::x86_64::serial::write_str("\r\n");
-            return false;
-        }
-
-        delay(200); // small pause to avoid hammering the bus
-    }
-}
-
-fn init_port(port: u32, ai: usize) -> bool {
-    stop_port(port);
-
-    // Set Command List Base
-    let cl_phys = virt_to_phys(unsafe { CMD_LISTS[ai].0.as_ptr() as usize });
-    port_write(port, PORT_CLB,  cl_phys as u32);
-    port_write(port, PORT_CLBU, (cl_phys >> 32) as u32);
-
-    // Set FIS Receive Base
-    let fb_phys = virt_to_phys(unsafe { FIS_AREAS[ai].0.as_ptr() as usize });
-    port_write(port, PORT_FB,  fb_phys as u32);
-    port_write(port, PORT_FBU, (fb_phys >> 32) as u32);
-
-    // Clear error
-    port_write(port, PORT_SERR, 0xFFFFFFFF);
-
-    // Set up the first command header with our command table
-    let ct_phys = virt_to_phys(unsafe { CMD_TABLES[ai].cfis.as_ptr() as usize });
-    unsafe {
-        CMD_LISTS[ai].0[0].ctba_lo = ct_phys as u32;
-        CMD_LISTS[ai].0[0].ctba_hi = (ct_phys >> 32) as u32;
-    }
-
-    start_port(port);
-    true
-}
-
-fn identify_port(port: u32, ai: usize) -> bool {
-    // Use a 512-byte identify buffer in DATA_BUF
-    let result = run_pio_command(port, ai, ATA_CMD_IDENTIFY, 0, 0, 1, true);
-    if !result { return false; }
-
-    // Parse identify data from DATA_BUF
-    unsafe {
-        let id = core::slice::from_raw_parts(DATA_BUF.as_ptr() as *const u16, 256);
-
-        // 48-bit LBA sector count: words 100-103
-        let sects = (id[100] as u64)
-            | ((id[101] as u64) << 16)
-            | ((id[102] as u64) << 32)
-            | ((id[103] as u64) << 48);
-
-        let drive_idx = DRIVE_COUNT;
-        DRIVES[drive_idx].present   = true;
-        DRIVES[drive_idx].port_idx  = port as u8;
-        DRIVES[drive_idx].alloc_idx = ai as u8;
-        DRIVES[drive_idx].sectors   = sects;
-        DRIVES[drive_idx].size_mb   = sects / 2048;
-
-        // Model name: words 27-46, byte-swapped
-        let mut mi = 0usize;
-        for i in 27..47usize {
-            let w = id[i];
-            let b0 = (w >> 8) as u8;
-            let b1 = (w & 0xFF) as u8;
-            if b0 != 0 && mi < 40 { DRIVES[drive_idx].model[mi] = b0; mi += 1; }
-            if b1 != 0 && mi < 40 { DRIVES[drive_idx].model[mi] = b1; mi += 1; }
-        }
-        while mi > 0 && DRIVES[drive_idx].model[mi - 1] == b' ' {
-            DRIVES[drive_idx].model[mi - 1] = 0; mi -= 1;
-        }
-        DRIVES[drive_idx].model[mi] = 0;
-
-        let model_end = DRIVES[drive_idx].model.iter().position(|&b| b == 0).unwrap_or(40);
-        let model_str = core::str::from_utf8_unchecked(&DRIVES[drive_idx].model[..model_end]);
-        crate::arch::x86_64::serial::write_str("[AHCI]   Model: ");
-        crate::arch::x86_64::serial::write_str(model_str);
-        crate::arch::x86_64::serial::write_str(", ");
-        serial_dec(DRIVES[drive_idx].size_mb);
-        crate::arch::x86_64::serial::write_str(" MiB\r\n");
+        if unsafe { DRIVE_COUNT } >= MAX_ACTIVE_PORTS { break; }
+        probe_port(c, port);
     }
     true
 }
 
-fn run_pio_command(port: u32, ai: usize, cmd: u8, lba: u64, count: u32,
-                   sector_count: u32, is_read: bool) -> bool {
-    unsafe {
-        let ct = &mut CMD_TABLES[ai];
-        // Zero FIS area
-        for b in ct.cfis.iter_mut() { *b = 0; }
+fn stop_port(c: usize, port: u32) -> bool {
+    let cmd = port_read(c, port, PORT_CMD);
+    if cmd & PORT_CMD_ST != 0 {
+        port_write(c, port, PORT_CMD, cmd & !PORT_CMD_ST);
+    }
+    let ok_cr = wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_CR == 0);
+    let cmd = port_read(c, port, PORT_CMD);
+    if cmd & PORT_CMD_FRE != 0 {
+        port_write(c, port, PORT_CMD, cmd & !PORT_CMD_FRE);
+    }
+    let ok_fr = wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_FR == 0);
+    ok_cr && ok_fr
+}
 
-        // Build H2D FIS
-        ct.cfis[0] = FIS_TYPE_REG_H2D;
-        ct.cfis[1] = 1 << 7; // C bit = 1 (command)
-        ct.cfis[2] = cmd;
-        ct.cfis[3] = 0; // features
-        ct.cfis[4] = (lba & 0xFF) as u8;
-        ct.cfis[5] = ((lba >> 8) & 0xFF) as u8;
-        ct.cfis[6] = ((lba >> 16) & 0xFF) as u8;
-        ct.cfis[7] = 0x40; // LBA mode = bit 6 set in device register
-        ct.cfis[8] = ((lba >> 24) & 0xFF) as u8;
-        ct.cfis[9] = ((lba >> 32) & 0xFF) as u8;
-        ct.cfis[10] = ((lba >> 40) & 0xFF) as u8;
-        ct.cfis[11] = 0;
-        ct.cfis[12] = (count & 0xFF) as u8;
-        ct.cfis[13] = ((count >> 8) & 0xFF) as u8;
+fn start_port(c: usize, port: u32) {
+    wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_CR == 0);
+    let cmd = port_read(c, port, PORT_CMD);
+    port_write(c, port, PORT_CMD, cmd | PORT_CMD_FRE | PORT_CMD_ST);
+}
 
-        // Set up PRD entry
-        let dat_phys = virt_to_phys(DATA_BUF.as_ptr() as usize);
-        ct.prdt[0].dba_lo = dat_phys as u32;
-        ct.prdt[0].dba_hi = (dat_phys >> 32) as u32;
-        ct.prdt[0]._rsv   = 0;
-        let byte_count = (sector_count as usize * SECTOR_SIZE - 1) as u32;
-        ct.prdt[0].dbc    = byte_count | (1 << 31); // interrupt on completion
+fn det(c: usize, port: u32) -> u32 { port_read(c, port, PORT_SSTS) & 0xF }
 
-        // Set command header
-        let cfis_len_dw = 5u16; // 20 bytes / 4 = 5 DWORDs
-        let write_bit = if !is_read { 1u16 << 6 } else { 0u16 };
-        CMD_LISTS[ai].0[0].flags  = cfis_len_dw | write_bit;
-        CMD_LISTS[ai].0[0].prdtl  = 1;
-        CMD_LISTS[ai].0[0].prdbc  = 0;
+/// COMRESET via PxSCTL.DET. Port must be stopped (ST=0).
+fn comreset(c: usize, port: u32) -> bool {
+    let sctl = port_read(c, port, PORT_SCTL);
+    port_write(c, port, PORT_SCTL, (sctl & !0xF) | 0x1);
+    sleep_us(2_000); // spec: hold at least 1 ms
+    port_write(c, port, PORT_SCTL, sctl & !0xF);
+    let ok = wait_until(T_COMRESET_US, || det(c, port) == SSTS_DET_PRESENT);
+    port_write(c, port, PORT_SERR, 0xFFFF_FFFF);
+    ok
+}
+
+fn probe_port(c: usize, port: u32) {
+    let ai = unsafe { DRIVE_COUNT };
+    let cap = unsafe { HBA_CAPS[c] };
+
+    if !stop_port(c, port) {
+        log("[AHCI]   port "); serial_dec(port as u64); log(": engine won't stop\r\n");
+        return;
     }
 
-    // Clear interrupt status
-    port_write(port, PORT_IS, 0xFFFFFFFF);
+    // Command list / FIS receive area
+    let cl_phys = virt_to_phys(unsafe { ptr::addr_of!(CMD_LISTS[ai]) as usize });
+    let fb_phys = virt_to_phys(unsafe { ptr::addr_of!(FIS_AREAS[ai]) as usize });
+    let ct_phys = virt_to_phys(unsafe { ptr::addr_of!(CMD_TABLES[ai]) as usize });
+    let buf_phys = virt_to_phys(unsafe { ptr::addr_of!(DATA_BUF) as usize });
+    if cap & CAP_S64A == 0 && (cl_phys | fb_phys | ct_phys | buf_phys) >> 32 != 0 {
+        log("[AHCI]   DMA memory above 4 GiB but HBA is 32-bit only\r\n");
+        return;
+    }
+    unsafe {
+        let cl = &mut *ptr::addr_of_mut!(CMD_LISTS[ai]);
+        for h in cl.0.iter_mut() { *h = EMPTY_HDR; }
+        cl.0[0].ctba_lo = ct_phys as u32;
+        cl.0[0].ctba_hi = (ct_phys >> 32) as u32;
+        (*ptr::addr_of_mut!(FIS_AREAS[ai])).0 = [0u8; 256];
+    }
+    fence(Ordering::SeqCst);
+    port_write(c, port, PORT_CLB,  cl_phys as u32);
+    port_write(c, port, PORT_CLBU, (cl_phys >> 32) as u32);
+    port_write(c, port, PORT_FB,   fb_phys as u32);
+    port_write(c, port, PORT_FBU,  (fb_phys >> 32) as u32);
+    port_write(c, port, PORT_IE, 0);
 
-    // Issue command (slot 0)
-    port_write(port, PORT_CI, 1);
+    // Power on / spin up (staggered spin-up HBAs leave devices off), FIS receive on
+    let mut cmd = port_read(c, port, PORT_CMD) | PORT_CMD_FRE;
+    if cap & CAP_SSS != 0 { cmd |= PORT_CMD_SUD | PORT_CMD_POD; }
+    port_write(c, port, PORT_CMD, cmd);
+    wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_FR != 0);
 
-    // Wait for completion (1s deadline with debug dump)
-    if !wait_ci_clear(port, 1, "PIO") {
+    // Link up?
+    wait_until(T_LINK_US, || det(c, port) == SSTS_DET_PRESENT);
+    let d = det(c, port);
+    if d == 0 || d == 4 {
+        return; // nothing attached / PHY offline
+    }
+    if d != SSTS_DET_PRESENT {
+        // Device detected but no PHY communication: COMRESET once
+        let cmd = port_read(c, port, PORT_CMD);
+        port_write(c, port, PORT_CMD, cmd & !PORT_CMD_FRE);
+        wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_FR == 0);
+        let ok = comreset(c, port);
+        port_write(c, port, PORT_CMD, port_read(c, port, PORT_CMD) | PORT_CMD_FRE);
+        if !ok {
+            log("[AHCI]   port "); serial_dec(port as u64); log(": no link after COMRESET\r\n");
+            return;
+        }
+    }
+
+    // Wake the link if it is in a low-power state
+    let ipm = (port_read(c, port, PORT_SSTS) >> 8) & 0xF;
+    if ipm != 1 {
+        let cmd = port_read(c, port, PORT_CMD);
+        port_write(c, port, PORT_CMD, (cmd & !PORT_CMD_ICC_MASK) | PORT_CMD_ICC_ACTIVE);
+        wait_until(T_LINK_US, || (port_read(c, port, PORT_SSTS) >> 8) & 0xF == 1);
+    }
+
+    port_write(c, port, PORT_SERR, 0xFFFF_FFFF);
+    port_write(c, port, PORT_IS, 0xFFFF_FFFF);
+
+    // Wait for the device's initial D2H FIS (clears BSY, latches signature)
+    if !wait_until(T_BUSY_US, || port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) == 0) {
+        log("[AHCI]   port "); serial_dec(port as u64); log(": BSY stuck, COMRESET\r\n");
+        let cmd = port_read(c, port, PORT_CMD);
+        port_write(c, port, PORT_CMD, cmd & !PORT_CMD_FRE);
+        wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_FR == 0);
+        comreset(c, port);
+        port_write(c, port, PORT_CMD, port_read(c, port, PORT_CMD) | PORT_CMD_FRE);
+        if !wait_until(T_BUSY_US, || port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) == 0) {
+            log("[AHCI]   port "); serial_dec(port as u64); log(": device not ready\r\n");
+            stop_port(c, port);
+            return;
+        }
+    }
+
+    let sig = port_read(c, port, PORT_SIG);
+    log("[AHCI]   port "); serial_dec(port as u64);
+    log(": SSTS=0x"); serial_hex32(port_read(c, port, PORT_SSTS));
+    log(" sig=0x"); serial_hex32(sig);
+
+    match sig {
+        SIG_ATAPI => { log(" (ATAPI, skipped)\r\n"); stop_port(c, port); return; }
+        SIG_SEMB  => { log(" (SEMB, skipped)\r\n");  stop_port(c, port); return; }
+        SIG_PM    => { log(" (port multiplier, unsupported)\r\n"); stop_port(c, port); return; }
+        SIG_ATA   => log(" (ATA)\r\n"),
+        _         => log(" (unknown, trying IDENTIFY)\r\n"),
+    }
+
+    port_write(c, port, PORT_SERR, 0xFFFF_FFFF);
+    port_write(c, port, PORT_IS, 0xFFFF_FFFF);
+    start_port(c, port);
+
+    let drv = AhciDrive {
+        present: false, ctrl: c as u8, port_idx: port as u8, alloc_idx: ai as u8,
+        lba48: false, sectors: 0, size_mb: 0, model: [0u8; 41],
+    };
+    if identify(drv) {
+        unsafe { DRIVE_COUNT += 1; }
+    } else {
+        log("[AHCI]   port "); serial_dec(port as u64); log(": IDENTIFY failed\r\n");
+        stop_port(c, port);
+    }
+}
+
+fn identify(mut drv: AhciDrive) -> bool {
+    let buf_phys = virt_to_phys(unsafe { ptr::addr_of!(DATA_BUF) as usize });
+    if !exec(&drv, ATA_CMD_IDENTIFY, 0, 0, buf_phys, 512, false) {
         return false;
     }
 
+    let mut id = [0u16; 256];
+    unsafe {
+        let src = &(*ptr::addr_of!(DATA_BUF)).0;
+        for i in 0..256 { id[i] = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]); }
+    }
+
+    let lba48 = id[83] & (1 << 10) != 0;
+    let sects48 = (id[100] as u64) | ((id[101] as u64) << 16)
+        | ((id[102] as u64) << 32) | ((id[103] as u64) << 48);
+    let sects28 = (id[60] as u64) | ((id[61] as u64) << 16);
+    drv.lba48 = lba48 && sects48 != 0;
+    drv.sectors = if drv.lba48 { sects48 } else { sects28 };
+    if drv.sectors == 0 { return false; }
+    drv.size_mb = drv.sectors / 2048;
+
+    // Model: words 27..46, byte-swapped ASCII
+    let mut mi = 0usize;
+    for w in &id[27..47] {
+        for b in [(*w >> 8) as u8, (*w & 0xFF) as u8] {
+            if b != 0 && mi < 40 { drv.model[mi] = b; mi += 1; }
+        }
+    }
+    while mi > 0 && drv.model[mi - 1] == b' ' { mi -= 1; drv.model[mi] = 0; }
+    drv.present = true;
+
+    log("[AHCI]   Model: ");
+    log(unsafe { core::str::from_utf8_unchecked(&drv.model[..mi]) });
+    log(", "); serial_dec(drv.size_mb); log(" MiB");
+    log(if drv.lba48 { ", LBA48\r\n" } else { ", LBA28\r\n" });
+
+    unsafe { DRIVES[DRIVE_COUNT] = drv; }
     true
+}
+
+/// Recover a port after a task-file / interface error or a timeout.
+fn recover_port(c: usize, port: u32) {
+    let cmd = port_read(c, port, PORT_CMD);
+    port_write(c, port, PORT_CMD, cmd & !PORT_CMD_ST);
+    wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_CR == 0);
+    port_write(c, port, PORT_SERR, 0xFFFF_FFFF);
+    port_write(c, port, PORT_IS, 0xFFFF_FFFF);
+    if port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
+        let cmd = port_read(c, port, PORT_CMD);
+        port_write(c, port, PORT_CMD, cmd & !PORT_CMD_FRE);
+        wait_until(T_STOP_US, || port_read(c, port, PORT_CMD) & PORT_CMD_FR == 0);
+        comreset(c, port);
+        port_write(c, port, PORT_CMD, port_read(c, port, PORT_CMD) | PORT_CMD_FRE);
+        wait_until(T_BUSY_US, || port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) == 0);
+    }
+    port_write(c, port, PORT_SERR, 0xFFFF_FFFF);
+    port_write(c, port, PORT_IS, 0xFFFF_FFFF);
+    start_port(c, port);
+}
+
+/// Build and issue one command in slot 0, poll for completion.
+/// `bytes == 0` → non-data command. `count` is the ATA sector count field.
+fn exec(drv: &AhciDrive, cmd: u8, lba: u64, count: u32, buf_phys: u64, bytes: u32, write: bool) -> bool {
+    let c = drv.ctrl as usize;
+    let port = drv.port_idx as u32;
+    let ai = drv.alloc_idx as usize;
+
+    if bytes > 0 && (buf_phys & 1 != 0 || bytes > 4 * 1024 * 1024 || bytes & 1 != 0) { return false; }
+    if unsafe { HBA_CAPS[c] } & CAP_S64A == 0 && (buf_phys + bytes as u64) > 0x1_0000_0000 {
+        return false;
+    }
+
+    // Device must be idle before issuing
+    if port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
+        recover_port(c, port);
+        if port_read(c, port, PORT_TFD) & (TFD_BSY | TFD_DRQ) != 0 { return false; }
+    }
+
+    unsafe {
+        let ct = &mut *ptr::addr_of_mut!(CMD_TABLES[ai]);
+        ct.cfis = [0u8; 64];
+        ct.cfis[0] = FIS_TYPE_REG_H2D;
+        ct.cfis[1] = 1 << 7; // C = command
+        ct.cfis[2] = cmd;
+        let lba28 = matches!(cmd, ATA_CMD_READ_DMA | ATA_CMD_WRITE_DMA);
+        ct.cfis[4] = lba as u8;
+        ct.cfis[5] = (lba >> 8) as u8;
+        ct.cfis[6] = (lba >> 16) as u8;
+        ct.cfis[7] = match cmd {
+            ATA_CMD_IDENTIFY => 0,
+            _ if lba28 => 0x40 | ((lba >> 24) as u8 & 0x0F),
+            _ => 0x40,
+        };
+        if !lba28 {
+            ct.cfis[8]  = (lba >> 24) as u8;
+            ct.cfis[9]  = (lba >> 32) as u8;
+            ct.cfis[10] = (lba >> 40) as u8;
+        }
+        ct.cfis[12] = count as u8;
+        ct.cfis[13] = (count >> 8) as u8;
+
+        ct.prdt[0] = if bytes > 0 {
+            PrdEntry {
+                dba_lo: buf_phys as u32,
+                dba_hi: (buf_phys >> 32) as u32,
+                _rsv: 0,
+                dbc: bytes - 1,
+            }
+        } else { EMPTY_PRD };
+
+        let hdr = &mut (*ptr::addr_of_mut!(CMD_LISTS[ai])).0[0];
+        hdr.flags = 5 | if write { 1 << 6 } else { 0 }; // CFL = 5 dwords
+        hdr.prdtl = if bytes > 0 { 1 } else { 0 };
+        hdr.prdbc = 0;
+    }
+    // Descriptors must be globally visible before the doorbell
+    fence(Ordering::SeqCst);
+
+    port_write(c, port, PORT_IS, 0xFFFF_FFFF);
+    port_write(c, port, PORT_CI, 1);
+
+    let start = now_us();
+    loop {
+        let is = port_read(c, port, PORT_IS);
+        if is & PORT_IS_ERR_MASK != 0 {
+            log("[AHCI] cmd 0x"); serial_hex8(cmd);
+            log(" error IS=0x"); serial_hex32(is);
+            log(" TFD=0x"); serial_hex32(port_read(c, port, PORT_TFD));
+            log(" SERR=0x"); serial_hex32(port_read(c, port, PORT_SERR));
+            log("\r\n");
+            recover_port(c, port);
+            return false;
+        }
+        if port_read(c, port, PORT_CI) & 1 == 0 { break; }
+        if now_us().wrapping_sub(start) >= T_CMD_US {
+            log("[AHCI] cmd 0x"); serial_hex8(cmd);
+            log(" timeout IS=0x"); serial_hex32(is);
+            log(" TFD=0x"); serial_hex32(port_read(c, port, PORT_TFD));
+            log(" SERR=0x"); serial_hex32(port_read(c, port, PORT_SERR));
+            log("\r\n");
+            recover_port(c, port);
+            return false;
+        }
+        for _ in 0..64 { unsafe { core::arch::asm!("pause"); } }
+    }
+    fence(Ordering::SeqCst);
+
+    if port_read(c, port, PORT_TFD) & TFD_ERR != 0 {
+        log("[AHCI] cmd 0x"); serial_hex8(cmd);
+        log(" device error TFD=0x"); serial_hex32(port_read(c, port, PORT_TFD)); log("\r\n");
+        recover_port(c, port);
+        return false;
+    }
+    true
+}
+
+/// One DMA transfer of `n` sectors (n ≤ limit for the drive's LBA mode).
+fn rw_dma(drv: &AhciDrive, lba: u64, n: u32, buf_phys: u64, write: bool) -> bool {
+    if n == 0 { return true; }
+    if lba + n as u64 > drv.sectors { return false; }
+    let (cmd, count) = if drv.lba48 {
+        (if write { ATA_CMD_WRITE_DMA_EX } else { ATA_CMD_READ_DMA_EX }, n & 0xFFFF)
+    } else {
+        if n > 256 || lba + n as u64 > (1 << 28) { return false; }
+        (if write { ATA_CMD_WRITE_DMA } else { ATA_CMD_READ_DMA }, n & 0xFF)
+    };
+    exec(drv, cmd, lba, count, buf_phys, n * SECTOR_SIZE as u32, write)
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────
@@ -552,145 +728,83 @@ pub fn drive_count() -> usize   { unsafe { DRIVE_COUNT } }
 
 pub fn drive_info(idx: usize) -> Option<&'static AhciDrive> {
     unsafe {
-        if idx < DRIVE_COUNT && DRIVES[idx].present { Some(&DRIVES[idx]) } else { None }
+        if idx < DRIVE_COUNT && DRIVES[idx].present { Some(&*ptr::addr_of!(DRIVES[idx])) } else { None }
     }
 }
 
-/// Read `count` sectors from AHCI drive `drive_idx` at LBA `lba`.
-/// Data written into `buf` (must be count * 512 bytes).
+/// Read `count` sectors from AHCI drive `drive_idx` at LBA `lba` into `buf`.
 pub fn read_sectors(drive_idx: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
     if buf.len() < count as usize * SECTOR_SIZE { return false; }
-
     let d = match drive_info(drive_idx) { Some(d) => *d, None => return false };
-    let port = d.port_idx as u32;
-    let ai   = d.alloc_idx as usize;
+    let bounce_phys = virt_to_phys(unsafe { ptr::addr_of!(DATA_BUF) as usize });
 
-    if !run_pio_command(port, ai, ATA_CMD_READ_DMA_EX, lba, count, count, true) {
-        return false;
+    let mut done = 0u32;
+    while done < count {
+        let n = (count - done).min(BOUNCE_SECTORS);
+        if !rw_dma(&d, lba + done as u64, n, bounce_phys, false) { return false; }
+        let off = done as usize * SECTOR_SIZE;
+        let len = n as usize * SECTOR_SIZE;
+        unsafe { buf[off..off + len].copy_from_slice(&(&(*ptr::addr_of!(DATA_BUF)).0)[..len]); }
+        done += n;
     }
-
-    let total = (count as usize * SECTOR_SIZE).min(DATA_BUF_SIZE);
-    buf[..total].copy_from_slice(unsafe { &DATA_BUF[..total] });
     true
 }
 
-/// Write `count` sectors to AHCI drive `drive_idx` at LBA `lba`.
+/// Write `count` sectors from `data` to AHCI drive `drive_idx` at LBA `lba`.
 pub fn write_sectors(drive_idx: usize, lba: u64, count: u32, data: &[u8]) -> bool {
     if data.len() < count as usize * SECTOR_SIZE { return false; }
-
     let d = match drive_info(drive_idx) { Some(d) => *d, None => return false };
-    let port = d.port_idx as u32;
-    let ai   = d.alloc_idx as usize;
+    let bounce_phys = virt_to_phys(unsafe { ptr::addr_of!(DATA_BUF) as usize });
 
-    let total = (count as usize * SECTOR_SIZE).min(DATA_BUF_SIZE);
-    unsafe { DATA_BUF[..total].copy_from_slice(&data[..total]); }
-
-    run_pio_command(port, ai, ATA_CMD_WRITE_DMA_EX, lba, count, count, false)
-}
-
-/// Send ATA FLUSH CACHE EXT (0xEA) to the specified drive to drain its
-/// volatile write-back cache.  This is a non-data command: no PRD is set up.
-/// The installer calls this after writing the partition table so that UEFI
-/// firmware sees consistent sector data on the next boot.
-pub fn flush_cache(drive_idx: usize) -> bool {
-    let d = match drive_info(drive_idx) { Some(d) => *d, None => return true };
-    let port = d.port_idx as u32;
-    let ai   = d.alloc_idx as usize;
-
-    unsafe {
-        let ct = &mut CMD_TABLES[ai];
-        for b in ct.cfis.iter_mut() { *b = 0; }
-
-        // H2D Register FIS for FLUSH CACHE EXT
-        ct.cfis[0] = FIS_TYPE_REG_H2D;
-        ct.cfis[1] = 1 << 7;  // C bit = command, not control
-        ct.cfis[2] = 0xEA;    // ATA_CMD_FLUSH_CACHE_EXT
-        ct.cfis[7] = 0x40;    // LBA mode bit
-
-        // No data transfer — zero out the single PRD entry
-        ct.prdt[0].dba_lo = 0;
-        ct.prdt[0].dba_hi = 0;
-        ct.prdt[0]._rsv   = 0;
-        ct.prdt[0].dbc    = 0;
-
-        // Command-list header: 5 DWORDs FIS, 0 PRD entries, no write bit
-        CMD_LISTS[ai].0[0].flags  = 5u16;  // cfis_len = 5 DWORDs, W=0, P=0
-        CMD_LISTS[ai].0[0].prdtl  = 0;
-        CMD_LISTS[ai].0[0].prdbc  = 0;
+    let mut done = 0u32;
+    while done < count {
+        let n = (count - done).min(BOUNCE_SECTORS);
+        let off = done as usize * SECTOR_SIZE;
+        let len = n as usize * SECTOR_SIZE;
+        unsafe { (&mut (*ptr::addr_of_mut!(DATA_BUF)).0)[..len].copy_from_slice(&data[off..off + len]); }
+        if !rw_dma(&d, lba + done as u64, n, bounce_phys, true) { return false; }
+        done += n;
     }
-
-    port_write(port, PORT_IS, 0xFFFF_FFFF);
-    port_write(port, PORT_CI, 1);
-    if wait_ci_clear(port, 1, "FLUSH_EXT") {
-        crate::arch::x86_64::serial::write_str("[AHCI] Flush cache OK\r\n");
-        true
-    } else {
-        crate::arch::x86_64::serial::write_str("[AHCI] Flush cache timeout\r\n");
-        false   // non-fatal
-    }
-}
-
-/// Zero-copy DMA write using a physical buffer allocated by the PMM.
-/// `buffer_phys` must point to a physically contiguous region of at least
-/// `count * 512` bytes. Returns true on success.
-pub fn dma_write(drive_idx: usize, lba: u64, count: u32, buffer_phys: u64) -> bool {
-    if count == 0 { return true; }
-
-    let d = match drive_info(drive_idx) { Some(d) => *d, None => return false };
-    let port = d.port_idx as u32;
-    let ai   = d.alloc_idx as usize;
-
-    unsafe {
-        let ct = &mut CMD_TABLES[ai];
-        for b in ct.cfis.iter_mut() { *b = 0; }
-
-        // Build H2D FIS for WRITE DMA EXT
-        ct.cfis[0] = FIS_TYPE_REG_H2D;
-        ct.cfis[1] = 1 << 7; // Command
-        ct.cfis[2] = ATA_CMD_WRITE_DMA_EX;
-        ct.cfis[3] = 0;
-        ct.cfis[4] = (lba & 0xFF) as u8;
-        ct.cfis[5] = ((lba >> 8) & 0xFF) as u8;
-        ct.cfis[6] = ((lba >> 16) & 0xFF) as u8;
-        ct.cfis[7] = 0x40; // LBA mode
-        ct.cfis[8] = ((lba >> 24) & 0xFF) as u8;
-        ct.cfis[9] = ((lba >> 32) & 0xFF) as u8;
-        ct.cfis[10] = ((lba >> 40) & 0xFF) as u8;
-        ct.cfis[11] = 0;
-        ct.cfis[12] = (count & 0xFF) as u8;
-        ct.cfis[13] = ((count >> 8) & 0xFF) as u8;
-
-        // PRD: point directly to caller's physical buffer
-        ct.prdt[0].dba_lo = buffer_phys as u32;
-        ct.prdt[0].dba_hi = (buffer_phys >> 32) as u32;
-        ct.prdt[0]._rsv   = 0;
-        let byte_count = (count as usize * SECTOR_SIZE - 1) as u32;
-        ct.prdt[0].dbc    = byte_count | (1 << 31); // IOC
-
-        // Command header
-        let cfis_len_dw = 5u16;
-        CMD_LISTS[ai].0[0].flags  = cfis_len_dw | (1u16 << 6); // write bit
-        CMD_LISTS[ai].0[0].prdtl  = 1;
-        CMD_LISTS[ai].0[0].prdbc  = 0;
-
-        port_write(port, PORT_IS, 0xFFFFFFFF);
-        port_write(port, PORT_CI, 1);
-
-        // Poll for completion (1s deadline with IS/SERR dump)
-        if !wait_ci_clear(port, 1, "DMA") {
-            return false;
-        }
-    }
-
     true
 }
 
-fn serial_hex32(v: u32) {
-    let h = b"0123456789abcdef";
-    for i in (0..8).rev() {
-        crate::arch::x86_64::serial::write_byte(h[((v >> (i * 4)) & 0xF) as usize]);
+/// Send FLUSH CACHE (EXT) to drain the drive's volatile write cache.
+pub fn flush_cache(drive_idx: usize) -> bool {
+    let d = match drive_info(drive_idx) { Some(d) => *d, None => return true };
+    let cmd = if d.lba48 { ATA_CMD_FLUSH_CACHE_EX } else { ATA_CMD_FLUSH_CACHE };
+    if exec(&d, cmd, 0, 0, 0, 0, false) {
+        log("[AHCI] Flush cache OK\r\n");
+        true
+    } else {
+        log("[AHCI] Flush cache failed\r\n");
+        false
     }
 }
+
+/// Zero-copy DMA write from a physically contiguous buffer of at least
+/// `count * 512` bytes (e.g. PMM-allocated). Returns true on success.
+pub fn dma_write(drive_idx: usize, lba: u64, count: u32, buffer_phys: u64) -> bool {
+    if count == 0 { return true; }
+    let d = match drive_info(drive_idx) { Some(d) => *d, None => return false };
+    let max = if d.lba48 { DMA_MAX_SECTORS } else { 256 };
+
+    let mut done = 0u32;
+    while done < count {
+        let n = (count - done).min(max);
+        let phys = buffer_phys + done as u64 * SECTOR_SIZE as u64;
+        if !rw_dma(&d, lba + done as u64, n, phys, true) { return false; }
+        done += n;
+    }
+    true
+}
+
+fn serial_hex8(v: u8) {
+    let h = b"0123456789abcdef";
+    crate::arch::x86_64::serial::write_byte(h[(v >> 4) as usize]);
+    crate::arch::x86_64::serial::write_byte(h[(v & 0xF) as usize]);
+}
+fn serial_hex16(v: u16) { serial_hex8((v >> 8) as u8); serial_hex8(v as u8); }
+fn serial_hex32(v: u32) { serial_hex16((v >> 16) as u16); serial_hex16(v as u16); }
 fn serial_dec(mut v: u64) {
     if v == 0 { crate::arch::x86_64::serial::write_byte(b'0'); return; }
     let mut buf = [0u8; 20]; let mut i = 0;

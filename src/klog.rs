@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Kernel event log: lock-free ring buffer for last N events.
 Used by panic handler and diagnostic tools.

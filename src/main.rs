@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 AETERNA Microkernel entry point.
 Boot sequence: hardware init → memory → scheduler → terminal.
@@ -14,7 +14,7 @@ mod terminal;
 mod version;
 mod installer;
 
-use core::arch::asm;
+use alloc::boxed::Box;
 use ospab_os::arch::x86_64::serial;
 use ospab_os::arch::x86_64::framebuffer;
 use ospab_os::klog;
@@ -31,418 +31,395 @@ pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     n
 }
 
-// ─── Colors for boot log output on framebuffer ───
-const COLOR_OK: u32     = 0x0000FF00;   // Green
-const COLOR_WARN: u32   = 0x0000FFFF;   // Yellow
-const COLOR_FAIL: u32   = 0x000000FF;   // Red
-const COLOR_WHITE: u32  = 0x00FFFFFF;
-const COLOR_GRAY: u32   = 0x00AAAAAA;
-const COLOR_BG: u32     = 0x00000000;
+// Boot log types and macros (macro_rules! must precede their use); the
+// output format is described with boot_line() at the end of this file.
 
-// Filesystem persistence sector
-const FS_SUPER_LBA: u64 = 2048;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status { Ok, Warn, Fail, Absent, Info }
 
+/// Fixed-size line buffer for `format_args!` without the heap. Overflow is truncated.
+struct LineBuf { buf: [u8; 160], len: usize }
+
+impl LineBuf {
+    const fn new() -> Self { LineBuf { buf: [0; 160], len: 0 } }
+    fn as_str(&self) -> &str {
+        match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => s,
+            // A multi-byte character was cut at the end: drop the partial tail.
+            Err(e) => core::str::from_utf8(&self.buf[..e.valid_up_to()]).unwrap_or(""),
+        }
+    }
+}
+
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// `boot_log!(Status::Ok, "Subject", "fmt", args..)`
+macro_rules! boot_log {
+    ($st:expr, $subject:expr) => { boot_line($st, $subject, "") };
+    ($st:expr, $subject:expr, $($arg:tt)+) => {{
+        let mut l = LineBuf::new();
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($arg)+));
+        boot_line($st, $subject, l.as_str())
+    }};
+}
+
+/// A `[TAG] message` detail line on serial only.
+macro_rules! serial_line {
+    ($($arg:tt)+) => {{
+        let mut l = LineBuf::new();
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($arg)+));
+        serial::write_str(l.as_str());
+        serial::write_str("\r\n");
+    }};
+}
+
+/// Kernel entry. Limine jumps here with every register zeroed; the ospab loaders
+/// pass BootInfo / magic / HHDM in RDI / RSI / RDX (arch/x86_64/boot/ospab_proto.rs).
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
+    // SAFETY: first thing on the boot CPU, before anything reads boot data.
+    unsafe { ospab_os::arch::x86_64::boot::early_init(boot_arg0, boot_arg1, boot_arg2) };
+
     // ══════════════════════════════════════════════
-    // Phase 0: Hardware initialization
+    // Phase 0: CPU and platform (arch/x86_64/init.rs)
     // ══════════════════════════════════════════════
     ospab_os::arch::x86_64::init();
-
-    // First serial messages
-    serial::write_str("\r\n");
-    serial::write_str("  AETERNA Microkernel ");
-    serial::write_str(version::VERSION_STR);
-    serial::write_str(" - ospab.os\r\n");
-    serial::write_str("  ====================================\r\n\r\n");
-
+    boot_banner();
     klog::boot("AETERNA started");
-    klog::boot("Hardware init complete");
 
-    // Boot log to framebuffer
-    boot_ok("Hardware init (SSE, GDT, IDT, PIC)");
-
-    // ══════════════════════════════════════════════
-    // Phase 1: Bootloader verification
-    // ══════════════════════════════════════════════
-    boot_pending("Limine protocol");
-    if ospab_os::arch::x86_64::boot::base_revision_supported() {
-        boot_ok("Limine protocol");
-        klog::boot("Limine protocol OK");
+    let mhz = ospab_os::arch::x86_64::tsc::mhz();
+    let apic = if ospab_os::arch::x86_64::apic::is_present() { ", APIC timer" } else { "" };
+    if mhz > 0 {
+        boot_log!(Status::Ok, "CPU", "GDT/TSS, IDT, PIC, PIT 100 Hz, TSC {} MHz{}", mhz, apic);
     } else {
-        boot_warn("Limine base revision mismatch");
-        klog::boot("Limine revision warning");
+        boot_log!(Status::Warn, "CPU", "TSC not calibrated, timing falls back to the 100 Hz PIT");
     }
 
-    boot_ok("Serial (COM1)");
-    boot_ok("Framebuffer");
-
-    // Log kernel load addresses (critical for DMA validation)
+    // ══════════════════════════════════════════════
+    // Phase 1: Boot loader hand-off
+    // ══════════════════════════════════════════════
+    let boot = &ospab_os::arch::x86_64::boot::loader_name;
+    if ospab_os::arch::x86_64::boot::base_revision_supported() {
+        boot_log!(Status::Ok, "Boot loader", "{}", boot());
+    } else {
+        boot_log!(Status::Warn, "Boot loader", "{}: base revision not supported", boot());
+    }
     {
         let phys = ospab_os::arch::x86_64::boot::kernel_phys_base();
         let virt = ospab_os::arch::x86_64::boot::kernel_virt_base();
-        serial::write_str("[AETERNA] Kernel phys base: 0x");
-        serial_hex64(phys);
-        serial::write_str(", virt base: 0x");
-        serial_hex64(virt);
-        serial::write_str("\r\n");
-        if phys != 0x200000 {
-            serial::write_str("[AETERNA] *** Kernel RELOCATED by Limine (not at 0x200000) ***\r\n");
-        }
+        serial_line!("[BOOT] Kernel at phys {:#x}, virt {:#x}", phys, virt);
+    }
+    match framebuffer::info() {
+        Some(fb) => boot_log!(Status::Ok, "Display", "{}x{}, {} bpp boot framebuffer", fb.width, fb.height, fb.bpp),
+        None     => boot_log!(Status::Warn, "Display", "no framebuffer: output on serial only"),
     }
 
     // ══════════════════════════════════════════════
-    // Phase 2: Memory subsystem
+    // Phase 2: Memory
     // ══════════════════════════════════════════════
-    boot_pending("Memory map");
-    if ospab_os::arch::x86_64::boot::memory_map().is_some() {
-        boot_ok("Memory map");
-        klog::memory("Memory map loaded");
-    } else {
-        boot_warn("Memory map unavailable");
+    if ospab_os::arch::x86_64::boot::memory_map().is_none() {
+        boot_log!(Status::Fail, "Memory map", "boot loader provided none");
     }
 
-    boot_pending("Physical memory manager");
+    boot_step("Physical memory");
     ospab_os::mm::physical::init();
     let stats = ospab_os::mm::physical::stats();
-    boot_ok("Physical memory manager");
-    klog::memory("Physical allocator ready");
-
-    boot_pending("Kernel heap");
+    boot_step("Kernel heap");
     ospab_os::mm::heap::init();
+    let pmm_ok = ospab_os::mm::physical::self_test();
+    boot_log!(if pmm_ok { Status::Ok } else { Status::Fail }, "Physical memory",
+        "{} MiB usable, {} regions{}", stats.usable_bytes >> 20, stats.region_count,
+        if pmm_ok { "" } else { ", SELF-TEST FAILED" });
+
     if ospab_os::mm::heap::is_initialized() {
-        let mib = ospab_os::mm::heap::heap_size() / (1024 * 1024);
-        if mib >= 128 {
-            boot_ok("Kernel heap (128 MiB)");
-        } else {
-            // Still OK, just less than ideal
-            boot_ok("Kernel heap (reduced)");
-        }
+        boot_log!(Status::Ok, "Kernel heap", "{} MiB", ospab_os::mm::heap::heap_size() >> 20);
         klog::memory("Heap allocator initialized");
     } else {
-        boot_fail("Kernel heap allocation failed");
+        boot_log!(Status::Fail, "Kernel heap", "allocation failed");
         klog::fault("Heap init failed");
     }
 
-    // ══════════════════════════════════════════════
-    // Phase 2.5: Virtual memory manager
-    // ══════════════════════════════════════════════
-    boot_pending("Virtual memory manager");
+    boot_step("Virtual memory");
     ospab_os::mm::r#virtual::init();
-    boot_ok("Virtual memory manager (4-level page tables)");
-    klog::memory("VMM initialized");
-
-    boot_pending("Deterministic Memory Fabric (MED)");
     ospab_os::mm::numa::init();
-    boot_ok("Memory Fabric: MEDs initialized");
+    boot_log!(Status::Ok, "Virtual memory", "4-level paging, {} memory domains",
+        ospab_os::mm::numa::get_med_info().len());
+
+    // ACPI tables (FADT, \_S5, reset register): needed for power-off and reboot
+    boot_step("ACPI");
+    if ospab_os::acpi::init() {
+        boot_log!(Status::Ok, "ACPI", "power-off and reset available");
+    } else {
+        boot_log!(Status::Warn, "ACPI", "tables not found: shutdown and reboot may not work");
+    }
 
     // ══════════════════════════════════════════════
     // Phase 2.8: PCI bus enumeration
     // ══════════════════════════════════════════════
-    boot_pending("PCI bus enumeration");
+    boot_step("PCI");
     let pci_count = ospab_os::pci::enumerate();
     ospab_os::pci::print_devices();
     if pci_count > 0 {
-        boot_ok("PCI bus enumeration");
-        klog::boot("PCI devices enumerated");
+        boot_log!(Status::Ok, "PCI", "{} devices", pci_count);
     } else {
-        boot_warn("PCI: no devices found");
+        boot_log!(Status::Warn, "PCI", "no devices found");
     }
 
     // ══════════════════════════════════════════════
     // Phase 3: Kernel services
     // ══════════════════════════════════════════════
-    boot_pending("Scheduler");
+    boot_step("Scheduler");
     ospab_os::core::scheduler::init();
-    boot_ok("Scheduler (Compute-First)");
-    klog::boot("Scheduler ready");
-
-    boot_ok("Syscall interface");
     ospab_os::core::syscall::init_syscall_msr();
-    boot_ok("Syscall MSRs (LSTAR, STAR, FMASK)");
-    boot_ok("Kernel event log");
+    let (smep, smap) = ospab_os::mm::usercopy::init();
+    let nx = ospab_os::mm::r#virtual::enable_nx();
+    boot_log!(Status::Ok, "Scheduler", "preemptive, ring 3 via SYSCALL/SYSRET");
+    let on = |b: bool| if b { "on" } else { "off" };
+    boot_log!(if nx { Status::Ok } else { Status::Warn }, "Memory protection",
+        "NX {}, SMEP {}, SMAP {}", on(nx), on(smep), on(smap));
 
     // ══════════════════════════════════════════════
-    // Phase 3.2: Virtual Filesystem + RamFS
+    // Phase 3.2: Virtual Filesystem + RamFS + CowFS
     // ══════════════════════════════════════════════
-    boot_pending("Virtual filesystem");
+    boot_step("Root filesystem");
     ospab_os::fs::init();
-    ospab_os::fs::ramfs::init();
-    // Mount CoW root filesystem
-    // For now, base = ramfs (read-only), upper = ramfs (read-write overlay).
-    // In Phase 6, base will be AeternaFS (NVMe).
-    let cow_root = ospab_os::fs::cow::init(
-        ospab_os::fs::ramfs::instance(), // Base
-        ospab_os::fs::ramfs::instance()  // Upper (RamFS handles multiple paths fine)
-    );
+
+    // Base layer: read-only system files. Upper layer: writable overlay that is persisted.
+    let base_ramfs = Box::leak(Box::new(ospab_os::fs::ramfs::RamFs::with_defaults()));
+    base_ramfs.is_readonly = true;
+    let upper_ramfs = Box::leak(Box::new(ospab_os::fs::ramfs::RamFs::new()));
+    ospab_os::fs::set_syncable_fs(upper_ramfs);
+
+    let cow_root = Box::leak(Box::new(ospab_os::fs::cow::CowFs::new(base_ramfs, upper_ramfs)));
     ospab_os::fs::mount("/", cow_root);
     ospab_os::fs::mount("/proc", ospab_os::fs::procfs::instance());
-
-    let node_count = ospab_os::fs::ramfs::node_count();
-    boot_ok("VFS + CowFS (RamFS+RamFS overlay) mounted at /");
-    boot_ok("ProcFs mounted at /proc");
-    klog::boot("VFS ready");
-    serial::write_str("  RamFS: ");
-    serial_u32(node_count as u32);
-    serial::write_str(" nodes populated\r\n");
+    boot_log!(Status::Ok, "Root filesystem", "RAM overlay, {} system files, /proc", base_ramfs.node_count());
 
     // ══════════════════════════════════════════════
     // Phase 3.5: Storage (ATA PIO + AHCI SATA)
     // ══════════════════════════════════════════════
-    boot_pending("Storage subsystem");
+    boot_step("Storage");
     let disk_count = ospab_os::drivers::init();
     if disk_count > 0 {
-        boot_ok("Storage subsystem");
-        klog::boot("Storage drivers ready");
-        // Log found drives
+        boot_log!(Status::Ok, "Storage", "{} disk(s)", disk_count);
         for i in 0..disk_count {
             if let Some(d) = ospab_os::drivers::disk_info(i) {
-                let model = ospab_os::drivers::model_str(d);
-                serial::write_str("  Disk ");
-                serial_u32(i as u32);
-                serial::write_str(": ");
-                serial::write_str(model);
-                serial::write_str(" (");
-                serial_u32(d.size_mb as u32);
-                serial::write_str(" MiB)\r\n");
+                boot_log!(Status::Info, "Disk", "{}: {}, {} MiB", i, ospab_os::drivers::model_str(d), d.size_mb);
             }
         }
 
-        // ── Superblock inspection: dump sector 2048 header ──
-        let mut lba_buf = [0u8; 512];
-        let mut super_ok = false;
-        if let Some(disk_idx) = ospab_os::fs::disk_sync::primary_disk_index() {
-            if ospab_os::drivers::read(disk_idx, FS_SUPER_LBA, 1, &mut lba_buf) {
-                let mut sb = [0u8; 8];
-                sb.copy_from_slice(&lba_buf[..8]);
-                let super_magic = u64::from_le_bytes(sb);
-                super_ok = super_magic == ospab_os::fs::disk_sync::SUPER_MAGIC;
-
-                serial::write_str("  [DISK] LBA 2048 super=0x");
-                serial_hex64(super_magic);
-                serial::write_str("\r\n");
-                serial::write_str("  [DISK] LBA2048 bytes[0..64]: ");
-                for i in 0..64 {
-                    serial_hex8(lba_buf[i]);
-                    serial::write_byte(b' ');
+        // Restore the writable layer saved by `sync` (vfs/disk_sync.rs decides where it lives)
+        boot_step("Persistence");
+        let target = ospab_os::fs::disk_sync::primary_disk_index()
+            .and_then(|i| ospab_os::fs::disk_sync::base_lba(i).map(|lba| (i, lba)));
+        match target {
+            None => boot_log!(Status::Info, "Persistence",
+                "no AETERNA partition: changes stay in RAM"),
+            Some((disk, lba)) => {
+                serial_line!("[FS] Persistence area: disk {}, LBA {}", disk, lba);
+                let restored = ospab_os::fs::disk_sync::read_from_disk().and_then(|data| {
+                    let bytes = data.len();
+                    ospab_os::fs::disk_sync::deserialize_ramfs(&data).map(|tree| (tree, bytes))
+                });
+                match restored {
+                    Some((tree, bytes)) => {
+                        upper_ramfs.restore_from_tree(tree);
+                        boot_log!(Status::Ok, "Persistence", "restored {} files ({} bytes) from disk {}",
+                            upper_ramfs.node_count(), bytes, disk);
+                        klog::boot("Filesystem restored from disk");
+                    }
+                    None => boot_log!(Status::Info, "Persistence",
+                        "disk {}: nothing saved yet, `sync` writes it", disk),
                 }
-                serial::write_str("\r\n");
-
-                if !super_ok {
-                    boot_warn("Filesystem superblock missing or corrupt");
-                }
-            } else {
-                boot_warn("Disk read failed for superblock");
-            }
-        } else {
-            boot_warn("No persistence disk available");
-        }
-        
-        // ── Boot recovery: try to restore RamFS from disk ──
-        boot_pending("Filesystem recovery");
-        let mut fs_recovered = false;
-        if let Some(fs_data) = ospab_os::fs::disk_sync::read_from_disk() {
-            let data_bytes = fs_data.len();
-            if let Some(tree) = ospab_os::fs::disk_sync::deserialize_ramfs(&fs_data) {
-                ospab_os::fs::ramfs::restore_from_tree(tree);
-                let restored_count = ospab_os::fs::ramfs::node_count();
-                fs_recovered = true;
-
-                // Visual feedback on framebuffer
-                boot_ok("Filesystem recovery");
-                boot_info_recovery(restored_count, data_bytes);
-
-                serial::write_str("  Restored RamFS: ");
-                serial_u32(restored_count as u32);
-                serial::write_str(" nodes, ");
-                serial_u32(data_bytes as u32);
-                serial::write_str(" bytes\r\n");
             }
         }
-        if !fs_recovered {
-            serial::write_str("[FS] No persisted FS found, creating new\r\n");
-            boot_warn_new_fs();
-        }
-
-        boot_ok("Disk persistence: deferred sync enabled");
     } else {
-        boot_warn("Storage: no drives found (ATA/AHCI)");
-        klog::boot("No storage devices");
+        boot_log!(Status::Absent, "Storage", "no ATA/AHCI disks");
     }
 
     // ══════════════════════════════════════════════
-    // Phase 3.4: GPU / Display acceleration
-    //   Wrapped in driver registry for fault isolation.
+    // Phase 3.4: Optional devices
     // ══════════════════════════════════════════════
-    boot_pending("GPU / Display acceleration");
+    boot_step("GPU");
     if ospab_os::drivers::registry::try_init_driver("GPU (VMware SVGA II)", || {
         ospab_os::drivers::gpu::init()
     }) {
-        boot_ok("GPU: VMware SVGA II + VMMouse initialized");
-        klog::boot("GPU ready");
+        boot_log!(Status::Ok, "GPU", "VMware SVGA II, VMMouse");
     } else {
-        boot_warn("GPU: no accelerated display found (VMware SVGA II not present)");
-        klog::boot("GPU not available");
+        boot_log!(Status::Absent, "GPU", "no VMware SVGA II, using the boot framebuffer");
     }
 
-    // ══════════════════════════════════════════════
-    // Phase 3.5: Audio subsystem (Intel HDA)
-    //   Wrapped in driver registry for fault isolation.
-    // ══════════════════════════════════════════════
-    boot_pending("Audio subsystem");
-    if ospab_os::drivers::registry::try_init_driver("Audio (Intel HDA)", || {
+    boot_step("Audio");
+    if ospab_os::drivers::registry::try_init_driver("Audio", || {
         ospab_os::drivers::audio::init()
     }) {
-        boot_ok("Audio subsystem (Intel HDA, 44100Hz/16-bit/2ch)");
-        klog::boot("HDA audio initialized");
+        boot_log!(Status::Ok, "Audio", "{}, {} Hz, 16-bit stereo",
+            ospab_os::drivers::audio::active_driver_name(), ospab_os::drivers::audio::sample_rate());
     } else {
-        boot_warn("Audio: no HDA controller found (add -device intel-hda,id=sound0 -device hda-duplex,bus=sound0.0 to QEMU)");
-        klog::boot("Audio not available");
+        boot_log!(Status::Absent, "Audio", "no supported card (HDA, AC97, ES1371/ES1370)");
     }
 
-    // ══════════════════════════════════════════════
-    // Phase 3.6: NVMe SSD + GPT + DevFS + AeternaFS
-    //   Wrapped in driver registry for fault isolation.
-    // ══════════════════════════════════════════════
-    boot_pending("NVMe storage");
+    boot_step("NVMe");
     if ospab_os::drivers::registry::try_init_driver("NVMe SSD", || {
         ospab_os::drivers::nvme::probe_and_init()
     }) {
-        // Build a NvmeDisk wrapper and try to parse GPT
         let mut nvme_disk = ospab_os::drivers::block::NvmeDisk::new();
         let gpt_parts = ospab_os::drivers::gpt::parse(&mut nvme_disk).unwrap_or(0);
-
-        // Register /dev/nvme0n1 and /dev/nvme0n1pN entries in VFS
         ospab_os::drivers::block::register_devices();
 
         if gpt_parts > 0 {
-            let mut msg = [0u8; 60];
-            let mut pos = 0;
-            for b in b"NVMe SSD + GPT (" { msg[pos] = *b; pos += 1; }
-            let mut p = gpt_parts;
-            if p >= 10 { msg[pos] = b'0' + (p / 10) as u8; pos += 1; }
-            msg[pos] = b'0' + (p % 10) as u8; pos += 1;
-            for b in b" partitions)" { if pos < 58 { msg[pos] = *b; pos += 1; } }
-            if let Ok(s) = core::str::from_utf8(&msg[..pos]) {
-                boot_ok(s);
-            } else {
-                boot_ok("NVMe SSD + GPT");
-            }
-            klog::boot("NVMe + GPT initialized");
-
-            // Try to auto-mount first AeternaFS partition at /mnt/target
+            boot_log!(Status::Ok, "NVMe", "{} GPT partitions", gpt_parts);
+            // Auto-mount the first AeternaFS partition at /mnt/target
             for pi in 0..gpt_parts {
                 if let Some(part) = ospab_os::drivers::gpt::get_partition(pi) {
                     let ss = ospab_os::drivers::nvme::sector_size();
                     if ospab_os::fs::aeternafs::mount_nvme_partition(part.start_lba, ss) {
-                        ospab_os::fs::mount("/mnt/target",
-                            ospab_os::fs::aeternafs::instance());
-                        serial::write_str("  [AeternaFS] Auto-mounted partition ");
-                        serial::write_byte(b'0' + pi as u8);
-                        serial::write_str(" at /mnt/target\r\n");
+                        ospab_os::fs::mount("/mnt/target", ospab_os::fs::aeternafs::instance());
+                        boot_log!(Status::Info, "NVMe", "AeternaFS partition {} mounted at /mnt/target", pi);
                         break;
                     }
                 }
             }
         } else {
-            boot_ok("NVMe SSD (no GPT — run `fdisk -l` then `mkfs`)");
-            klog::boot("NVMe initialized, no GPT");
+            boot_log!(Status::Ok, "NVMe", "no partition table (use `fdisk`, then `mkfs`)");
         }
     } else {
-        boot_warn("NVMe: no NVMe controller found");
-        klog::boot("NVMe not available");
+        boot_log!(Status::Absent, "NVMe", "no controller");
     }
 
-    // ══════════════════════════════════════════════
-    // Phase 3.7: /sys virtual filesystem nodes
-    // ══════════════════════════════════════════════
-    boot_pending("/sys VFS nodes");
+    // /sys/status: boot-time task snapshot (`ps` refreshes it); /dev/audio: writes go to the sound card
     ospab_os::fs::mkdir("/sys");
-    // Write initial /sys/status with boot-time process snapshot.
-    // The terminal `ps` command calls refresh_sys_status() to keep it current.
     refresh_sys_status();
-    boot_ok("/sys/status ready");
-    klog::boot("/sys/status populated");
-
-    // Create /dev tree — /dev/audio is a virtual device file (writes go to HDA)
     ospab_os::fs::mkdir("/dev");
-    ospab_os::fs::write_file("/dev/audio", b""); // placeholder; writes intercepted in VFS layer
+    ospab_os::fs::write_file("/dev/audio", b"");
 
     // ══════════════════════════════════════════════
     // Phase 4: Network (optional — continues if no NIC)
     // ══════════════════════════════════════════════
-    boot_pending("Network stack");
+    boot_step("Network");
     if ospab_os::net::init() {
+        let ip = unsafe { ospab_os::net::OUR_IP };
         let nic = ospab_os::net::nic_name();
-        let mut msg = [0u8; 40];
-        let mut pos = 0;
-        for b in b"Network stack (" { msg[pos] = *b; pos += 1; }
-        for b in nic.as_bytes() { if pos < 38 { msg[pos] = *b; pos += 1; } }
-        msg[pos] = b')'; pos += 1;
-        if let Ok(s) = core::str::from_utf8(&msg[..pos]) {
-            boot_ok(s);
+        if ip[0] == 169 && ip[1] == 254 {
+            boot_log!(Status::Warn, "Network", "{}: DHCP failed, link-local {}.{}.{}.{}", nic, ip[0], ip[1], ip[2], ip[3]);
         } else {
-            boot_ok("Network stack");
+            boot_log!(Status::Ok, "Network", "{}, {}.{}.{}.{} via DHCP", nic, ip[0], ip[1], ip[2], ip[3]);
         }
         klog::boot("Network initialized");
-
-        klog::boot("Network initialized");
-
-        // ── Init system ──
-        boot_step("Init system (seed)");
     } else {
-        boot_warn("Network: no supported NIC found");
-        klog::boot("Network not available");
-        // Still run PCI scan diagnostic so we see what hardware exists
+        boot_log!(Status::Absent, "Network", "no supported network card");
+        // List what is there so an unsupported NIC is visible on serial
         ospab_os::net::diag::dump_pci_nics();
     }
 
     // ══════════════════════════════════════════════
-    // Phase 4.5: Userland initialization
+    // Phase 4.5: Userland
     // ══════════════════════════════════════════════
-    boot_pending("Init system (seed)");
     ospab_os::userspace::seed::init();
-    boot_ok("Init system (seed) — services registered");
-    klog::boot("seed init ready");
-
-    boot_pending("Shell (plum)");
     ospab_os::plum::init();
-    boot_ok("Shell (plum) — env + aliases loaded");
-    klog::boot("plum shell ready");
+    boot_log!(Status::Ok, "Shell", "plum");
 
     // ══════════════════════════════════════════════
-    // Phase 5: Terminal or Installer (cmdline-selected)
+    // Phase 5: Installer or console (cmdline `mode=`)
     // ══════════════════════════════════════════════
     let boot_mode = ospab_os::arch::x86_64::boot::cmdline_get("mode");
-    serial::write_str("[BOOT] mode=");
-    serial::write_str(boot_mode);
-    serial::write_str("\r\n");
+    serial_line!("[BOOT] mode={}", boot_mode);
 
     if boot_mode == "installer" {
-        serial::write_str("[BOOT] Launching installer (mode=installer)\r\n");
-        boot_ok("Launching installer");
+        boot_log!(Status::Ok, "Installer", "starting");
         klog::boot("Entering installer");
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
         crate::installer::run();
-        loop { unsafe { core::arch::asm!("hlt"); } }
+        // Leaving the installer drops to the normal console.
+        framebuffer::clear(COLOR_BG);
     } else {
-        // ── Milestone 1: ring-3 smoke test ──
-        // Spawn a tiny ring-3 task (getpid → exit(pid)). It runs on the next
-        // preemption tick; success is observable on serial as `[SYSCALL] exit(<pid>)`
-        // followed by the terminal coming up normally — proving the full
-        // ring0→ring3→syscall→ring0 round trip.
-        serial::write_str("[BOOT] Launching ring-3 smoke test\r\n");
-        if let Some(pid) = ospab_os::arch::x86_64::ring::launch_ring3_smoke_test() {
-            // Block until the ring-3 task exits, then confirm the kernel regained
-            // control — this proves the full round trip resumed cleanly.
-            ospab_os::core::scheduler::wait_pid(pid);
-            serial::write_str("[BOOT] Ring-3 smoke test completed; kernel alive and resumed\r\n");
-        }
-
-        boot_ok("Console ready");
-        klog::boot("Entering terminal");
+        ring3_self_test();
+        boot_log!(Status::Ok, "Console", "ready");
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
-        terminal::run();
+    }
+    klog::boot("Entering terminal");
+    terminal::run();
+}
+
+/// Run the boot-time ring-3 programs and check their exit codes and that every
+/// frame they used came back. One status line; details go to serial as [RING3].
+fn ring3_self_test() {
+    use ospab_os::arch::x86_64::ring;
+    use ospab_os::core::scheduler::wait_pid;
+
+    boot_step("Ring 3 self-test");
+    let frames_before = ospab_os::mm::physical::frames_free();
+    let mut passed = 0u32;
+    let mut failed: [&str; 5] = [""; 5];
+    let mut nfailed = 0usize;
+    let mut check = |name: &'static str, ok: bool| {
+        serial_line!("[RING3] {}: {}", name, if ok { "pass" } else { "FAIL" });
+        if ok { passed += 1 } else if nfailed < failed.len() { failed[nfailed] = name; nfailed += 1; }
+    };
+
+    // getpid → exit(pid): the full ring0 → ring3 → syscall → ring0 round trip
+    match ring::launch_ring3_smoke_test() {
+        Some(pid) => check("smoke", wait_pid(pid) == Some(pid as i64)),
+        None => check("smoke", false),
+    }
+    // Two tasks at once, one blocking in a syscall: per-task kernel stacks, FPU/SSE switching.
+    // Each exits with its pid, or 0xBAD.
+    match ring::launch_ring3_stress_test() {
+        Some((a, b)) => {
+            let ok = wait_pid(a) == Some(a as i64) && wait_pid(b) == Some(b as i64);
+            serial_line!("[RING3] ring3<->ring3 switches: {}",
+                ospab_os::core::scheduler::USER_TO_USER_SWITCHES.load(core::sync::atomic::Ordering::Relaxed));
+            check("stress", ok);
+        }
+        None => check("stress", false),
+    }
+    // Bad user pointers rejected, mmap/munmap working: exits 0x600D
+    match ring::launch_ring3_usercopy_test() {
+        Some(pid) => check("usercopy", wait_pid(pid) == Some(0x600D)),
+        None => check("usercopy", false),
+    }
+    // First real program: an ELF built with liboos (user/hello), exits 0
+    #[cfg(user_hello)]
+    {
+        static HELLO: &[u8] = include_bytes!(env!("OOS_USER_HELLO"));
+        match ospab_os::core::elf::spawn(
+            "hello",
+            HELLO,
+            &["hello", "from", "AETERNA"],
+            alloc::vec![ospab_os::core::scheduler::Capability::Serial],
+        ) {
+            Ok(pid) => check("hello (ELF)", wait_pid(pid) == Some(0)),
+            Err(e) => {
+                serial_line!("[RING3] ELF load failed: {}", e.as_str());
+                check("hello (ELF)", false);
+            }
+        }
+    }
+
+    // Dead tasks are reaped lazily by the scheduler; give it a few ticks, then every
+    // frame the tests used (kernel stacks, page tables, stacks, mmap) must be back.
+    for _ in 0..10 {
+        ospab_os::core::scheduler::sys_yield();
+    }
+    let leaked = frames_before.saturating_sub(ospab_os::mm::physical::frames_free());
+    check("no frame leak", leaked == 0);
+
+    if nfailed == 0 {
+        boot_log!(Status::Ok, "Ring 3 self-test", "{} checks passed", passed);
+    } else {
+        let mut list = LineBuf::new();
+        for (i, name) in failed[..nfailed].iter().enumerate() {
+            let _ = core::fmt::Write::write_str(&mut list, if i == 0 { "" } else { ", " });
+            let _ = core::fmt::Write::write_str(&mut list, name);
+        }
+        boot_log!(Status::Fail, "Ring 3 self-test", "failed: {}", list.as_str());
     }
 }
 
@@ -500,86 +477,84 @@ fn refresh_sys_status() {
     ospab_os::fs::write_file("/sys/status", &out);
 }
 
-// ─── Boot log helpers: write to both serial and framebuffer ───
+// ─── Boot log ────────────────────────────────────────────────────────────────
+//
+// Every boot step reports exactly one status line, identical on serial and screen:
+//
+//   [  OK  ] Subject: detail     the step worked
+//   [ WARN ] Subject: detail     works, but degraded
+//   [ FAIL ] Subject: detail     broken
+//   [  --  ] Subject: detail     optional hardware not present
+//   [ INFO ] Subject: detail     a fact worth seeing
+//
+// Serial also gets `[ .... ] Subject` when a step starts, so a hang shows where it stopped.
+// Drivers and subsystems log their own details to serial as `[TAG] message`.
+// Formatting uses a stack buffer: the first lines are printed before the heap exists.
 
-fn boot_ok(msg: &str) {
-    serial::write_str("[  OK  ] ");
-    serial::write_str(msg);
-    serial::write_str("\r\n");
+const COLOR_OK: u32    = 0x0000D000;
+const COLOR_WARN: u32  = 0x00FFD000;
+const COLOR_FAIL: u32  = 0x00FF4040;
+const COLOR_INFO: u32  = 0x0040C0FF;
+const COLOR_DIM: u32   = 0x00888888;
+const COLOR_WHITE: u32 = 0x00FFFFFF;
+const COLOR_BG: u32    = 0x00000000;
 
+
+fn boot_banner() {
+    serial::write_str("\r\n[BOOT] ospab.os ");
+    serial::write_str(version::VERSION_STR);
+    serial::write_str(", AETERNA kernel\r\n");
     if framebuffer::is_initialized() {
-        framebuffer::draw_string("[  ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string("OK", COLOR_OK, COLOR_BG);
-        framebuffer::draw_string("  ] ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string(msg, COLOR_WHITE, COLOR_BG);
-        framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+        framebuffer::draw_string("ospab.os ", COLOR_WHITE, COLOR_BG);
+        framebuffer::draw_string(version::VERSION_STR, COLOR_WHITE, COLOR_BG);
+        framebuffer::draw_string("  AETERNA kernel\n\n", COLOR_DIM, COLOR_BG);
     }
 }
 
-fn boot_pending(msg: &str) {
+fn boot_step(subject: &str) {
     serial::write_str("[ .... ] ");
-    serial::write_str(msg);
+    serial::write_str(subject);
     serial::write_str("\r\n");
-    // Don't show pending on framebuffer — only final status
 }
 
-fn boot_warn(msg: &str) {
-    serial::write_str("[ WARN ] ");
-    serial::write_str(msg);
-    serial::write_str("\r\n");
+fn boot_line(st: Status, subject: &str, detail: &str) {
+    let (tag, color) = match st {
+        Status::Ok     => ("  OK  ", COLOR_OK),
+        Status::Warn   => (" WARN ", COLOR_WARN),
+        Status::Fail   => (" FAIL ", COLOR_FAIL),
+        Status::Absent => ("  --  ", COLOR_DIM),
+        Status::Info   => (" INFO ", COLOR_INFO),
+    };
+
+    let mut l = LineBuf::new();
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("[{}] {}{}{}\r\n",
+        tag, subject, if detail.is_empty() { "" } else { ": " }, detail));
+    serial::write_str(l.as_str());
 
     if framebuffer::is_initialized() {
-        framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string("WARN", COLOR_WARN, COLOR_BG);
-        framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string(msg, COLOR_WARN, COLOR_BG);
+        framebuffer::draw_string("[", COLOR_DIM, COLOR_BG);
+        framebuffer::draw_string(tag, color, COLOR_BG);
+        framebuffer::draw_string("] ", COLOR_DIM, COLOR_BG);
+        framebuffer::draw_string(subject, if st == Status::Absent { COLOR_DIM } else { COLOR_WHITE }, COLOR_BG);
+        if !detail.is_empty() {
+            framebuffer::draw_string(": ", COLOR_DIM, COLOR_BG);
+            let detail_color = match st {
+                Status::Warn | Status::Fail => color,
+                _ => COLOR_DIM,
+            };
+            framebuffer::draw_string(detail, detail_color, COLOR_BG);
+        }
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+    }
+
+    match st {
+        Status::Fail => klog::fault(subject),
+        Status::Warn => klog::boot(subject),
+        _ => {}
     }
 }
 
-fn boot_fail(msg: &str) {
-    serial::write_str("[ FAIL ] ");
-    serial::write_str(msg);
-    serial::write_str("\r\n");
-
-    if framebuffer::is_initialized() {
-        framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string("FAIL", COLOR_FAIL, COLOR_BG);
-        framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
-        framebuffer::draw_string(msg, COLOR_FAIL, COLOR_BG);
-        framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
-    }
-}
-
-/// Display [INFO] recovery message with node count and byte count on framebuffer
-fn boot_info_recovery(node_count: usize, byte_count: usize) {
-    if !framebuffer::is_initialized() { return; }
-
-    // Format: [INFO] Root filesystem mounted from disk. N nodes, B bytes recovered.
-    framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
-    framebuffer::draw_string("INFO", COLOR_OK, COLOR_BG); // Not OK, but maybe cyan? Using OK color for now to preserve semantics.
-    framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
-    framebuffer::draw_string("Root filesystem mounted from disk. ", COLOR_WHITE, COLOR_BG);
-    framebuffer::draw_string(&dec_str(node_count as u64), COLOR_OK, COLOR_BG);
-    framebuffer::draw_string(" nodes, ", COLOR_WHITE, COLOR_BG);
-    framebuffer::draw_string(&dec_str(byte_count as u64), COLOR_OK, COLOR_BG);
-    framebuffer::draw_string(" bytes recovered.", COLOR_WHITE, COLOR_BG);
-    framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
-}
-
-/// Display [WARN] when no filesystem found on disk
-fn boot_warn_new_fs() {
-    serial::write_str("[ WARN ] No filesystem found on disk. Creating new.\r\n");
-    if !framebuffer::is_initialized() { return; }
-
-    framebuffer::draw_string("[ ", COLOR_GRAY, COLOR_BG);
-    framebuffer::draw_string("WARN", COLOR_WARN, COLOR_BG);
-    framebuffer::draw_string(" ] ", COLOR_GRAY, COLOR_BG);
-    framebuffer::draw_string("No filesystem found on disk. Creating new.", COLOR_WARN, COLOR_BG);
-    framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
-}
-
-/// Format a u64 into a decimal string (for framebuffer output)
+/// Format a u64 into a decimal string (for /sys/status)
 fn dec_str(mut n: u64) -> alloc::string::String {
     if n == 0 { return alloc::string::String::from("0"); }
     let mut buf = [0u8; 20];
@@ -590,46 +565,4 @@ fn dec_str(mut n: u64) -> alloc::string::String {
         n /= 10;
     }
     alloc::string::String::from(core::str::from_utf8(&buf[pos..]).unwrap_or("0"))
-}
-
-/// Write a u32 decimal number to serial
-fn serial_u32(mut n: u32) {
-    if n == 0 { serial::write_byte(b'0'); return; }
-    let mut buf = [0u8; 10];
-    let mut pos = 0;
-    while n > 0 {
-        buf[pos] = b'0' + (n % 10) as u8;
-        n /= 10;
-        pos += 1;
-    }
-    for i in (0..pos).rev() {
-        serial::write_byte(buf[i]);
-    }
-}
-
-fn serial_hex16(v: u16) {
-    let hex = b"0123456789ABCDEF";
-    for i in (0..4).rev() {
-        serial::write_byte(hex[((v >> (i * 4)) & 0xF) as usize]);
-    }
-}
-
-fn serial_hex32(v: u32) {
-    let hex = b"0123456789ABCDEF";
-    for i in (0..8).rev() {
-        serial::write_byte(hex[((v >> (i * 4)) & 0xF) as usize]);
-    }
-}
-
-fn serial_hex64(v: u64) {
-    let hex = b"0123456789ABCDEF";
-    for i in (0..16).rev() {
-        serial::write_byte(hex[((v >> (i * 4)) & 0xF) as usize]);
-    }
-}
-
-fn serial_hex8(v: u8) {
-    let hex = b"0123456789ABCDEF";
-    serial::write_byte(hex[(v >> 4) as usize]);
-    serial::write_byte(hex[(v & 0xF) as usize]);
 }

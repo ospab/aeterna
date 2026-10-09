@@ -8,7 +8,6 @@
 extern crate alloc;
 use alloc::format;
 
-use crate::arch::x86_64::framebuffer;
 
 const FG: u32    = 0x00FFFFFF;
 const FG_OK: u32 = 0x0000FF00;
@@ -17,18 +16,18 @@ const FG_DIM: u32 = 0x00AAAAAA;
 const FG_HL: u32  = 0x00FFCC00;
 const BG: u32    = 0x00000000;
 
-fn puts(s: &str)  { framebuffer::draw_string(s, FG, BG); }
-fn ok(s: &str)    { framebuffer::draw_string(s, FG_OK, BG); }
-fn err(s: &str)   { framebuffer::draw_string(s, FG_ERR, BG); }
-fn dim(s: &str)   { framebuffer::draw_string(s, FG_DIM, BG); }
-fn hl(s: &str)    { framebuffer::draw_string(s, FG_HL, BG); }
+fn puts(s: &str)  { crate::userspace::plum::io::out_c(s, FG); }
+fn ok(s: &str)    { crate::userspace::plum::io::out_c(s, FG_OK); }
+fn err(s: &str)   { crate::userspace::plum::io::err(s); }
+fn dim(s: &str)   { crate::userspace::plum::io::out_c(s, FG_DIM); }
+fn hl(s: &str)    { crate::userspace::plum::io::out_c(s, FG_HL); }
 
 fn put_usize(mut n: usize) {
     if n == 0 { puts("0"); return; }
     let mut buf = [0u8; 20];
     let mut i = 0;
     while n > 0 { buf[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-    for k in (0..i).rev() { framebuffer::draw_char(buf[k] as char, FG, BG); }
+    for k in (0..i).rev() { { let mut cb = [0u8; 4]; crate::userspace::plum::io::out_c((buf[k] as char).encode_utf8(&mut cb), FG); }; }
 }
 
 // ─── ps ─────────────────────────────────────────────────────────────────────
@@ -63,7 +62,7 @@ pub fn cmd_ps(_args: &str) {
         };
         match t.state {
             TaskState::Running => ok(st),
-            TaskState::Dead    => err(st),
+            TaskState::Dead    => crate::userspace::plum::io::out_c(st, FG_ERR),
             _                  => dim(st),
         }
         puts("      ");
@@ -121,7 +120,7 @@ pub fn cmd_top(_args: &str) {
         };
         match t.state {
             TaskState::Running => ok(st),
-            TaskState::Dead    => err(st),
+            TaskState::Dead    => crate::userspace::plum::io::out_c(st, FG_ERR),
             _                  => dim(st),
         }
         puts("  ");

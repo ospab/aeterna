@@ -1,0 +1,9 @@
+[package]
+name = "hello"
+description = "First ospab.os user program: proves the ELF loader, liboos and the heap work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

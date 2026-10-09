@@ -338,7 +338,7 @@ pub fn send_packet(data: &[u8], len: usize) {
 
         // Wait until NIC releases this descriptor
         let mut timeout = 500000u32;
-        while d.flags & DESC_OWN != 0 && timeout > 0 {
+        while core::ptr::read_volatile(core::ptr::addr_of!(d.flags)) & DESC_OWN != 0 && timeout > 0 {
             timeout -= 1;
             core::arch::asm!("pause");
         }
@@ -375,9 +375,10 @@ pub fn receive_packet() -> Option<(&'static [u8], usize)> {
         let d = &mut RX_DESCS.0[idx];
 
         // If OWN bit set, NIC still owns this descriptor
-        if d.flags & DESC_OWN != 0 { return None; }
+        let flags = core::ptr::read_volatile(core::ptr::addr_of!(d.flags));
+        if flags & DESC_OWN != 0 { return None; }
 
-        let len = (d.flags & DESC_LEN_MASK) as usize;
+        let len = (flags & DESC_LEN_MASK) as usize;
         if len < 14 || len > BUF_SIZE {
             // Bad — give back to NIC
             let is_last = idx == RX_RING - 1;

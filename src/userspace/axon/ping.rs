@@ -104,12 +104,17 @@ fn parse_args<'a>(args: &'a str) -> Option<PingConfig<'a>> {
     // Parse IP address
     let ip = match parse_ip(target) {
         Some(ip) => ip,
-        None => {
-            err("ping: invalid address: ");
-            err(target);
-            err("\n");
-            return None;
-        }
+        None => match crate::userspace::net::resolver::resolve_host(target) {
+            Ok(ip) => ip,
+            Err(e) => {
+                err("ping: cannot resolve ");
+                err(target);
+                err(": ");
+                err(e.as_str());
+                err("\n");
+                return None;
+            }
+        },
     };
 
     Some(PingConfig { target, ip, count, interval_us, payload, timeout_us })
@@ -206,10 +211,8 @@ fn isqrt(n: u64) -> u64 {
 }
 
 fn check_ctrl_c() -> bool {
-    while let Some(ch) = crate::arch::x86_64::keyboard::try_read_key() {
-        if ch == '\x03' { return true; }
-    }
-    false
+    // Ctrl+C is flagged by the keyboard IRQ (shared API; the shell clears it)
+    crate::arch::x86_64::keyboard::interrupt_pending()
 }
 
 // ─── Format helpers ───────────────────────────────────────────────────────────
@@ -274,8 +277,8 @@ pub fn run(args: &str) {
 
     // Header:  PING 10.0.2.2 (10.0.2.2) 56(84) bytes of data.
     let total_ip = 20 + 8 + cfg.payload; // IP + ICMP hdr + payload
-    puts(&format!("PING {} ({}) {}({}) bytes of data.\n",
-        cfg.target, cfg.target, cfg.payload, total_ip));
+    puts(&format!("PING {} ({}.{}.{}.{}) {}({}) bytes of data.\n",
+        cfg.target, cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3], cfg.payload, total_ip));
 
     let mut sent: u64     = 0;
     let mut received: u64 = 0;
@@ -334,8 +337,9 @@ pub fn run(args: &str) {
 
                 let mut buf = [0u8; 32];
                 let ms_str = fmt_rtt_us(rtt, &mut buf);
-                puts(&format!("{} bytes from {}: icmp_seq={} ttl={} time={} ms\n",
-                    r.nbytes, cfg.target, seq, r.ttl, ms_str));
+                puts(&format!("{} bytes from {}.{}.{}.{}: icmp_seq={} ttl={} time={} ms\n",
+                    r.nbytes, r.src_ip[0], r.src_ip[1], r.src_ip[2], r.src_ip[3],
+                    r.seq, r.ttl, ms_str));
             }
             None => {
                 err(&format!("Request timeout for icmp_seq {}\n", seq));

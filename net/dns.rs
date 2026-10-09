@@ -154,18 +154,34 @@ fn skip_name(data: &[u8], mut pos: usize) -> usize {
     }
 }
 
-// ─── Parse DNS response — find first A record ───────────────────────────
-fn parse_response(data: &[u8], expected_id: u16) -> Option<[u8; 4]> {
+// ─── Parse DNS response ──────────────────────────────────────────────────
+/// Outcome of parsing a response that matched our query ID.
+enum Parsed {
+    /// First A record found.
+    Addr([u8; 4]),
+    /// Valid answer, but the name does not exist (RCODE 3).
+    NxDomain,
+    /// Valid answer without any A record (e.g. only AAAA / CNAME to nothing).
+    NoA,
+    /// Server-side failure (SERVFAIL, REFUSED, ...): try another server.
+    ServerFail,
+}
+
+/// Returns None if the packet is not a response to `expected_id`.
+fn parse_response(data: &[u8], expected_id: u16) -> Option<Parsed> {
     if data.len() < 12 { return None; }
 
     let id = u16::from_be_bytes([data[0], data[1]]);
     if id != expected_id { return None; }
 
     let flags = u16::from_be_bytes([data[2], data[3]]);
-    // Check QR=1 (response)
+    // Must be a response (QR=1)
     if flags & 0x8000 == 0 { return None; }
-    // Check RCODE = 0 (no error)
-    if flags & 0x000F != 0 { return None; }
+    match flags & 0x000F {
+        0 => {}
+        3 => return Some(Parsed::NxDomain),
+        _ => return Some(Parsed::ServerFail),
+    }
 
     let ancount = u16::from_be_bytes([data[6], data[7]]);
     let qdcount = u16::from_be_bytes([data[4], data[5]]);
@@ -175,28 +191,29 @@ fn parse_response(data: &[u8], expected_id: u16) -> Option<[u8; 4]> {
     for _ in 0..qdcount {
         pos = skip_name(data, pos);
         pos += 4; // QTYPE + QCLASS
-        if pos > data.len() { return None; }
+        if pos > data.len() { return Some(Parsed::ServerFail); }
     }
 
     // Parse answer section — look for type A (1), class IN (1)
     for _ in 0..ancount {
-        if pos >= data.len() { return None; }
+        if pos >= data.len() { break; }
         pos = skip_name(data, pos); // NAME
-        if pos + 10 > data.len() { return None; }
+        if pos + 10 > data.len() { break; }
         let rtype  = u16::from_be_bytes([data[pos], data[pos+1]]);
         let rclass = u16::from_be_bytes([data[pos+2], data[pos+3]]);
-        // skip TTL (4 bytes)
         let rdlen  = u16::from_be_bytes([data[pos+8], data[pos+9]]) as usize;
         pos += 10;
-        if pos + rdlen > data.len() { return None; }
+        if pos + rdlen > data.len() { break; }
 
         if rtype == 1 && rclass == 1 && rdlen == 4 {
-            return Some([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+            return Some(Parsed::Addr([data[pos], data[pos+1], data[pos+2], data[pos+3]]));
         }
         pos += rdlen;
     }
 
-    None
+    // Truncated (TC) responses without an A record: let the caller try again.
+    if flags & 0x0200 != 0 { return Some(Parsed::ServerFail); }
+    Some(Parsed::NoA)
 }
 
 fn parse_nameserver_line(line: &[u8]) -> Option<[u8; 4]> {
@@ -260,64 +277,117 @@ fn collect_dns_servers(out: &mut [[u8; 4]; 6]) -> usize {
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
-/// Resolve a hostname to an IPv4 address via DNS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsError {
+    /// The name does not exist (NXDOMAIN) — answered by `server`.
+    NxDomain { server: [u8; 4] },
+    /// The name exists but has no IPv4 address — answered by `server`.
+    NoAddress { server: [u8; 4] },
+    /// No configured server answered (timeouts / server failures).
+    NoResponse,
+    /// The name could not be encoded (empty label, too long, ...).
+    BadName,
+}
+
+impl DnsError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DnsError::NxDomain { .. }  => "NXDOMAIN (name does not exist)",
+            DnsError::NoAddress { .. } => "no IPv4 (A) record",
+            DnsError::NoResponse       => "no response from DNS servers",
+            DnsError::BadName          => "invalid name",
+        }
+    }
+}
+
+/// Successful lookup: the address, the server that answered, and whether the
+/// result came from the local cache.
+#[derive(Clone, Copy, Debug)]
+pub struct DnsAnswer {
+    pub ip: [u8; 4],
+    pub server: [u8; 4],
+    pub cached: bool,
+}
+
+/// Servers in the order they are tried: /etc/resolv.conf, then the
+/// DHCP-provided server, then public fallbacks.
+pub fn servers(out: &mut [[u8; 4]; 6]) -> usize {
+    collect_dns_servers(out)
+}
+
+/// Resolve a hostname to an IPv4 address via DNS (A record).
 ///
-/// Steps:
-///   1. Check local cache
-///   2. Send UDP query to DNS_IP:53
-///   3. Wait up to 3 seconds for response
-///   4. Retry up to 2 times
-///
-/// Returns None if DNS is not configured or the name cannot be resolved.
-pub fn resolve(name: &str) -> Option<[u8; 4]> {
-    // Check cache first
+/// Each server gets two attempts (1.5 s, then 3 s). A definite answer
+/// (address, NXDOMAIN, or "no A record") stops the search; only timeouts and
+/// server failures move on to the next server.
+pub fn query(name: &str) -> Result<DnsAnswer, DnsError> {
+    let name = name.trim_end_matches('.');
     if let Some(ip) = cache_lookup(name) {
-        return Some(ip);
+        return Ok(DnsAnswer { ip, server: [0; 4], cached: true });
     }
 
     let mut servers = [[0u8; 4]; 6];
     let server_count = collect_dns_servers(&mut servers);
-    if server_count == 0 { return None; }
-
-    let query_id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
-
-    // Ephemeral port: 49152 + (query_id mod 16384)
-    let src_port = 49152 + (query_id % 16384);
-    DNS_SRC_PORT.store(src_port, Ordering::Relaxed);
+    if server_count == 0 { return Err(DnsError::NoResponse); }
 
     let mut qbuf = [0u8; 512];
-    let qlen = build_query(name, query_id, &mut qbuf);
-    if qlen == 0 { return None; }
 
     for si in 0..server_count {
         let dns_ip = servers[si];
         for attempt in 0u8..2 {
-            let timeout = 300u64 * (1 + attempt as u64); // 3s, 6s
+            let timeout = if attempt == 0 { 150u64 } else { 300u64 };
 
+            // Fresh ID and source port per attempt so late replies to an
+            // earlier attempt cannot be confused with this one.
+            let query_id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed)
+                ^ (crate::arch::x86_64::idt::timer_ticks() as u16).rotate_left(7);
+            let src_port = 49152 + (query_id % 16384);
+            let qlen = build_query(name, query_id, &mut qbuf);
+            if qlen == 0 { return Err(DnsError::BadName); }
+
+            DNS_SRC_PORT.store(src_port, Ordering::Relaxed);
             DNS_RX_READY.store(false, Ordering::Release);
             super::udp::send_udp(dns_ip, src_port, 53, &qbuf[..qlen]);
 
-            // Wait for response
             let start = crate::arch::x86_64::idt::timer_ticks();
+            let mut server_failed = false;
             loop {
                 super::poll_rx();
                 if DNS_RX_READY.load(Ordering::Acquire) {
                     DNS_RX_READY.store(false, Ordering::Release);
                     let len = unsafe { DNS_RX_LEN };
                     let data = unsafe { &DNS_RX_BUF[..len] };
-                    if let Some(ip) = parse_response(data, query_id) {
-                        cache_insert(name, ip);
-                        DNS_SRC_PORT.store(0, Ordering::Relaxed);
-                        return Some(ip);
+                    match parse_response(data, query_id) {
+                        Some(Parsed::Addr(ip)) => {
+                            DNS_SRC_PORT.store(0, Ordering::Relaxed);
+                            cache_insert(name, ip);
+                            return Ok(DnsAnswer { ip, server: dns_ip, cached: false });
+                        }
+                        Some(Parsed::NxDomain) => {
+                            DNS_SRC_PORT.store(0, Ordering::Relaxed);
+                            return Err(DnsError::NxDomain { server: dns_ip });
+                        }
+                        Some(Parsed::NoA) => {
+                            DNS_SRC_PORT.store(0, Ordering::Relaxed);
+                            return Err(DnsError::NoAddress { server: dns_ip });
+                        }
+                        Some(Parsed::ServerFail) => { server_failed = true; break; }
+                        None => {} // not ours, keep waiting
                     }
                 }
                 let now = crate::arch::x86_64::idt::timer_ticks();
                 if now.saturating_sub(start) >= timeout { break; }
-                unsafe { core::arch::asm!("hlt"); }
+                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
             }
+            if server_failed { break; } // next server
         }
     }
 
     DNS_SRC_PORT.store(0, Ordering::Relaxed);
-    None
+    Err(DnsError::NoResponse)
+}
+
+/// Resolve a hostname to an IPv4 address via DNS. None if it cannot be resolved.
+pub fn resolve(name: &str) -> Option<[u8; 4]> {
+    query(name).ok().map(|a| a.ip)
 }

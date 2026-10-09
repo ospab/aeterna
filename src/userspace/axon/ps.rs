@@ -9,7 +9,6 @@
  */
 
 extern crate alloc;
-use crate::arch::x86_64::framebuffer;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;
@@ -18,9 +17,9 @@ const FG_DIM: u32 = 0x00AAAAAA;
 const FG_HL: u32  = 0x00FFCC00;
 const BG: u32     = 0x00000000;
 
-fn puts(s: &str)  { framebuffer::draw_string(s, FG, BG); }
-fn hl(s: &str)    { framebuffer::draw_string(s, FG_HL, BG); }
-fn dim(s: &str)   { framebuffer::draw_string(s, FG_DIM, BG); }
+fn puts(s: &str)  { crate::userspace::plum::io::out_c(s, FG); }
+fn hl(s: &str)    { crate::userspace::plum::io::out_c(s, FG_HL); }
+fn dim(s: &str)   { crate::userspace::plum::io::out_c(s, FG_DIM); }
 
 fn state_color(state: &str, s: &str) {
     let color = if state.starts_with("running") {
@@ -30,7 +29,7 @@ fn state_color(state: &str, s: &str) {
     } else {
         FG_DIM
     };
-    framebuffer::draw_string(s, color, BG);
+    crate::userspace::plum::io::out_c(s, color);
 }
 
 /// Refresh /sys/status by reading the live task table and writing it to VFS.
@@ -107,7 +106,7 @@ pub fn run(_args: &str) {
     let data = match crate::fs::read_file("/sys/status") {
         Some(d) => d,
         None => {
-            framebuffer::draw_string("ps: /sys/status not found\n", FG_ERR, BG);
+            crate::userspace::plum::io::err("ps: /sys/status not found\n");
             return;
         }
     };
@@ -115,7 +114,7 @@ pub fn run(_args: &str) {
     let text = match core::str::from_utf8(&data) {
         Ok(t) => t,
         Err(_) => {
-            framebuffer::draw_string("ps: /sys/status is not valid UTF-8\n", FG_ERR, BG);
+            crate::userspace::plum::io::err("ps: /sys/status is not valid UTF-8\n");
             return;
         }
     };

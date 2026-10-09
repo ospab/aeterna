@@ -138,6 +138,9 @@ struct AcpiState {
     has_reset_reg:   bool,
     /// SCI interrupt number
     sci_irq:         u16,
+    /// SMI command port and the value that switches the chipset into ACPI mode
+    smi_cmd:         u32,
+    acpi_enable_val: u8,
 }
 
 static mut ACPI: AcpiState = AcpiState {
@@ -154,6 +157,8 @@ static mut ACPI: AcpiState = AcpiState {
     reset_val:     0,
     has_reset_reg: false,
     sci_irq:       0,
+    smi_cmd:       0,
+    acpi_enable_val: 0,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -273,12 +278,10 @@ pub fn init() -> bool {
         // Take ACPI ownership from UEFI/SMM: set SCI_EN (bit 0) in PM1a_CNT.
         // This routes ACPI events (including power button) to the OS via SCI IRQ
         // instead of letting firmware handle them (which causes instant power-off).
+        ACPI.smi_cmd = fadt.smi_command_port;
+        ACPI.acpi_enable_val = fadt.acpi_enable;
         if ACPI.pm1a_cnt_blk != 0 {
-            let cnt_port = ACPI.pm1a_cnt_blk as u16;
-            let cnt_val: u16;
-            asm!("in ax, dx", in("dx") cnt_port, out("ax") cnt_val, options(nomem, nostack));
-            asm!("out dx, ax", in("dx") cnt_port, in("ax") cnt_val | 1u16, options(nomem, nostack));
-            serial::write_str("[ACPI] SCI_EN set\r\n");
+            enable_acpi_mode();
 
             // Enable power-button SCI: PWRBTN_EN is bit 8 in PM1a_EVT_EN.
             // PM1a_EVT_EN is in the upper half of the PM1 event block:
@@ -492,12 +495,14 @@ fn parse_s5_from_dsdt(dsdt_virt: *const u8) {
     // then 12 (PackageOp)
     let name_bytes = b"_S5_";
 
+    // The name may carry a root prefix: 08 5C "_S5_" (VMware writes Name (\_S5, ...)).
     for i in 0..aml.len().saturating_sub(20) {
-        if aml[i] == 0x08 && i + 5 < aml.len() {
+        if aml[i] == 0x08 {
+            let name_at = if aml[i + 1] == 0x5C { i + 2 } else { i + 1 };
             // Check for "_S5_" name
-            if &aml[i+1..i+5] == name_bytes {
+            if &aml[name_at..name_at + 4] == name_bytes {
                 // Found NameOp "_S5_" — next should be PackageOp (0x12)
-                let pkg_start = i + 5;
+                let pkg_start = name_at + 4;
                 if pkg_start >= aml.len() { continue; }
 
                 if aml[pkg_start] == 0x12 {
@@ -514,9 +519,10 @@ fn parse_s5_from_dsdt(dsdt_virt: *const u8) {
                     // Read SLP_TYPb (second element)
                     let (slp_typb, _) = read_aml_integer(aml, next);
 
+                    // SLP_TYP is a 3-bit field
                     unsafe {
-                        ACPI.slp_typa_s5 = slp_typa as u16;
-                        ACPI.slp_typb_s5 = slp_typb as u16;
+                        ACPI.slp_typa_s5 = (slp_typa & 7) as u16;
+                        ACPI.slp_typb_s5 = (slp_typb & 7) as u16;
                     }
 
                     serial::write_str("[ACPI] S5 SLP_TYPa=");
@@ -607,36 +613,84 @@ fn read_aml_integer(aml: &[u8], offset: usize) -> (u64, usize) {
 // Shutdown (S5 sleep state)
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Switch the chipset from legacy (SMM) mode into ACPI mode: write ACPI_ENABLE to the
+/// SMI command port and wait for SCI_EN. Firmware that already handed over ACPI is left alone.
+fn enable_acpi_mode() {
+    unsafe {
+        let cnt_port = ACPI.pm1a_cnt_blk as u16;
+        let read_cnt = || -> u16 {
+            let v: u16;
+            asm!("in ax, dx", in("dx") cnt_port, out("ax") v, options(nomem, nostack));
+            v
+        };
+        if read_cnt() & 1 != 0 {
+            serial::write_str("[ACPI] SCI_EN already set\r\n");
+            return;
+        }
+        if ACPI.smi_cmd != 0 && ACPI.acpi_enable_val != 0 {
+            asm!("out dx, al", in("dx") ACPI.smi_cmd as u16, in("al") ACPI.acpi_enable_val,
+                options(nomem, nostack));
+            for _ in 0..3_000_000u32 {
+                if read_cnt() & 1 != 0 {
+                    serial::write_str("[ACPI] ACPI mode enabled via SMI_CMD\r\n");
+                    return;
+                }
+                asm!("pause");
+            }
+            serial::write_str("[ACPI] SMI_CMD did not set SCI_EN\r\n");
+        }
+        // Last resort for firmware without an SMI command port
+        asm!("out dx, ax", in("dx") cnt_port, in("ax") read_cnt() | 1, options(nomem, nostack));
+        serial::write_str("[ACPI] SCI_EN set directly\r\n");
+    }
+}
+
 /// Perform ACPI shutdown (S5 sleep state).
 /// Falls back to emulator-specific ports if ACPI is not available.
 pub fn shutdown() {
     serial::write_str("[ACPI] Shutdown requested\r\n");
+    crate::drivers::audio::stop();
 
     unsafe {
         asm!("cli");
 
         if ACPI.initialized && ACPI.pm1a_cnt_blk != 0 {
-            // Write SLP_TYPa | SLP_EN (bit 13) to PM1a_CNT
-            let val = (ACPI.slp_typa_s5 as u16) << 10 | (1 << 13);
-            serial::write_str("[ACPI] Writing PM1a_CNT: 0x");
-            serial_hex(val as u64);
-            serial::write_str(" to port 0x");
-            serial_hex(ACPI.pm1a_cnt_blk as u64);
-            serial::write_str("\r\n");
+            // Sleep requests are ignored while the chipset is still in legacy (SMM) mode
+            enable_acpi_mode();
 
-            asm!("out dx, ax",
-                in("dx") ACPI.pm1a_cnt_blk as u16,
-                in("ax") val,
-                options(nomem, nostack));
-
-            // If PM1b exists, write there too
-            if ACPI.pm1b_cnt_blk != 0 {
-                let val_b = (ACPI.slp_typb_s5 as u16) << 10 | (1 << 13);
-                asm!("out dx, ax",
-                    in("dx") ACPI.pm1b_cnt_blk as u16,
-                    in("ax") val_b,
+            // Clear WAK_STS (bit 15 of PM1a_STS, write-1-to-clear)
+            if ACPI.pm1a_evt_blk != 0 {
+                asm!("out dx, ax", in("dx") ACPI.pm1a_evt_blk as u16, in("ax") 1u16 << 15,
                     options(nomem, nostack));
             }
+
+            // Read-modify-write: keep SCI_EN and the other bits, replace SLP_TYP (bits 10..12),
+            // then set SLP_EN (bit 13) in a separate write as the spec recommends.
+            let port_a = ACPI.pm1a_cnt_blk as u16;
+            let cur: u16;
+            asm!("in ax, dx", in("dx") port_a, out("ax") cur, options(nomem, nostack));
+            let typ = (cur & !(7 << 10 | 1 << 13)) | (ACPI.slp_typa_s5 & 7) << 10;
+            serial::write_str("[ACPI] PM1a_CNT 0x");
+            serial_hex(cur as u64);
+            serial::write_str(" -> 0x");
+            serial_hex((typ | 1 << 13) as u64);
+            serial::write_str(" (port 0x");
+            serial_hex(port_a as u64);
+            serial::write_str(")\r\n");
+
+            let port_b = ACPI.pm1b_cnt_blk as u16;
+            let mut typ_b = 0u16;
+            if port_b != 0 {
+                let cur_b: u16;
+                asm!("in ax, dx", in("dx") port_b, out("ax") cur_b, options(nomem, nostack));
+                typ_b = (cur_b & !(7 << 10 | 1 << 13)) | (ACPI.slp_typb_s5 & 7) << 10;
+                asm!("out dx, ax", in("dx") port_b, in("ax") typ_b, options(nomem, nostack));
+            }
+            asm!("out dx, ax", in("dx") port_a, in("ax") typ, options(nomem, nostack));
+            if port_b != 0 {
+                asm!("out dx, ax", in("dx") port_b, in("ax") typ_b | 1 << 13, options(nomem, nostack));
+            }
+            asm!("out dx, ax", in("dx") port_a, in("ax") typ | 1 << 13, options(nomem, nostack));
 
             // Wait a bit for the hardware to respond
             for _ in 0..1000000u32 { asm!("pause"); }
@@ -662,6 +716,7 @@ pub fn shutdown() {
 /// Tries: FADT reset register → PCI reset (0xCF9) → PS/2 controller → triple fault.
 pub fn reboot() {
     serial::write_str("[ACPI] Reboot requested\r\n");
+    crate::drivers::audio::stop();
 
     unsafe {
         asm!("cli");
@@ -706,9 +761,12 @@ pub fn reboot() {
 
         // Method 2: PCI reset control register (0xCF9)
         serial::write_str("[ACPI] Trying PCI reset (0xCF9)\r\n");
-        asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x00u8, options(nomem, nostack));
-        asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x04u8, options(nomem, nostack)); // RST_CPU
-        asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x0Eu8, options(nomem, nostack)); // RST_CPU | SYS_RST | FULL_RST
+        // Arm SYS_RST first, then raise RST_CPU: a hard (platform) reset, as Linux does.
+        // Raising RST_CPU alone (0x04) is a soft INIT-only reset, which leaves chipset
+        // state behind and can hang UEFI firmware (seen in VMware).
+        asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x02u8, options(nomem, nostack)); // SYS_RST
+        for _ in 0..10_000u32 { asm!("pause"); }
+        asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x06u8, options(nomem, nostack)); // SYS_RST | RST_CPU
         for _ in 0..1000000u32 { asm!("pause"); }
 
         // Method 3: PS/2 keyboard controller reset

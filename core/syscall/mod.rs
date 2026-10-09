@@ -1,5 +1,5 @@
 /*
-Business Source License 1.1
+SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
 Syscall interface for AETERNA microkernel (Phase 3).
@@ -115,7 +115,23 @@ pub enum SyscallError {
     IoError = -8,
     /// Process not found
     NoSuchProcess = -9,
+    /// A pointer argument is outside user space or not mapped
+    BadAddress = -10,
 }
+
+impl From<crate::mm::usercopy::UserCopyError> for SyscallError {
+    fn from(e: crate::mm::usercopy::UserCopyError) -> Self {
+        match e {
+            crate::mm::usercopy::UserCopyError::TooLarge => SyscallError::InvalidArgument,
+            _ => SyscallError::BadAddress,
+        }
+    }
+}
+
+/// Largest buffer a single read/write syscall moves (bigger requests are clamped).
+const MAX_IO_CHUNK: usize = 64 * 1024;
+/// Longest path or name accepted from user space.
+const MAX_PATH: usize = 4096;
 
 /// Syscall arguments passed in registers
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +201,7 @@ const MSR_LSTAR: u32 = 0xC0000082;
 /// IA32_FMASK MSR — RFLAGS mask during SYSCALL
 const MSR_FMASK: u32 = 0xC0000084;
 /// IA32_KERNEL_GS_BASE MSR — Base address of KERNEL_GS segment
+const MSR_GS_BASE: u32 = 0xC0000101;
 const MSR_KERNEL_GS_BASE: u32 = 0xC0000102;
 
 #[repr(C)]
@@ -252,9 +269,12 @@ pub fn init_syscall_msr() {
         // 4. FMASK: clear IF (bit 9) on SYSCALL entry (disable interrupts)
         wrmsr(MSR_FMASK, 0x200); // mask IF
 
-        // 5. KERNEL_GS_BASE: base for swapgs
+        // 5. GS convention: while in the kernel, GS.base = PER_CPU and KERNEL_GS_BASE
+        //    holds the user value. Every entry from ring 3 (SYSCALL and the interrupt
+        //    stubs) does swapgs, and every return to ring 3 swaps back.
         PER_CPU.kernel_stack = (SYSCALL_STACK.as_ptr() as u64) + 16384;
-        wrmsr(MSR_KERNEL_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
+        wrmsr(MSR_GS_BASE, core::ptr::addr_of!(PER_CPU) as u64);
+        wrmsr(MSR_KERNEL_GS_BASE, 0);
     }
 
     crate::arch::x86_64::serial::write_str("[SYSCALL] MSR configured (LSTAR, STAR, FMASK, KERN_GS)\r\n");
@@ -267,9 +287,11 @@ pub fn init_syscall_msr() {
 pub unsafe extern "C" fn syscall_entry_stub() {
     core::arch::naked_asm!(
         "swapgs",               // Get kernel GS base (points to PerCpu)
-        "mov gs:[8], rsp",      // Save user RSP to user_rsp
-        "mov rsp, gs:[0]",      // Load kernel_stack to RSP
-        
+        "mov gs:[8], rsp",      // Stash user RSP (IF is masked, nothing can intervene)
+        "mov rsp, gs:[0]",      // Switch to this task's kernel stack
+        "push qword ptr gs:[8]", // Keep user RSP on the task's own stack: the per-CPU slot
+                                 // is reused by the next task that enters while we block.
+
         "push r11",             // Save R11 (User RFLAGS)
         "push rcx",             // Save RCX (User RIP)
         
@@ -289,8 +311,12 @@ pub unsafe extern "C" fn syscall_entry_stub() {
         "mov rdx, rsi",         // arg2
         "mov rsi, rdi",         // arg1
         "mov rdi, rax",         // number
+        "sub rsp, 8",           // 9 pushes above: realign to 16 bytes for the call
         "call syscall_dispatch",
-        
+        "add rsp, 8",
+        "cli",                 // A blocking syscall may have enabled interrupts; the
+                                // stack/GS switch below must not be interrupted.
+
         // Restore scratch registers
         "pop r10",
         "pop r9",
@@ -301,11 +327,17 @@ pub unsafe extern "C" fn syscall_entry_stub() {
 
         "pop rcx",              // Restore RCX (User RIP)
         "pop r11",              // Restore R11 (User RFLAGS)
-        
-        "mov rsp, gs:[8]",      // Restore user RSP
+
+        "pop rsp",              // Restore user RSP saved on entry
         "swapgs",               // Restore user GS base
         "sysretq"
     );
+}
+
+/// Point the SYSCALL entry at the kernel stack of the task being switched in.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: single CPU; called from the scheduler with interrupts disabled.
+    unsafe { PER_CPU.kernel_stack = top };
 }
 
 #[no_mangle]
@@ -338,11 +370,10 @@ fn syscall_exit(code: u64) -> i64 {
     // drives `on_timer_irq`, which sees this task as Dead and context-switches
     // (via iretq) into the next ready task, never returning here.
     //
-    // Because we skip the stub's closing `swapgs`, we must restore the GS-base
-    // invariant ourselves first — otherwise the *next* SYSCALL from ring 3
-    // would swapgs into the wrong base and fault in the kernel handler.
+    // GS stays on the kernel base: inside the kernel it always is. Whichever
+    // interrupt switches us away swaps to the user base only if it returns to
+    // ring 3, based on the frame of the task it resumes.
     unsafe {
-        core::arch::asm!("swapgs", options(nomem, nostack));
         loop {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }
@@ -376,16 +407,18 @@ fn can_serial_write() -> bool {
 /// fd=1 → serial+framebuffer (stdout), fd=2 → serial (stderr).
 /// fd≥3 → VFS file write.
 fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
+    let len = (len as usize).min(MAX_IO_CHUNK);
     // stdout/stderr → serial output
     if fd == 1 || fd == 2 {
         if !can_serial_write() {
             return SyscallError::PermissionDenied as i64;
         }
-        unsafe {
-            let buf = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-            for &b in buf {
-                crate::arch::x86_64::serial::write_byte(b);
-            }
+        let buf = match crate::mm::usercopy::read_user_bytes(buf_ptr, len, MAX_IO_CHUNK) {
+            Ok(b) => b,
+            Err(e) => return SyscallError::from(e) as i64,
+        };
+        for &b in &buf {
+            crate::arch::x86_64::serial::write_byte(b);
         }
         return len as i64;
     }
@@ -394,25 +427,25 @@ fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     if !can_fs_write() {
         return SyscallError::PermissionDenied as i64;
     }
-    unsafe {
-        let buf = core::slice::from_raw_parts(buf_ptr as *const u8, len as usize);
-        crate::fs::sys_write(fd as usize, buf)
+    match crate::mm::usercopy::read_user_bytes(buf_ptr, len, MAX_IO_CHUNK) {
+        Ok(buf) => crate::fs::sys_write(fd as usize, &buf),
+        Err(e) => SyscallError::from(e) as i64,
     }
 }
 
 /// sys_read(fd, buf_ptr, len) — read bytes from a file descriptor.
 /// fd=0 → keyboard (stdin), fd≥3 → VFS file read.
 fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
+    let len = (len as usize).min(MAX_IO_CHUNK);
     if fd == 0 {
         // stdin: read one key from keyboard
         let key = crate::arch::x86_64::keyboard::poll_key();
         if let Some(ch) = key {
             if len >= 1 {
-                unsafe {
-                    let buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
-                    buf[0] = ch as u8;
-                }
-                return 1;
+                return match crate::mm::usercopy::copy_to_user(buf_ptr, &[ch as u8]) {
+                    Ok(()) => 1,
+                    Err(e) => SyscallError::from(e) as i64,
+                };
             }
         }
         return 0;
@@ -422,10 +455,17 @@ fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     if !can_fs_read() {
         return SyscallError::PermissionDenied as i64;
     }
-    unsafe {
-        let buf = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len as usize);
-        crate::fs::sys_read(fd as usize, buf)
+    if !crate::mm::usercopy::range_ok(buf_ptr, len) {
+        return SyscallError::BadAddress as i64;
     }
+    let mut buf = alloc::vec![0u8; len];
+    let n = crate::fs::sys_read(fd as usize, &mut buf);
+    if n > 0 {
+        if let Err(e) = crate::mm::usercopy::copy_to_user(buf_ptr, &buf[..n as usize]) {
+            return SyscallError::from(e) as i64;
+        }
+    }
+    n
 }
 
 /// sys_open(path_ptr, path_len, flags) — open a file, returning fd.
@@ -450,13 +490,9 @@ fn syscall_open(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
         _ => return SyscallError::InvalidArgument as i64,
     }
 
-    unsafe {
-        let path_bytes = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
-        let path = match core::str::from_utf8(path_bytes) {
-            Ok(s) => s,
-            Err(_) => return SyscallError::InvalidArgument as i64,
-        };
-        crate::fs::sys_open(path, flags)
+    match crate::mm::usercopy::read_user_str(path_ptr, path_len as usize, MAX_PATH) {
+        Ok(path) => crate::fs::sys_open(&path, flags),
+        Err(e) => SyscallError::from(e) as i64,
     }
 }
 
@@ -475,7 +511,7 @@ fn syscall_yield() -> i64 {
 /// sys_waitpid(pid) — block until the task with `pid` exits.
 /// Returns 0 on success, -1 if pid is invalid / never existed.
 fn syscall_waitpid(pid: u64) -> i64 {
-    crate::core::scheduler::wait_pid(pid as crate::core::scheduler::TaskId);
+    let _ = crate::core::scheduler::wait_pid(pid as crate::core::scheduler::TaskId);
     SyscallError::Success as i64
 }
 
@@ -489,13 +525,11 @@ fn syscall_spawn(name_ptr: u64, name_len: u64, priority: u64) -> i64 {
         return SyscallError::PermissionDenied as i64;
     }
 
-    let name = unsafe {
-        let bytes = core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
-        match core::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return SyscallError::InvalidArgument as i64,
-        }
+    let name = match crate::mm::usercopy::read_user_str(name_ptr, name_len as usize, 64) {
+        Ok(s) => s,
+        Err(e) => return SyscallError::from(e) as i64,
     };
+    let name = name.as_str();
 
     let prio = match priority {
         0 => crate::core::scheduler::Priority::Idle,
@@ -541,101 +575,93 @@ pub fn sys_get_tasks(out: &mut [TaskInfo]) -> usize {
 
 // ─── sys_mmap (SyscallNumber::Mmap = 40) ────────────────────────────────────
 //
-// ABI: RDI=addr_hint (0=kernel_picks), RSI=size, RDX=flags
-//   flags bit 0 = HUGE_PAGE (2MiB aligned allocation)
-//   flags bit 1 = EXEC      (mark executable, reserved)
-//
-// Returns: mapped virtual address (as i64), or negative SyscallError on fail.
-// Alignment: always 64-byte minimum; HUGE_PAGE requests 2MiB alignment (align=0x200000).
-//
-// SAFETY invariant: returned pointer is heap-allocated and must be freed via
-// sys_munmap with the same size.  The caller (aai) holds a CapabilityToken{} for
-// MemHuge before invoking this path (token checked at dispatch time in future).
+// ABI: RDI=addr_hint (ignored), RSI=size, RDX=flags (ignored for now)
+// Allocates zeroed pages and maps them read/write into the calling task's
+// address space. Returns the user virtual address, or a negative SyscallError.
+// Only ring-3 tasks with their own address space may call it.
 
-fn syscall_mmap(_addr_hint: u64, size: u64, flags: u64) -> i64 {
-    let size = size as usize;
-    if size == 0 {
+/// Largest single mmap request (64 MiB).
+const MAX_MMAP_BYTES: u64 = 64 * 1024 * 1024;
+
+fn syscall_mmap(_addr_hint: u64, size: u64, _flags: u64) -> i64 {
+    use crate::mm::{physical, r#virtual as vmm};
+    if size == 0 || size > MAX_MMAP_BYTES {
         return SyscallError::InvalidArgument as i64;
     }
-    let huge = (flags & 1) != 0;
+    let cr3 = match crate::core::scheduler::current_user_cr3() {
+        Some(c) => c,
+        None => return SyscallError::NotSupported as i64,
+    };
+    let pages = (size + physical::FRAME_SIZE - 1) / physical::FRAME_SIZE;
+    let base = match crate::core::scheduler::reserve_user_range(pages) {
+        Some(b) => b,
+        None => return SyscallError::OutOfMemory as i64,
+    };
 
-    if huge {
-        if !has_system_cap() &&
-           !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::MemHuge) {
-            return SyscallError::PermissionDenied as i64;
-        }
-
-        // AI-native path: use the 2MB physical frame allocator
-        if let Some(phys) = crate::mm::physical::alloc_huge_frame() {
-            let virt = crate::mm::r#virtual::phys_to_virt(phys);
-            
-            crate::arch::x86_64::serial::write_str("[SYSCALL] Mmap(HUGE): ");
-            serial_dec(crate::mm::physical::HUGE_FRAME_SIZE);
-            crate::arch::x86_64::serial::write_str(" bytes @ Phys 0x");
-            serial_hex(phys);
-            crate::arch::x86_64::serial::write_str(" / Virt 0x");
-            serial_hex(virt);
-            crate::arch::x86_64::serial::write_str("\r\n");
-
-            let current_pid = crate::core::scheduler::current_pid();
-            crate::core::scheduler::add_memory_usage(current_pid, crate::mm::physical::HUGE_FRAME_SIZE);
-
-            return virt as i64;
-        } else {
+    for i in 0..pages {
+        let va = base + i * physical::FRAME_SIZE;
+        let ok = match physical::alloc_frame() {
+            Some(phys) => {
+                if vmm::map_page(cr3, va, phys, vmm::FLAG_USER | vmm::FLAG_WRITABLE | vmm::FLAG_OWNED) {
+                    true
+                } else {
+                    physical::free_frame(phys);
+                    false
+                }
+            }
+            None => false,
+        };
+        if !ok {
+            // Roll back what was mapped so far.
+            unmap_user_pages(cr3, base, i);
             return SyscallError::OutOfMemory as i64;
         }
     }
 
-    // 2 MiB alignment for HUGE_PAGE; 64-byte otherwise (AVX-512 native).
-    let align: usize = 64;
-    // Round size up to alignment boundary to avoid partial-page tails.
-    let alloc_size = (size + align - 1) & !(align - 1);
-
-    let layout = match core::alloc::Layout::from_size_align(alloc_size, align) {
-        Ok(l)  => l,
-        Err(_) => return SyscallError::InvalidArgument as i64,
-    };
-
-    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        crate::arch::x86_64::serial::write_str("[SYSCALL] Mmap: OOM\r\n");
-        return SyscallError::OutOfMemory as i64;
-    }
-
-    crate::arch::x86_64::serial::write_str("[SYSCALL] Mmap: ");
-    serial_dec(alloc_size as u64);
-    crate::arch::x86_64::serial::write_str(" bytes @ 0x");
-    serial_hex(ptr as u64);
-    crate::arch::x86_64::serial::write_str("\r\n");
-
-    let current_pid = crate::core::scheduler::current_pid();
-    crate::core::scheduler::add_memory_usage(current_pid, alloc_size as u64);
-
-    ptr as i64
+    let pid = crate::core::scheduler::current_pid();
+    crate::core::scheduler::add_memory_usage(pid, pages * physical::FRAME_SIZE);
+    base as i64
 }
 
-/// sys_munmap(addr, size) — free a mapping previously created by sys_mmap.
-/// The size must match exactly what was passed to Mmap.
+/// sys_munmap(addr, size) — unmap and free pages of the caller's address space.
+/// Only page-aligned user ranges are accepted; pages that are not mapped are skipped.
 fn syscall_munmap(addr: u64, size: u64) -> i64 {
-    if addr == 0 || size == 0 {
+    use crate::mm::physical::FRAME_SIZE;
+    if size == 0 || addr % FRAME_SIZE != 0 || !crate::mm::usercopy::range_ok(addr, size as usize) {
         return SyscallError::InvalidArgument as i64;
     }
-    let size = size as usize;
-    // We can only know the alignment from size; use 64-byte minimum.
-    let align: usize = if size % 0x200_000 == 0 { 0x200_000 } else { 64 };
-    let alloc_size = (size + align - 1) & !(align - 1);
-
-    let layout = match core::alloc::Layout::from_size_align(alloc_size, align) {
-        Ok(l)  => l,
-        Err(_) => return SyscallError::InvalidArgument as i64,
+    let cr3 = match crate::core::scheduler::current_user_cr3() {
+        Some(c) => c,
+        None => return SyscallError::NotSupported as i64,
     };
-    // SAFETY: addr points to memory allocated by syscall_mmap with the same layout.
-    unsafe { alloc::alloc::dealloc(addr as *mut u8, layout); }
-
-    let current_pid = crate::core::scheduler::current_pid();
-    crate::core::scheduler::sub_memory_usage(current_pid, alloc_size as u64);
-
+    let pages = (size + FRAME_SIZE - 1) / FRAME_SIZE;
+    let freed = unmap_user_pages(cr3, addr, pages);
+    let pid = crate::core::scheduler::current_pid();
+    crate::core::scheduler::sub_memory_usage(pid, freed * FRAME_SIZE);
     SyscallError::Success as i64
+}
+
+/// Unmap `pages` pages starting at `base` in address space `cr3` and free their frames.
+/// Returns how many pages were actually mapped (and are now freed).
+fn unmap_user_pages(cr3: u64, base: u64, pages: u64) -> u64 {
+    use crate::mm::{physical, r#virtual as vmm};
+    let current = vmm::read_cr3() & !0xFFF == cr3 & !0xFFF;
+    let mut freed = 0;
+    for i in 0..pages {
+        let va = base + i * physical::FRAME_SIZE;
+        if let Some((phys, flags)) = vmm::unmap_page_entry(cr3, va) {
+            if current {
+                vmm::invlpg(va);
+            }
+            // Only frames the process owns go back to the allocator; shared ones
+            // (e.g. kernel text mapped for tests) are just unmapped.
+            if flags & vmm::FLAG_OWNED != 0 {
+                physical::free_frame(phys);
+                freed += 1;
+            }
+        }
+    }
+    freed
 }
 
 fn syscall_ioport_in(port: u64, size: u64) -> i64 {
@@ -756,13 +782,11 @@ fn syscall_vfs_register(path_ptr: u64, path_len: u64) -> i64 {
         return SyscallError::PermissionDenied as i64;
     }
 
-    let path = unsafe {
-        let bytes = core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
-        match core::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return SyscallError::InvalidArgument as i64,
-        }
+    let path = match crate::mm::usercopy::read_user_str(path_ptr, path_len as usize, MAX_PATH) {
+        Ok(s) => s,
+        Err(e) => return SyscallError::from(e) as i64,
     };
+    let path = path.as_str();
 
     crate::arch::x86_64::serial::write_str("[VFS] Registering userspace server at ");
     crate::arch::x86_64::serial::write_str(path);
