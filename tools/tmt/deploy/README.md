@@ -10,6 +10,11 @@ The repository is static files; the Ed25519 *private* key never goes on the serv
 5. Check: `curl -I https://tmt.ospab.org/x86_64/index` (after the first upload).
 
 ## Adding or updating a package (on your PC)
+Windows (PowerShell 7), all in one — build, pack, index, sign, verify and optionally upload:
+```
+.\apps\build.ps1 -Repo D:\ospab-projects\tmt-repo -Upload user@server
+```
+Or step by step (Git Bash / WSL / Linux; in WSL set `USERPROFILE=/mnt/c/Users/<you>` so tmt finds the key):
 ```
 bash tools/tmt/build.sh                       # builds tools/tmt/bin/tmt
 bash apps/build.sh                            # or your own build; writes apps/dist/*.tmt
