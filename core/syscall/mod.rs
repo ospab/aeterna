@@ -16,6 +16,8 @@ instruction to jump to our handler entry point.
 
 extern crate alloc;
 
+pub mod objects;
+
 /// Syscall numbers for AETERNA microkernel
 /// Follows microkernel philosophy: minimal set, everything else via IPC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +119,16 @@ pub enum SyscallError {
     NoSuchProcess = -9,
     /// A pointer argument is outside user space or not mapped
     BadAddress = -10,
+    /// Handle value is not in the caller's table (never issued, closed, or stale)
+    BadHandle = -11,
+    /// Handle refers to an object of the wrong type for this call
+    WrongType = -12,
+    /// The other side of the IPC is gone (channel closed, reply handle dropped)
+    PeerClosed = -13,
+    /// Handle table full
+    TableFull = -14,
+    /// Timed out
+    Timeout = -15,
 }
 
 impl From<crate::mm::usercopy::UserCopyError> for SyscallError {
@@ -178,6 +190,22 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (121, |a| syscall_smr_send(a.arg1, a.arg2, a.arg3)),
     (122, |a| syscall_smr_recv(a.arg1)),
     (130, |a| syscall_dma_alloc(a.arg1, a.arg2)),
+    // Kernel objects and handles (docs/SYSCALL-ABI.md)
+    (200, |a| objects::handle_close(a.arg1)),
+    (201, |a| objects::handle_dup(a.arg1, a.arg2)),
+    (202, |a| objects::handle_info(a.arg1)),
+    (210, |_| objects::channel_create()),
+    (211, |a| objects::ipc_call(a.arg1, a.arg2, a.arg3)),
+    (212, |a| objects::ipc_send(a.arg1, a.arg2)),
+    (213, |a| objects::ipc_recv(a.arg1, a.arg2, a.arg3)),
+    (214, |a| objects::ipc_reply(a.arg1, a.arg2)),
+    (220, |_| objects::notify_create()),
+    (221, |a| objects::notify_signal(a.arg1, a.arg2)),
+    (222, |a| objects::notify_wait(a.arg1, a.arg2)),
+    (230, |_| objects::process_self()),
+    (231, |_| objects::thread_self()),
+    (232, |a| objects::process_wait(a.arg1, a.arg2, a.arg3)),
+    (233, |a| objects::process_kill(a.arg1)),
 ];
 
 /// Dispatch a syscall by looking up the number in the dispatch table
@@ -406,6 +434,14 @@ fn can_serial_write() -> bool {
 /// sys_write(fd, buf_ptr, len) — write bytes to a file descriptor.
 /// fd=1 → serial+framebuffer (stdout), fd=2 → serial (stderr).
 /// fd≥3 → VFS file write.
+/// Set by the console when it starts: from then on fd 1/2 of ring-3 programs also
+/// reach the shell's output (before that, e.g. boot self-tests, serial only).
+static CONSOLE_STDOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_console_stdout(on: bool) {
+    CONSOLE_STDOUT.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     let len = (len as usize).min(MAX_IO_CHUNK);
     // stdout/stderr → serial output
@@ -419,6 +455,16 @@ fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
         };
         for &b in &buf {
             crate::arch::x86_64::serial::write_byte(b);
+        }
+        // Once the console runs, a program's output also goes where the shell's current
+        // stdout/stderr goes (screen, pipe or redirect): the shell waits for the program.
+        if CONSOLE_STDOUT.load(core::sync::atomic::Ordering::Relaxed) {
+            let text = alloc::string::String::from_utf8_lossy(&buf);
+            if fd == 1 {
+                crate::userspace::plum::io::out(&text);
+            } else {
+                crate::userspace::plum::io::err(&text);
+            }
         }
         return len as i64;
     }

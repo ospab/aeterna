@@ -94,6 +94,7 @@ pub fn init() {
     }
     let (y, mo, d, h, mi, s) = read_rtc();
     if (1..=12).contains(&mo) && (1..=31).contains(&d) && h < 24 && mi < 60 && s < 61 {
+        // RTC_OFFSET_SECS is still 0 here; the saved offset is applied once the VFS is up.
         set(from_civil(y, mo, d, h, mi, s), Source::Rtc);
         let mut buf = [0u8; 40];
         let n = format(now(), 0, &mut buf);
@@ -103,6 +104,47 @@ pub fn init() {
     } else {
         serial::write_str("[TIME] RTC returned garbage, clock left unset\r\n");
     }
+}
+
+// ─── RTC kept in local time ─────────────────────────────────────────────────
+//
+// Windows and VMware keep the CMOS clock in local time. We never write the RTC
+// (that would break a Windows dual boot); instead the offset RTC − UTC is learned
+// when NTP succeeds and saved to /etc/rtc_offset, then applied at the next boot.
+
+pub const RTC_OFFSET_FILE: &str = "/etc/rtc_offset";
+
+static mut RTC_OFFSET_SECS: i64 = 0;
+
+pub fn rtc_offset() -> i64 { unsafe { RTC_OFFSET_SECS } }
+
+/// Set the RTC − UTC offset; a clock still running on the RTC is corrected at once.
+pub fn set_rtc_offset(secs: i64) {
+    unsafe {
+        let delta = secs - RTC_OFFSET_SECS;
+        RTC_OFFSET_SECS = secs;
+        if SOURCE == Source::Rtc {
+            BASE_NS = BASE_NS.saturating_sub(delta.saturating_mul(NS_PER_SEC));
+        }
+    }
+}
+
+/// After an NTP sync: compare with the raw RTC and learn a local-time offset.
+/// Offsets are rounded to 15 minutes (all real time zones); anything else is drift.
+/// Returns Some(offset) when it changed.
+pub fn learn_rtc_offset() -> Option<i64> {
+    if source() != Source::Ntp { return None; }
+    let (y, mo, d, h, mi, s) = read_rtc();
+    let rtc = from_civil(y, mo, d, h, mi, s).div_euclid(NS_PER_SEC);
+    let diff = rtc - now_secs();
+    let quarter = 15 * 60;
+    let rounded = (diff + quarter / 2).div_euclid(quarter) * quarter;
+    if (diff - rounded).abs() > 120 || rounded.abs() > 14 * 3600 {
+        return None; // RTC is simply off; not a time-zone offset
+    }
+    if rounded == rtc_offset() { return None; }
+    unsafe { RTC_OFFSET_SECS = rounded; }
+    Some(rounded)
 }
 
 // ─── Unix interchange ───────────────────────────────────────────────────────

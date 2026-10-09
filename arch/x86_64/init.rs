@@ -66,11 +66,12 @@ pub fn enable_avx() {
             return;
         }
 
-        // Write XCR0: enable x87 (bit 0) + SSE/XMM (bit 1) + AVX/YMM (bit 2)
+        // Write XCR0 = x87 (bit 0) + SSE/XMM (bit 1) + AVX/YMM (bit 2) exactly: the
+        // per-task save area is sized for these components only.
         asm!(
             "xor ecx, ecx",   // XCR0 selector = 0
-            "xgetbv",          // EAX ← XCR0[31:0], EDX ← XCR0[63:32]
-            "or eax, 7",       // set bits 0,1,2
+            "mov eax, 7",
+            "xor edx, edx",
             "xsetbv",
             out("eax") _,
             out("ecx") _,
@@ -78,7 +79,83 @@ pub fn enable_avx() {
             options(nostack, nomem)
         );
 
-        serial::write_str("[ARCH] AVX/YMM enabled (CR4.OSXSAVE + XCR0[2])\r\n");
+        serial::write_str("[ARCH] AVX/YMM enabled (CR4.OSXSAVE + XCR0[2])
+");
+        setup_xsave(7);
+    }
+}
+
+// ── Per-task FPU/SIMD state: XSAVE when the CPU has it, FXSAVE otherwise ─────────────
+// Read by the ISR stubs in idt.rs (via `sym`), so they are plain statics.
+
+/// 1 = context switches use XSAVE/XRSTOR, 0 = FXSAVE/FXRSTOR.
+#[no_mangle]
+pub static mut XSAVE_ENABLED: u8 = 0;
+/// Bytes to reserve for one save area (>= 512; XSAVE: CPUID.0Dh.0:EBX for the enabled XCR0).
+#[no_mangle]
+pub static mut XSAVE_AREA_SIZE: u64 = 512;
+/// Requested-feature bitmap passed in EDX:EAX to XSAVE/XRSTOR (= XCR0).
+#[no_mangle]
+pub static mut XSAVE_MASK_LO: u32 = 0;
+#[no_mangle]
+pub static mut XSAVE_MASK_HI: u32 = 0;
+
+/// Largest save area a task can hold (x87 + SSE + AVX needs 832 bytes).
+pub const XSAVE_AREA_MAX: usize = 1024;
+
+/// Size of the XSAVE/FXSAVE image the context switch writes per task.
+pub fn xsave_area_size() -> usize {
+    unsafe { XSAVE_AREA_SIZE as usize }
+}
+
+/// Whether context switches use XSAVE (true) or FXSAVE (false).
+pub fn xsave_enabled() -> bool {
+    unsafe { XSAVE_ENABLED != 0 }
+}
+
+/// Load the FPU/SIMD state from `area` (the format the stubs saved it in).
+///
+/// # Safety
+/// `area` must be 64-byte aligned and hold a valid image of `xsave_area_size()` bytes.
+pub unsafe fn restore_fpu_state(area: *const u8) {
+    if XSAVE_ENABLED != 0 {
+        asm!("xrstor [{}]", in(reg) area, in("eax") XSAVE_MASK_LO, in("edx") XSAVE_MASK_HI,
+            options(nostack));
+    } else {
+        asm!("fxrstor [{}]", in(reg) area, options(nostack));
+    }
+}
+
+/// Decide on XSAVE for context switches once XCR0 is final.
+fn setup_xsave(xcr0: u32) {
+    use core::arch::x86_64::__cpuid_count;
+    unsafe {
+        // Trust the hypervisor only as far as it is self-consistent: read XCR0 back, and
+        // take the area size CPUID reports for exactly those components.
+        let (lo, hi): (u32, u32);
+        asm!("xor ecx, ecx", "xgetbv", out("eax") lo, out("edx") hi, out("ecx") _,
+            options(nostack, nomem));
+        let xcr0 = lo;
+        let leaf = __cpuid_count(0xD, 0);
+        let size = leaf.ebx as usize; // size for the currently enabled XCR0 components
+        // Minimum plausible size: legacy 512 + header 64, plus 256 for YMM when enabled.
+        let min = 576 + if xcr0 & 4 != 0 { 256 } else { 0 };
+        if hi != 0 || xcr0 & 3 != 3 || size < min || size > XSAVE_AREA_MAX || leaf.eax & xcr0 != xcr0 {
+            // Cannot hold it: fall back to the legacy image and drop the YMM state from XCR0.
+            asm!("xor ecx, ecx", "mov eax, 3", "xor edx, edx", "xsetbv",
+                out("eax") _, out("ecx") _, out("edx") _, options(nostack, nomem));
+            serial::write_str("[ARCH] XSAVE area too large, AVX disabled, using FXSAVE
+");
+            return;
+        }
+        XSAVE_AREA_SIZE = size as u64;
+        XSAVE_MASK_LO = xcr0;
+        XSAVE_MASK_HI = 0;
+        XSAVE_ENABLED = 1;
+        serial::write_str("[ARCH] Context switch uses XSAVE (area ");
+        serial_dec(size as u64);
+        serial::write_str(" bytes)
+");
     }
 }
 

@@ -26,6 +26,12 @@ static mut HEAP_INITIALIZED: bool = false;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// True while some code holds the heap lock (an interrupt handler must not allocate or
+/// free then: it would wait for itself).
+pub fn is_locked() -> bool {
+    ALLOCATOR.is_locked()
+}
+
 /// Get the actual heap size that was allocated
 pub fn heap_size() -> usize {
     unsafe { HEAP_ACTUAL }

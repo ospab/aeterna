@@ -7,3 +7,4 @@ pub mod capability;
 pub mod scheduler;
 pub mod syscall;
 pub mod elf;
+pub mod object;

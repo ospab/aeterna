@@ -1,0 +1,9 @@
+[package]
+name = "ipcclient"
+description = "IPC client used by the boot self-test: talks to ipcsrv and checks rights, errors and handle transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

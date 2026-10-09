@@ -1,0 +1,5 @@
+# Host builds of oos-ui (tests, PNG mockups).  The kernel's ../.cargo/config.toml
+# would otherwise force the bare-metal target and build-std on this crate.
+[build]
+target = "host-tuple"
+target-dir = "target"

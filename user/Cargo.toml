@@ -1,5 +1,5 @@
 [workspace]
-members = ["liboos", "hello"]
+members = ["liboos", "hello", "ipcsrv", "ipcclient"]
 resolver = "2"
 
 [workspace.package]

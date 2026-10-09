@@ -1,0 +1,9 @@
+[package]
+name = "ipcsrv"
+description = "IPC echo server used by the boot self-test: channel recv/reply, notifications, handle transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

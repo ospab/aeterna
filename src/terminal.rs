@@ -121,6 +121,8 @@ pub fn run() -> ! {
     print_banner();
 
     klog::record(klog::EventSource::Terminal, "Terminal started");
+    ospab_os::core::syscall::set_console_stdout(true);
+    init_clock();
 
     loop {
         draw_prompt();
@@ -130,6 +132,28 @@ pub fn run() -> ! {
             // Copy out of the static input buffer: commands may re-enter the line editor.
             let owned = String::from(cmd);
             execute_command(&owned);
+        }
+    }
+}
+
+/// Wall clock at console start: apply the saved CMOS offset (RTC kept in local time,
+/// see time::learn_rtc_offset), then try one quick NTP sync if the network is up.
+fn init_clock() {
+    use ospab_os::time;
+    if let Some(data) = fs::read_file(time::RTC_OFFSET_FILE) {
+        if let Some(off) = core::str::from_utf8(&data).ok().and_then(|s| s.trim().parse::<i64>().ok()) {
+            time::set_rtc_offset(off);
+        }
+    }
+    if ospab_os::net::is_up() {
+        let server = ospab_os::net::sntp::NTP_FALLBACKS[0];
+        match ospab_os::net::sntp::sync_time(server) {
+            Ok(_) => ospab_os::arch::x86_64::serial::write_str("[TIME] synced via NTP at console start\r\n"),
+            Err(e) => {
+                ospab_os::arch::x86_64::serial::write_str("[TIME] NTP at console start failed: ");
+                ospab_os::arch::x86_64::serial::write_str(e.as_str());
+                ospab_os::arch::x86_64::serial::write_str("\r\n");
+            }
         }
     }
 }

@@ -203,7 +203,7 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     boot_log!(Status::Ok, "Root filesystem", "RAM overlay, {} system files, /proc", base_ramfs.node_count());
 
     // ══════════════════════════════════════════════
-    // Phase 3.5: Storage (ATA PIO + AHCI SATA)
+    // Phase 3.5: Storage (ATA PIO + AHCI SATA + NVMe + virtio-blk)
     // ══════════════════════════════════════════════
     boot_step("Storage");
     let disk_count = ospab_os::drivers::init();
@@ -241,7 +241,7 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
             }
         }
     } else {
-        boot_log!(Status::Absent, "Storage", "no ATA/AHCI disks");
+        boot_log!(Status::Absent, "Storage", "no ATA/AHCI/NVMe/virtio disks");
     }
 
     // ══════════════════════════════════════════════
@@ -266,10 +266,19 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
         boot_log!(Status::Absent, "Audio", "no supported card (HDA, AC97, ES1371/ES1370)");
     }
 
+    // NVMe controllers are probed inside drivers::init() (and show up in the
+    // Storage list above); this step only reads the GPT of the NVMe disk and
+    // auto-mounts an AeternaFS partition.
+    boot_step("USB");
+    if ospab_os::xhci::init() {
+        let (kbd, mouse) = ospab_os::xhci::hid_counts();
+        boot_log!(Status::Ok, "USB", "xHCI, {} keyboard(s), {} mouse/mice", kbd, mouse);
+    } else {
+        boot_log!(Status::Absent, "USB", "no xHCI controller");
+    }
+
     boot_step("NVMe");
-    if ospab_os::drivers::registry::try_init_driver("NVMe SSD", || {
-        ospab_os::drivers::nvme::probe_and_init()
-    }) {
+    if ospab_os::drivers::nvme::is_initialized() {
         let mut nvme_disk = ospab_os::drivers::block::NvmeDisk::new();
         let gpt_parts = ospab_os::drivers::gpt::parse(&mut nvme_disk).unwrap_or(0);
         ospab_os::drivers::block::register_devices();
@@ -352,12 +361,15 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
 /// frame they used came back. One status line; details go to serial as [RING3].
 fn ring3_self_test() {
     use ospab_os::arch::x86_64::ring;
-    use ospab_os::core::scheduler::wait_pid;
+    use ospab_os::core::scheduler::wait_pid_timeout;
+    // Every wait is bounded (10 s of uptime, task killed on expiry): a broken test fails, never hangs the boot.
+    let wait_pid = |pid: u32| wait_pid_timeout(pid, 1000);
 
     boot_step("Ring 3 self-test");
     let frames_before = ospab_os::mm::physical::frames_free();
+    let objects_before = ospab_os::core::object::live_objects();
     let mut passed = 0u32;
-    let mut failed: [&str; 5] = [""; 5];
+    let mut failed: [&str; 8] = [""; 8];
     let mut nfailed = 0usize;
     let mut check = |name: &'static str, ok: bool| {
         serial_line!("[RING3] {}: {}", name, if ok { "pass" } else { "FAIL" });
@@ -385,6 +397,12 @@ fn ring3_self_test() {
         Some(pid) => check("usercopy", wait_pid(pid) == Some(0x600D)),
         None => check("usercopy", false),
     }
+    // Two tasks keep different 256-bit patterns in ymm0/ymm15 while being preempted:
+    // XSAVE must keep the upper halves apart. Skipped on CPUs without AVX.
+    match ring::launch_ring3_avx_test() {
+        Some((a, b)) => check("avx (XSAVE)", wait_pid(a) == Some(a as i64) && wait_pid(b) == Some(b as i64)),
+        None => serial_line!("[RING3] avx (XSAVE): skipped (no AVX)"),
+    }
     // First real program: an ELF built with liboos (user/hello), exits 0
     #[cfg(user_hello)]
     {
@@ -403,6 +421,75 @@ fn ring3_self_test() {
         }
     }
 
+    // IPC: an echo server and a client, both ELF programs built with liboos. The client
+    // checks messages, notifications, handle transfer both ways, rights and error codes,
+    // then has the server exit(42). Two more clients block forever inside the kernel
+    // (recv / call) and are killed: their handles and objects must be released.
+    // Opt-in until the IPC path is proven: a hang here blocks every boot.
+    #[cfg(user_ipc)]
+    'ipc: {
+        if ospab_os::arch::x86_64::boot::cmdline_get("selftest") != "ipc" {
+            serial_line!("[RING3] ipc tests: skipped (boot with selftest=ipc to run them)");
+            break 'ipc;
+        }
+        use ospab_os::core::object::{self, rights};
+        use ospab_os::core::scheduler::{self, Capability, TaskState};
+        static SRV: &[u8] = include_bytes!(env!("OOS_USER_IPCSRV"));
+        static CLI: &[u8] = include_bytes!(env!("OOS_USER_IPCCLIENT"));
+        let serial_cap = || alloc::vec![Capability::Serial];
+        let run = || -> Result<(u32, u32), &'static str> {
+            let chan = object::kernel_new_channel().ok_or("channel")?;
+            let notif = object::kernel_new_notification().ok_or("notification")?;
+            let srv = ospab_os::core::elf::spawn_with_handles(
+                "ipcsrv", SRV, &["ipcsrv"], serial_cap(),
+                &[(chan, rights::READ), (notif, rights::WRITE)],
+            ).map_err(|_| "spawn server")?;
+            let srv_obj = object::kernel_new_process(srv).ok_or("process object")?;
+            let cli = ospab_os::core::elf::spawn_with_handles(
+                "ipcclient", CLI, &["ipcclient"], serial_cap(),
+                &[(chan, rights::WRITE | rights::DUP), (notif, rights::READ), (srv_obj, rights::READ)],
+            ).map_err(|_| "spawn client")?;
+            Ok((srv, cli))
+        };
+        match run() {
+            Ok((srv, cli)) => {
+                let c = scheduler::wait_pid_timeout(cli, 1500);
+                let s = scheduler::wait_pid_timeout(srv, 500);
+                serial_line!("[RING3] ipc client exit {:?}, server exit {:?}", c, s);
+                check("ipc client/server", c == Some(0) && s == Some(42));
+            }
+            Err(what) => {
+                serial_line!("[RING3] ipc setup failed: {}", what);
+                check("ipc client/server", false);
+            }
+        }
+
+        let mut killed_ok = true;
+        for mode in ["block-recv", "block-call"] {
+            let spawned = object::kernel_new_channel().and_then(|chan| {
+                ospab_os::core::elf::spawn_with_handles(
+                    "ipcblock", CLI, &["ipcclient", mode], serial_cap(),
+                    &[(chan, rights::ALL)],
+                ).ok()
+            });
+            match spawned {
+                Some(pid) => {
+                    let until = ospab_os::arch::x86_64::idt::timer_ticks() + 20;
+                    while ospab_os::arch::x86_64::idt::timer_ticks() < until {
+                        scheduler::sys_yield();
+                    }
+                    let asleep = scheduler::task_state(pid) == Some(TaskState::Waiting);
+                    scheduler::exit_pid(pid);
+                    let code = scheduler::wait_pid_timeout(pid, 300);
+                    serial_line!("[RING3] ipc {}: asleep={} exit={:?}", mode, asleep, code);
+                    killed_ok &= asleep && code == Some(scheduler::EXIT_KILLED);
+                }
+                None => killed_ok = false,
+            }
+        }
+        check("ipc kill while blocked", killed_ok);
+    }
+
     // Dead tasks are reaped lazily by the scheduler; give it a few ticks, then every
     // frame the tests used (kernel stacks, page tables, stacks, mmap) must be back.
     for _ in 0..10 {
@@ -410,6 +497,9 @@ fn ring3_self_test() {
     }
     let leaked = frames_before.saturating_sub(ospab_os::mm::physical::frames_free());
     check("no frame leak", leaked == 0);
+    let live = ospab_os::core::object::live_objects();
+    serial_line!("[RING3] kernel objects: {} before, {} after", objects_before, live);
+    check("no object leak", live == objects_before);
 
     if nfailed == 0 {
         boot_log!(Status::Ok, "Ring 3 self-test", "{} checks passed", passed);
@@ -503,11 +593,15 @@ const COLOR_BG: u32    = 0x00000000;
 fn boot_banner() {
     serial::write_str("\r\n[BOOT] ospab.os ");
     serial::write_str(version::VERSION_STR);
-    serial::write_str(", AETERNA kernel\r\n");
+    serial::write_str(", AETERNA kernel ");
+    serial::write_str(version::KERNEL_BUILD);
+    serial::write_str("\r\n");
     if framebuffer::is_initialized() {
         framebuffer::draw_string("ospab.os ", COLOR_WHITE, COLOR_BG);
         framebuffer::draw_string(version::VERSION_STR, COLOR_WHITE, COLOR_BG);
-        framebuffer::draw_string("  AETERNA kernel\n\n", COLOR_DIM, COLOR_BG);
+        framebuffer::draw_string("  AETERNA kernel ", COLOR_DIM, COLOR_BG);
+        framebuffer::draw_string(version::KERNEL_BUILD, COLOR_DIM, COLOR_BG);
+        framebuffer::draw_string("\n\n", COLOR_DIM, COLOR_BG);
     }
 }
 

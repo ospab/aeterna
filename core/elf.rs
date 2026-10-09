@@ -263,8 +263,23 @@ pub fn spawn(
     args: &[&str],
     capabilities: Vec<crate::core::scheduler::Capability>,
 ) -> Result<u32, ElfError> {
+    spawn_with_handles(name, image, args, capabilities, &[])
+}
+
+/// Like [`spawn`], and the new process starts with `handles` (kernel object, rights) already
+/// in its handle table: they get the values 1, 2, 3... in order. Each object must have been
+/// created with `object::kernel_new_*`; the kernel's own claim is released afterwards.
+pub fn spawn_with_handles(
+    name: &str,
+    image: &[u8],
+    args: &[&str],
+    capabilities: Vec<crate::core::scheduler::Capability>,
+    handles: &[(crate::core::object::ObjId, u32)],
+) -> Result<u32, ElfError> {
     let (entry, segs) = parse(image)?;
     let cr3 = vmm::create_address_space().ok_or(ElfError::OutOfMemory)?;
+    // Once the task exists the scheduler owns the address space (it frees it on reaping).
+    let task_owns_cr3 = core::cell::Cell::new(false);
 
     let result = (|| {
         for s in &segs {
@@ -272,18 +287,33 @@ pub fn spawn(
         }
         let rsp = build_stack(cr3, entry, args)?;
         vmm::sync_kernel_mappings(cr3);
-        crate::core::scheduler::spawn_user_task(
-            name,
-            crate::core::scheduler::Priority::Normal,
-            cr3,
-            entry,
-            rsp,
-            capabilities,
-        )
-        .ok_or(ElfError::SpawnFailed)
+        // The task becomes runnable inside spawn_user_task: install its handles before the
+        // next timer tick can start it.
+        crate::core::scheduler::without_interrupts(|| {
+            let pid = crate::core::scheduler::spawn_user_task(
+                name,
+                crate::core::scheduler::Priority::Normal,
+                cr3,
+                entry,
+                rsp,
+                capabilities,
+            )
+            .ok_or(ElfError::SpawnFailed)?;
+            task_owns_cr3.set(true);
+            for &(obj, rights) in handles {
+                if crate::core::object::kernel_install(pid, obj, rights).is_none() {
+                    crate::core::scheduler::exit_pid(pid);
+                    return Err(ElfError::SpawnFailed);
+                }
+            }
+            Ok(pid)
+        })
     })();
 
-    if result.is_err() {
+    for &(obj, _) in handles {
+        crate::core::object::kernel_release(obj);
+    }
+    if result.is_err() && !task_owns_cr3.get() {
         vmm::destroy_address_space(cr3);
     }
     result

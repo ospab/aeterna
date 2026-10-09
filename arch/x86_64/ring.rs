@@ -113,6 +113,86 @@ pub unsafe extern "C" fn ring3_stress_entry() -> ! {
     );
 }
 
+/// Ring-3 AVX program: two copies run at once and each keeps a distinct 256-bit pattern in
+/// ymm0 and ymm15 (upper halves included). Preemption must save/restore the full YMM state
+/// (XSAVE); with FXSAVE the upper halves would leak from one task into the other.
+/// Exits with its PID on success, `STRESS_FAIL_CODE` on any mismatch.
+#[unsafe(naked)]
+pub unsafe extern "C" fn ring3_avx_entry() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, 22",          // getpid
+        "syscall",
+        "mov r12, rax",         // pattern A = pid
+        "mov r13, rax",
+        "not r13",              // pattern B = !pid
+        "vmovq xmm0, r12",
+        "vpunpcklqdq xmm0, xmm0, xmm0",
+        "vinsertf128 ymm0, ymm0, xmm0, 1",
+        "vmovq xmm15, r13",
+        "vpunpcklqdq xmm15, xmm15, xmm15",
+        "vinsertf128 ymm15, ymm15, xmm15, 1",
+        "mov rbx, 10",          // iterations, ~20 ms each
+        "2:",
+        "mov rax, 51",          // uptime
+        "syscall",
+        "lea r14, [rax + 2]",
+        "3:",
+        "mov rcx, 10000",
+        "4:",
+        "pause",
+        "dec rcx",
+        "jnz 4b",
+        "mov rax, 51",
+        "syscall",
+        "cmp rax, r14",
+        "jb 3b",
+        "sub rsp, 64",
+        "vmovdqu [rsp], ymm0",
+        "vmovdqu [rsp + 32], ymm15",
+        "cmp [rsp], r12",
+        "jne 9f",
+        "cmp [rsp + 8], r12",
+        "jne 9f",
+        "cmp [rsp + 16], r12",
+        "jne 9f",
+        "cmp [rsp + 24], r12",
+        "jne 9f",
+        "cmp [rsp + 32], r13",
+        "jne 9f",
+        "cmp [rsp + 40], r13",
+        "jne 9f",
+        "cmp [rsp + 48], r13",
+        "jne 9f",
+        "cmp [rsp + 56], r13",
+        "jne 9f",
+        "add rsp, 64",
+        "dec rbx",
+        "jnz 2b",
+        "mov rdi, r12",         // exit(pid): success
+        "mov rax, 0",
+        "syscall",
+        "ud2",
+        "9:",
+        "mov rdi, {fail}",
+        "mov rax, 0",
+        "syscall",
+        "ud2",
+        fail = const STRESS_FAIL_CODE,
+    );
+}
+
+/// Spawn two AVX tasks back to back (see `ring3_avx_entry`). None when the CPU has no AVX/XSAVE.
+pub fn launch_ring3_avx_test() -> Option<(u32, u32)> {
+    if !crate::arch::x86_64::init::xsave_enabled() {
+        return None;
+    }
+    crate::core::scheduler::set_preemption_disabled(true);
+    let a = launch_embedded("ring3-avx-a", ring3_avx_entry as *const () as u64);
+    let b = launch_embedded("ring3-avx-b", ring3_avx_entry as *const () as u64);
+    crate::core::scheduler::set_preemption_disabled(false);
+    Some((a?, b?))
+}
+
 /// Exit code of the user-copy test on success.
 pub const USERCOPY_OK_CODE: u64 = 0x600D;
 

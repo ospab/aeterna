@@ -180,6 +180,12 @@ pub fn sync_time(server_ip: [u8; 4]) -> Result<u64, SntpError> {
     let frac  = u32::from_be_bytes([resp[44], resp[45], resp[46], resp[47]]);
     let nanos = ((frac as u64 * 1_000_000_000) >> 32) as u32;
     crate::time::set(crate::time::from_unix(ts as i64, nanos), crate::time::Source::Ntp);
+    // Learn whether the CMOS clock runs in local time and remember it for offline boots.
+    if let Some(off) = crate::time::learn_rtc_offset() {
+        let text = alloc::format!("{}\n", off);
+        crate::fs::write_file(crate::time::RTC_OFFSET_FILE, text.as_bytes());
+        crate::arch::x86_64::serial::write_str("[TIME] CMOS clock offset from UTC learned and saved\r\n");
+    }
     unsafe { TZ_LOADED = false; } // re-read timezone on next query
     let _ = read_timezone_offset();
     Ok(ts)

@@ -283,19 +283,45 @@ macro_rules! irq_handler {
                 "push r13",
                 "push r14",
                 "push r15",
-                // ── Save FPU/SSE state (512 bytes, must be 16-byte aligned) ──
+                // ── Save FPU/SIMD state: XSAVE (64-byte aligned) or FXSAVE ──
                 // rbp is already saved on the stack; re-use it as a frame ptr
                 "mov rbp, rsp",        // save GPR-area pointer
-                "sub rsp, 512",
-                "and rsp, -16",        // force 16-byte alignment for fxsave
+                "mov rax, [rip + {xsz}]",
+                "sub rsp, rax",
+                "and rsp, -64",        // 64-byte alignment (xsave requirement)
+                "cmp byte ptr [rip + {xen}], 0",
+                "je 5f",
+                // XSAVE writes only XSTATE_BV of the header; XRSTOR faults on stale reserved bytes.
+                "mov qword ptr [rsp + 512], 0",
+                "mov qword ptr [rsp + 520], 0",
+                "mov qword ptr [rsp + 528], 0",
+                "mov qword ptr [rsp + 536], 0",
+                "mov qword ptr [rsp + 544], 0",
+                "mov qword ptr [rsp + 552], 0",
+                "mov qword ptr [rsp + 560], 0",
+                "mov qword ptr [rsp + 568], 0",
+                "mov eax, [rip + {xlo}]",
+                "mov edx, [rip + {xhi}]",
+                "xsave [rsp]",
+                "jmp 6f",
+                "5:",
                 "fxsave [rsp]",
+                "6:",
                 "mov rdi, rbp",        // saved_state = GPR save area
                 "mov rsi, {}",
-                "mov rdx, rsp",        // fx_area = FPU/SSE save area
+                "mov rdx, rsp",        // fx_area = FPU/SIMD save area
                 "call {}",
-                // ── Restore FPU/SSE state ──
+                // ── Restore FPU/SIMD state ──
+                "cmp byte ptr [rip + {xen}], 0",
+                "je 3f",
+                "mov eax, [rip + {xlo}]",
+                "mov edx, [rip + {xhi}]",
+                "xrstor [rsp]",
+                "jmp 4f",
+                "3:",
                 "fxrstor [rsp]",
-                "mov rsp, rbp",        // restore exact pre-fxsave RSP
+                "4:",
+                "mov rsp, rbp",        // restore exact pre-save RSP
                 "pop r15",
                 "pop r14",
                 "pop r13",
@@ -319,6 +345,10 @@ macro_rules! irq_handler {
                 "iretq",
                 const $irq,
                 sym irq_dispatch,
+                xsz = sym crate::arch::x86_64::init::XSAVE_AREA_SIZE,
+                xen = sym crate::arch::x86_64::init::XSAVE_ENABLED,
+                xlo = sym crate::arch::x86_64::init::XSAVE_MASK_LO,
+                xhi = sym crate::arch::x86_64::init::XSAVE_MASK_HI,
             );
         }
     };
@@ -385,17 +415,43 @@ pub extern "C" fn apic_timer_isr() {
         "push r13",
         "push r14",
         "push r15",
-        // ── Save FPU/SSE state (512 bytes, 16-byte aligned) ──
+        // ── Save FPU/SIMD state: XSAVE (64-byte aligned) or FXSAVE ──
         "mov rbp, rsp",        // save GPR-area pointer
-        "sub rsp, 512",
-        "and rsp, -16",        // 16-byte align for fxsave
+        "mov rax, [rip + {xsz}]",
+        "sub rsp, rax",
+        "and rsp, -64",        // 64-byte alignment (xsave requirement)
+        "cmp byte ptr [rip + {xen}], 0",
+        "je 5f",
+        // XSAVE writes only XSTATE_BV of the header; XRSTOR faults on stale reserved bytes.
+        "mov qword ptr [rsp + 512], 0",
+        "mov qword ptr [rsp + 520], 0",
+        "mov qword ptr [rsp + 528], 0",
+        "mov qword ptr [rsp + 536], 0",
+        "mov qword ptr [rsp + 544], 0",
+        "mov qword ptr [rsp + 552], 0",
+        "mov qword ptr [rsp + 560], 0",
+        "mov qword ptr [rsp + 568], 0",
+        "mov eax, [rip + {xlo}]",
+        "mov edx, [rip + {xhi}]",
+        "xsave [rsp]",
+        "jmp 6f",
+        "5:",
         "fxsave [rsp]",
+        "6:",
         "mov rdi, rbp",        // saved_state = GPR save area
-        "mov rsi, rsp",        // fx_area = FPU/SSE save area
+        "mov rsi, rsp",        // fx_area = FPU/SIMD save area
         "call {}",
-        // ── Restore FPU/SSE state ──
+        // ── Restore FPU/SIMD state ──
+        "cmp byte ptr [rip + {xen}], 0",
+        "je 3f",
+        "mov eax, [rip + {xlo}]",
+        "mov edx, [rip + {xhi}]",
+        "xrstor [rsp]",
+        "jmp 4f",
+        "3:",
         "fxrstor [rsp]",
-        "mov rsp, rbp",        // restore exact pre-fxsave RSP
+        "4:",
+        "mov rsp, rbp",        // restore exact pre-save RSP
         "pop r15",
         "pop r14",
         "pop r13",
@@ -418,6 +474,10 @@ pub extern "C" fn apic_timer_isr() {
         "8:",
         "iretq",
         sym apic_timer_dispatch,
+        xsz = sym crate::arch::x86_64::init::XSAVE_AREA_SIZE,
+        xen = sym crate::arch::x86_64::init::XSAVE_ENABLED,
+        xlo = sym crate::arch::x86_64::init::XSAVE_MASK_LO,
+        xhi = sym crate::arch::x86_64::init::XSAVE_MASK_HI,
     );
 }
 

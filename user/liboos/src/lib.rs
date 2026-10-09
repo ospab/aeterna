@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub mod sys;
+pub mod ipc;
 mod heap;
 mod rt;
 

@@ -51,10 +51,11 @@ const FRAME_WORDS: usize = 21; // r15..rax, err, rip, cs, rflags, rsp, ss
 /// Kernel stack given to every ring-3 task (syscalls and interrupts from ring 3 run on it).
 const KSTACK_FRAMES: u64 = 4; // 16 KiB
 
-/// FXSAVE image (x87 + SSE state), saved per task on every context switch.
+/// Per-task FPU/SIMD image, saved on every context switch: XSAVE (x87 + SSE + AVX) when the
+/// CPU has it, else the 512-byte FXSAVE layout. 64-byte aligned as XSAVE requires.
 #[derive(Clone)]
-#[repr(C, align(16))]
-pub struct FxArea([u8; 512]);
+#[repr(C, align(64))]
+pub struct FxArea([u8; crate::arch::x86_64::init::XSAVE_AREA_MAX]);
 
 impl core::fmt::Debug for FxArea {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -63,9 +64,10 @@ impl core::fmt::Debug for FxArea {
 }
 
 impl FxArea {
-    /// State after FNINIT with default MXCSR: all exceptions masked, round-to-nearest.
+    /// State after FNINIT with default MXCSR, all vector registers zero. For XSAVE the
+    /// header (XSTATE_BV at 512, zero) says every component is in its init state.
     fn initial() -> alloc::boxed::Box<FxArea> {
-        let mut a = FxArea([0; 512]);
+        let mut a = FxArea([0; crate::arch::x86_64::init::XSAVE_AREA_MAX]);
         a.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
         a.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
         alloc::boxed::Box::new(a)
@@ -97,6 +99,12 @@ pub struct TaskControlBlock {
     pub kstack_top: u64,
     /// Next free virtual address for mmap in this task's address space (0 = not started).
     pub mmap_next: u64,
+    /// Kernel-object handles of this process (see core/object.rs).
+    pub handles: crate::core::object::HandleTable,
+    /// Reply object (+1) this task is blocked on inside `ipc_call`; 0 = none.
+    pub ipc_wait: u32,
+    /// Timer tick at which a Waiting task wakes up on its own; 0 = no deadline.
+    pub wake_at: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +174,9 @@ pub fn init() {
             kstack_phys: 0,
             kstack_top: 0,
             mmap_next: 0,
+            handles: crate::core::object::HandleTable::new(),
+            ipc_wait: 0,
+            wake_at: 0,
         });
         CURRENT_SLOT = 0;
         NEXT_PID = 1;
@@ -278,6 +289,9 @@ pub fn spawn_named(
                     kstack_phys: 0,
                     kstack_top: 0,
                     mmap_next: 0,
+                    handles: crate::core::object::HandleTable::new(),
+                    ipc_wait: 0,
+                    wake_at: 0,
                 });
                 return Some(pid);
             }
@@ -352,6 +366,9 @@ pub fn spawn_user_task(
                     kstack_phys,
                     kstack_top,
                     mmap_next: 0,
+                    handles: crate::core::object::HandleTable::new(),
+                    ipc_wait: 0,
+                    wake_at: 0,
                 });
                 return Some(pid);
             }
@@ -593,14 +610,26 @@ fn next_ready_slot() -> Option<usize> {
                 // Reap dead tasks (except kernel idle task at idx 0, and not the currently running slot)
                 if task.state == TaskState::Dead {
                     if idx != 0 && idx != CURRENT_SLOT {
+                        // Freeing may take the heap lock; if the interrupted code holds it,
+                        // try again on the next tick instead of deadlocking.
+                        if crate::mm::heap::is_locked() {
+                            continue;
+                        }
+                        let (pid, kstack_phys, cr3) = (task.pid, task.kstack_phys, task.cr3);
+                        let (handles, ipc_wait) = match TASKS[idx].as_mut() {
+                            Some(t) => (core::mem::take(&mut t.handles), t.ipc_wait),
+                            None => continue,
+                        };
                         // Safe to free the kernel stack: only the current task's stack is in use.
-                        if task.kstack_phys != 0 {
-                            crate::mm::physical::free_frames(task.kstack_phys, KSTACK_FRAMES);
+                        if kstack_phys != 0 {
+                            crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
                             // Ring-3 tasks own their address space: page tables and owned
                             // pages go back to the allocator (the CR3 is no longer active).
-                            crate::mm::r#virtual::destroy_address_space(task.cr3);
+                            crate::mm::r#virtual::destroy_address_space(cr3);
                         }
                         TASKS[idx] = None;
+                        // Close its handles (frees its kernel objects) and wake waiters.
+                        crate::core::object::task_reaped(pid, handles, ipc_wait);
                     }
                     continue;
                 }
@@ -662,10 +691,121 @@ pub fn sys_yield() {
     }
 }
 
+// ─── Blocking primitives for kernel objects (core/object.rs) ─────────────────────────
+
+/// Run `f` with interrupts disabled, restoring the previous interrupt state afterwards.
+pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags) };
+    let r = f();
+    if flags & 0x200 != 0 {
+        unsafe { core::arch::asm!("sti", options(nostack)) };
+    }
+    r
+}
+
+/// Put the current task to sleep until `wake(pid)`, a timer deadline (`deadline`, in
+/// `timer_ticks`; 0 = none) or any interrupt that ends HLT. Callers loop on their condition.
+/// Interrupts must be off on entry and are off again on return.
+pub fn park(deadline: u64) {
+    unsafe {
+        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
+            t.state = TaskState::Waiting;
+            t.wake_at = deadline;
+        }
+        // The timer interrupt that follows switches to another task; this one resumes here
+        // once it is Ready again.
+        // No `nomem`: this asm is a compiler barrier. The timer interrupt that ends the HLT
+        // reads and writes the task table, so the state stores above must not be delayed
+        // past it and the loads below must not be hoisted before it.
+        core::arch::asm!("sti; hlt; cli", options(nostack));
+        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
+            t.wake_at = 0;
+            if t.state == TaskState::Waiting {
+                t.state = TaskState::Running;
+            }
+        }
+    }
+}
+
+/// Make a Waiting task runnable again.
+pub fn wake(pid: TaskId) {
+    unsafe {
+        for t in TASKS.iter_mut().flatten() {
+            if t.pid == pid {
+                if t.state == TaskState::Waiting {
+                    t.state = TaskState::Ready;
+                    t.wake_at = 0;
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Wake tasks whose park deadline has passed. Called from the timer interrupt.
+fn wake_expired() {
+    let now = crate::arch::x86_64::idt::timer_ticks();
+    unsafe {
+        for t in TASKS.iter_mut().flatten() {
+            if t.state == TaskState::Waiting && t.wake_at != 0 && now >= t.wake_at {
+                t.state = TaskState::Ready;
+                t.wake_at = 0;
+            }
+        }
+    }
+}
+
+/// Does a task with this pid exist and not yet exited?
+pub fn task_alive(pid: TaskId) -> bool {
+    unsafe { TASKS.iter().flatten().any(|t| t.pid == pid && t.state != TaskState::Dead) }
+}
+
+/// Scheduler state of a task, if it exists.
+pub fn task_state(pid: TaskId) -> Option<TaskState> {
+    unsafe { TASKS.iter().flatten().find(|t| t.pid == pid).map(|t| t.state) }
+}
+
+/// Handle table of the running task.
+pub fn current_handles() -> &'static mut crate::core::object::HandleTable {
+    unsafe { &mut TASKS[CURRENT_SLOT].as_mut().expect("current task").handles }
+}
+
+/// Handle table of task `pid`, if it exists.
+pub fn handles_of(pid: TaskId) -> Option<&'static mut crate::core::object::HandleTable> {
+    unsafe { TASKS.iter_mut().flatten().find(|t| t.pid == pid).map(|t| &mut t.handles) }
+}
+
+/// Record the Reply object (+1) the running task is blocked on (0 = none), so the reaper
+/// can release it if the task dies while waiting.
+pub fn set_ipc_wait(v: u32) {
+    unsafe {
+        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
+            t.ipc_wait = v;
+        }
+    }
+}
+
+/// Like `wait_pid`, but gives up after `ticks` (100 Hz) and kills the task, so a broken
+/// test cannot hang the boot. Returns None on timeout.
+pub fn wait_pid_timeout(pid: TaskId, ticks: u64) -> Option<i64> {
+    let deadline = crate::arch::x86_64::idt::timer_ticks() + ticks;
+    loop {
+        if !task_alive(pid) {
+            return exit_code(pid);
+        }
+        if crate::arch::x86_64::idt::timer_ticks() >= deadline {
+            exit_pid(pid);
+            return None;
+        }
+        sys_yield();
+    }
+}
+
 /// Preempt the current task. Called from the timer ISRs and from the ring-3 fault path.
 ///
 /// `saved_state` points at the interrupted GPR + iretq frame. `fx_area` points at the
-/// FXSAVE image the ISR stub will FXRSTOR on return, or is null when the stub does not
+/// XSAVE/FXSAVE image the ISR stub will restore on return, or is null when the stub does not
 /// save FPU state (the exception path), in which case the next task's state is loaded here.
 pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
     unsafe {
@@ -673,6 +813,7 @@ pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
             return;
         }
 
+        wake_expired();
         let cur_slot = CURRENT_SLOT;
         if let Some(ref mut cur) = TASKS[cur_slot] {
             cur.cpu_ticks = cur.cpu_ticks.saturating_add(1);
@@ -695,7 +836,7 @@ pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
             }
             cur.has_frame = true;
             if !fx_area.is_null() {
-                core::ptr::copy_nonoverlapping(fx_area, cur.fx.0.as_mut_ptr(), 512);
+                core::ptr::copy_nonoverlapping(fx_area, cur.fx.0.as_mut_ptr(), crate::arch::x86_64::init::xsave_area_size());
             }
             if cur.state == TaskState::Running {
                 cur.state = TaskState::Ready;
@@ -751,10 +892,10 @@ pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
             }
 
             if fx_area.is_null() {
-                // The exception stub does no FXRSTOR on the way out: load the state now.
-                core::arch::asm!("fxrstor [{}]", in(reg) next.fx.0.as_ptr(), options(nostack));
+                // The exception stub does no restore on the way out: load the state now.
+                crate::arch::x86_64::init::restore_fpu_state(next.fx.0.as_ptr());
             } else {
-                core::ptr::copy_nonoverlapping(next.fx.0.as_ptr(), fx_area, 512);
+                core::ptr::copy_nonoverlapping(next.fx.0.as_ptr(), fx_area, crate::arch::x86_64::init::xsave_area_size());
             }
         }
     }
