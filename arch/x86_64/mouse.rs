@@ -134,8 +134,24 @@ unsafe fn process_byte(b: u8) {
     }
 }
 
+/// Add a movement from another source (USB HID mouse). `dy` follows the PS/2
+/// convention (positive = up). Buttons: bit0 left, bit1 right, bit2 middle.
+pub fn inject(dx: i32, dy: i32, btns: u8) {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem));
+        MOUSE_DX += dx;
+        MOUSE_DY += dy;
+        MOUSE_BTNS = btns & 0x07;
+        if flags & (1 << 9) != 0 {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+}
+
 /// Consume accumulated deltas
 pub fn poll() -> (i32, i32, u8) {
+    crate::xhci::poll(false); // USB mice have no IRQ: service them on every poll
     unsafe {
         let dx = MOUSE_DX;
         let dy = MOUSE_DY;

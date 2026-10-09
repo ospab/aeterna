@@ -64,6 +64,7 @@ pub fn irq_scancode(sc: u8) {
 /// Has Ctrl+C been pressed since the flag was last cleared?
 #[inline]
 pub fn interrupt_pending() -> bool {
+    crate::xhci::poll(false); // USB keyboards have no IRQ: service them here too
     INTERRUPT_PENDING.load(Ordering::Relaxed)
 }
 
@@ -96,6 +97,7 @@ pub fn poll_key() -> Option<char> {
 
 /// Try to read a key (non-blocking). Returns None if no key available.
 pub fn try_read_key() -> Option<char> {
+    crate::xhci::poll(true); // USB HID keyboards inject set-1 scancodes into the same buffer
     let scancode = crate::arch::x86_64::idt::kb_irq_read()?;
 
     // Extended scancode prefix
@@ -106,6 +108,12 @@ pub fn try_read_key() -> Option<char> {
 
     let is_extended = unsafe { EXTENDED };
     unsafe { EXTENDED = false; }
+
+    // Right Ctrl (E0 1D / E0 9D) acts like Left Ctrl
+    if is_extended && (scancode == 0x1D || scancode == 0x9D) {
+        unsafe { CTRL_PRESSED = scancode == 0x1D; }
+        return None;
+    }
 
     // Handle extended key releases (ignore)
     if is_extended && scancode & 0x80 != 0 {
@@ -122,6 +130,8 @@ pub fn try_read_key() -> Option<char> {
             0x47 => Some(KEY_HOME),
             0x4F => Some(KEY_END),
             0x53 => Some(KEY_DELETE),
+            0x1C => Some('\n'), // keypad Enter
+            0x35 => Some('/'),   // keypad /
             0x49 => Some(KEY_PGUP),
             0x51 => Some(KEY_PGDN),
             _ => None,
