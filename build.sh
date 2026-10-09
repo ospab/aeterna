@@ -48,7 +48,8 @@ else
     NEXT_NUM=$((LAST_NUM + 1))
 fi
 ISO_NAME="ospab-os-v2-${NEXT_NUM}.iso"
-ISO_PATH="$ISOS_DIR/$ISO_NAME"
+# ISO_PATH may be overridden so parallel builds do not race for the same number
+ISO_PATH="${ISO_PATH:-$ISOS_DIR/$ISO_NAME}"
 
 echo "=== Building ospab.os v2 (AETERNA) — ISO #$NEXT_NUM ==="
 cd "$PROJECT_ROOT"
