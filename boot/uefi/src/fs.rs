@@ -80,9 +80,9 @@ impl Volume {
     }
 }
 
-/// Find the volume holding `probe` (the kernel): the device we were loaded from
+/// Find the volume holding any of `probes` (config or kernel): the device we were loaded from
 /// first, then every file system, then every block device with ISO9660 on it.
-pub fn find_volume(image: Handle, probe: &str) -> Option<Volume> {
+pub fn find_volume(image: Handle, probes: &[&str]) -> Option<Volume> {
     let device = unsafe {
         let mut li: *mut c_void = ptr::null_mut();
         if is_error((bs().handle_protocol)(image, &LOADED_IMAGE_GUID, &mut li)) {
@@ -101,12 +101,12 @@ pub fn find_volume(image: Handle, probe: &str) -> Option<Volume> {
 
     for &h in &candidates {
         if let Some(mut v) = open_fat(h) {
-            if v.exists(probe) {
+            if probes.iter().any(|p| v.exists(p)) {
                 return Some(v);
             }
         }
         if let Some(mut v) = open_iso(h) {
-            if v.exists(probe) {
+            if probes.iter().any(|p| v.exists(p)) {
                 return Some(v);
             }
         }

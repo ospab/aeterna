@@ -36,6 +36,10 @@ use proto::*;
 const LOADER_NAME: &str = "ospab-boot 0.1 (UEFI)";
 const CONFIG_PATH: &str = "/boot/ospab.cfg";
 const DEFAULT_KERNEL: &str = "/boot/KERNEL";
+/// Layout of an installation next to other systems on a shared ESP (installer
+/// "alongside" mode): everything lives in \EFI\ospab\, next to the loader.
+const ALT_CONFIG_PATH: &str = "/EFI/ospab/ospab.cfg";
+const ALT_KERNEL: &str = "/EFI/ospab/KERNEL";
 /// Same offset Limine uses without KASLR, so kernel logs stay comparable.
 const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 const KERNEL_STACK: u64 = 128 * 1024;
@@ -598,15 +602,16 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> St
     println!("{}", LOADER_NAME);
 
     // Boot volume and configuration.
-    let mut vol: Volume = fs::find_volume(image, CONFIG_PATH)
-        .or_else(|| fs::find_volume(image, DEFAULT_KERNEL))
-        .unwrap_or_else(|| fail("no volume with /boot/ospab.cfg or /boot/KERNEL"));
-    let cfg = match vol.read_small(CONFIG_PATH) {
+    let mut vol: Volume = fs::find_volume(image, &[ALT_CONFIG_PATH, CONFIG_PATH])
+        .or_else(|| fs::find_volume(image, &[DEFAULT_KERNEL, ALT_KERNEL]))
+        .unwrap_or_else(|| fail("no volume with ospab.cfg (/boot or /EFI/ospab) or a kernel"));
+    let cfg_path = [ALT_CONFIG_PATH, CONFIG_PATH].into_iter().find(|p| vol.exists(p));
+    let cfg = match cfg_path.and_then(|p| vol.read_small(p)) {
         Some(text) => parse_config(core::str::from_utf8(&text).unwrap_or("")),
         None => default_config(),
     };
     if cfg.entries.is_empty() {
-        fail("no entries in /boot/ospab.cfg");
+        fail("no entries in ospab.cfg");
     }
     let entry = &cfg.entries[choose_entry(&cfg)];
     println!("Booting '{}' from {} volume", entry.title, vol.kind());

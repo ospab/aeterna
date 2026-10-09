@@ -4,32 +4,37 @@
  * Full-screen, step-by-step disk installer for AETERNA Microkernel.
  *
  * Screens:
- *   1 Welcome   system check (kernel + Limine modules, disks)
+ *   1 Welcome   system check (kernel + loader modules, disks) and install mode:
+ *                 "Erase entire disk"  or  "Install alongside other systems"
  *   2 Disk      pick the target disk (device, size, bus, model)
- *   3 Options   ESP size, hostname, root password, locale + layout preview
- *   4 Confirm   review the plan, red erase warning, type "yes"
+ *   3 Options   erase mode: ESP size, hostname, root password, locale + layout preview
+ *               alongside mode: existing partitions, free space, ESP + size choice
+ *               (see installer/alongside.rs)
+ *   4 Confirm   erase: red warning, type "yes"; alongside: dry-run of every sector
+ *               and file written, type "install"
  *   5 Install   per-step status + progress bars (nothing is written before this)
- *   6 Done      verification results, "remove the ISO", reboot / shell
+ *   6 Done      verification results, boot instructions, reboot / shell
  *
- * On-disk result:
+ * On-disk result of "Erase entire disk":
  *   Sector  0       Protective MBR (0xEE)
  *   Sector  1       GPT header (EFI PART)
- *   Sectors 2-33    GPT partition entries (128 × 128 B)
+ *   Sectors 2-33    GPT partition entries (128 x 128 B)
  *   ESP (FAT32):
- *     /EFI/BOOT/BOOTX64.EFI  — Limine UEFI payload
- *     /boot/KERNEL           — AETERNA kernel ELF
- *     /limine.conf           — boot config (Limine syntax)
- *   Root partition:
- *     Identity sector        — magic + version + hostname + geometry
+ *     /EFI/BOOT/BOOTX64.EFI  - the ospab UEFI loader (boot/uefi, module "efi")
+ *     /boot/KERNEL           - AETERNA kernel ELF
+ *     /boot/ospab.cfg        - loader config (no Installer entry)
+ *   Root partition ("AETERNA"):
+ *     Identity sector        - magic + version + hostname + geometry
  *     (RamFS persistence lives a few sectors further, see vfs/disk_sync.rs)
- *   Backup GPT               — at last sector
+ *   Backup GPT               - at last sector
  *
- * Readback verify: GPT signature + CRCs, FAT32 BPB, EFI MZ, kernel, identity.
+ * Readback verify: GPT signature + CRCs, FAT32 BPB, EFI MZ, kernel, config, identity.
  */
 
 #![allow(dead_code)]
 
 extern crate alloc;
+mod alongside;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -262,7 +267,7 @@ fn host_char(c: char) -> bool { c.is_ascii_alphanumeric() || c == '-' }
 fn pass_char(c: char) -> bool { c.is_ascii_graphic() }
 
 // ── Disk abstraction ─────────────────────────────────────────────────────────
-/// `index == usize::MAX` → NVMe;  otherwise AHCI/ATA disk index.
+/// `index` is the global disk index of `ospab_os::drivers` (ATA, AHCI, NVMe, virtio).
 #[derive(Clone, Copy)]
 struct VDisk {
     index:    usize,
@@ -274,8 +279,8 @@ struct VDisk {
 }
 impl VDisk {
     fn name(&self) -> &'static str { self.kind_str }
-    fn is_nvme(&self) -> bool { self.index == usize::MAX }
-    /// NVMe uses "p" before partition number (nvme0n1p1); AHCI uses "" (sda1).
+    fn is_nvme(&self) -> bool { self.bus == "NVMe" }
+    /// NVMe uses "p" before partition number (nvme0n1p1); the others use "" (sda1).
     fn part_sep(&self) -> &'static str { if self.is_nvme() { "p" } else { "" } }
     fn too_small(&self) -> bool { self.sectors < MIN_DISK_SECTORS }
 }
@@ -291,31 +296,13 @@ fn esp_fits(d: &VDisk, esp_mb: u64) -> bool {
     2048 + esp_mb * 2048 + MIN_ROOT_SECTORS + 34 <= d.sectors
 }
 
-fn ahci_dev_name(d: &ospab_os::drivers::DiskInfo) -> &'static str {
-    let idx = ospab_os::drivers::disk_info_count_before(d.index, d.kind);
-    match d.kind {
-        ospab_os::drivers::DiskKind::Ahci => match idx { 0=>"sda",1=>"sdb",2=>"sdc",3=>"sdd",_=>"sdX" },
-        ospab_os::drivers::DiskKind::Ata  => match idx { 0=>"hda",1=>"hdb",2=>"hdc",3=>"hdd",_=>"hdX" },
-    }
-}
-
 fn scan_disks() -> Vec<VDisk> {
     let mut v: Vec<VDisk> = Vec::new();
-    if ospab_os::drivers::nvme::is_initialized() {
-        let sc = ospab_os::drivers::nvme::sector_count();
-        let ss = ospab_os::drivers::nvme::sector_size();
-        let mb = (sc as u64).saturating_mul(ss as u64) / (1024 * 1024);
-        v.push(VDisk { index: usize::MAX, sectors: sc, size_mb: mb, kind_str: "nvme0n1",
-                       bus: "NVMe", model: "NVMe SSD" });
-    }
     for i in 0..ospab_os::drivers::disk_count() {
         if let Some(d) = ospab_os::drivers::disk_info(i) {
-            let bus = match d.kind {
-                ospab_os::drivers::DiskKind::Ahci => "SATA",
-                ospab_os::drivers::DiskKind::Ata  => "IDE",
-            };
-            v.push(VDisk { index: d.index, sectors: d.sectors, size_mb: d.size_mb,
-                           kind_str: ahci_dev_name(d), bus,
+            v.push(VDisk { index: i, sectors: d.sectors, size_mb: d.size_mb,
+                           kind_str: ospab_os::drivers::dev_name_for_index(i),
+                           bus: ospab_os::drivers::bus_label(d.kind),
                            model: ospab_os::drivers::model_str(d).trim() });
         }
     }
@@ -375,16 +362,11 @@ fn progress_tick() {
 
 // ── I/O with retry ────────────────────────────────────────────────────────────
 fn disk_write(disk: usize, lba: u64, count: u32, data: &[u8]) -> bool {
-    let ok = if disk == usize::MAX {
-        ospab_os::drivers::nvme::write_sectors(lba, count, data)
-    } else {
-        let mut ok = false;
-        for attempt in 0..3 {
-            if ospab_os::drivers::write(disk, lba, count, data) { ok = true; break; }
-            if attempt < 2 { for _ in 0..100_000usize { unsafe { core::arch::asm!("pause"); } } }
-        }
-        ok
-    };
+    let mut ok = false;
+    for attempt in 0..3 {
+        if ospab_os::drivers::write(disk, lba, count, data) { ok = true; break; }
+        if attempt < 2 { for _ in 0..100_000usize { unsafe { core::arch::asm!("pause"); } } }
+    }
     if ok { progress_tick(); }
     else {
         WRITE_ERRS.fetch_add(1, Ordering::Relaxed);
@@ -394,7 +376,6 @@ fn disk_write(disk: usize, lba: u64, count: u32, data: &[u8]) -> bool {
 }
 
 fn disk_read(disk: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    if disk == usize::MAX { return ospab_os::drivers::nvme::read_sectors(lba, count, buf); }
     for attempt in 0..3 {
         if ospab_os::drivers::read(disk, lba, count, buf) { return true; }
         if attempt < 2 { for _ in 0..100_000usize { unsafe { core::arch::asm!("pause"); } } }
@@ -403,26 +384,21 @@ fn disk_read(disk: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
 }
 
 // ── Write-cache flush barrier ─────────────────────────────────────────────────
-//
-// After writing the GPT and FAT32 structures, we issue a storage write-barrier
-// so that UEFI firmware reads consistent sector data on the next power-cycle.
-// NVMe : Flush command (opcode 0x00), writes volatile WC to non-volatile store.
-// AHCI : ATA FLUSH CACHE EXT (0xEA), same effect for SATA/AHCI drives.
-// Also adds a brief pause so the controller settles before we read back.
+// After writing the GPT and FAT32 structures, issue a flush so the firmware
+// reads consistent data on the next power cycle (NVMe / virtio flush; ATA and
+// AHCI are driven write-through by the driver).
 fn disk_flush(disk: usize) {
     slog("[INSTALLER] Issuing write-cache flush...\r\n");
-    if disk == usize::MAX {
-        ospab_os::drivers::nvme::flush();
-    } else {
-        ospab_os::drivers::ahci::flush_cache(disk);
-    }
+    ospab_os::drivers::flush(disk);
     // Short stall to let the controller drain its internal pipeline
     for _ in 0..500_000usize { unsafe { core::arch::asm!("pause"); } }
     slog("[INSTALLER] Flush done\r\n");
 }
 
-// ── Binary sources from Limine boot modules ───────────────────────────────────
-fn get_limine_efi_binary() -> (&'static [u8], usize) {
+// ── Binary sources from boot modules ──────────────────────────────────────────
+/// The ospab UEFI loader (boot/uefi), delivered as module "efi"
+/// (`/EFI/OSPAB/OSPABLDR.EFI` on the live medium).
+fn get_loader_binary() -> (&'static [u8], usize) {
     use ospab_os::arch::x86_64::boot;
     // Pass 1: by name
     if let Some(mut mods) = boot::modules() {
@@ -434,9 +410,9 @@ fn get_limine_efi_binary() -> (&'static [u8], usize) {
                 core::str::from_utf8_unchecked(
                     core::slice::from_raw_parts(m.path as *const u8, len))
             };
-            if path.contains("BOOTX64") || path.contains("bootx64") || path.contains("limine") {
+            if path.contains("OSPABLDR") || path.contains("ospabldr") {
                 let size = m.size as usize;
-                slog("[INSTALLER] Limine EFI: "); slog(path); slog("\r\n");
+                slog("[INSTALLER] Loader EFI: "); slog(path); slog("\r\n");
                 return (unsafe { core::slice::from_raw_parts(m.address, size) }, size);
             }
         }
@@ -448,13 +424,13 @@ fn get_limine_efi_binary() -> (&'static [u8], usize) {
             if size >= 2 {
                 let data = unsafe { core::slice::from_raw_parts(m.address, size) };
                 if data[0] == b'M' && data[1] == b'Z' {
-                    slog("[INSTALLER] Limine EFI: MZ match\r\n");
+                    slog("[INSTALLER] Loader EFI: MZ match\r\n");
                     return (data, size);
                 }
             }
         }
     }
-    slog("[INSTALLER] No Limine EFI module\r\n");
+    slog("[INSTALLER] No loader EFI module\r\n");
     (&[], 0)
 }
 
@@ -469,6 +445,7 @@ fn get_kernel_binary() -> (&'static [u8], usize) {
                 core::str::from_utf8_unchecked(
                     core::slice::from_raw_parts(m.path as *const u8, len))
             };
+            if path.contains("OSPABLDR") || path.contains("ospabldr") { continue; }
             if path.contains("aeterna") || path.contains("ospab")
                 || path.contains("KERNEL") || path.contains("kernel")
             {
@@ -521,6 +498,7 @@ fn w64(buf: &mut [u8], o: usize, v: u64) { buf[o..o+8].copy_from_slice(&v.to_le_
 const LOCALES: &[&str] = &["en_US.UTF-8","ru_RU.UTF-8","de_DE.UTF-8","fr_FR.UTF-8","zh_CN.UTF-8"];
 
 struct Config {
+    alongside: bool,
     disk:     Option<usize>,
     esp_mb:   u64,
     host:     [u8; 32],
@@ -538,7 +516,7 @@ struct Images { efi: &'static [u8], kernel: &'static [u8] }
 enum Nav { Next, Back, Quit }
 
 #[derive(Clone, Copy)]
-enum Page { Welcome, Disk, Options, Confirm }
+enum Page { Welcome, Disk, Options, Confirm, Alongside }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Main entry point
@@ -550,11 +528,12 @@ pub fn run() {
     slog("[INSTALLER] started\r\n");
 
     let disks = scan_disks();
-    let (efi, _) = get_limine_efi_binary();
+    let (efi, _) = get_loader_binary();
     let (kernel, _) = get_kernel_binary();
     let img = Images { efi, kernel };
 
     let mut cfg = Config {
+        alongside: false,
         disk: None, esp_mb: ESP_DEFAULT,
         host: [0u8; 32], host_len: 0,
         pass: [0u8; 32], pass_len: 0,
@@ -565,8 +544,9 @@ pub fn run() {
     let mut page = Page::Welcome;
     loop {
         let nav = match page {
-            Page::Welcome => page_welcome(&disks, &img),
+            Page::Welcome => page_welcome(&disks, &img, &mut cfg),
             Page::Disk    => page_disk(&disks, &mut cfg),
+            Page::Alongside => alongside::run(&disks[cfg.disk.unwrap_or(0)], &cfg, &img),
             Page::Options => page_options(&disks, &mut cfg),
             Page::Confirm => page_confirm(&disks, &cfg, &img),
         };
@@ -574,7 +554,9 @@ pub fn run() {
             (_, Nav::Quit) => { cancelled(); return; }
             (Page::Welcome, Nav::Next) => Page::Disk,
             (Page::Welcome, Nav::Back) => { cancelled(); return; }
-            (Page::Disk, Nav::Next)    => Page::Options,
+            (Page::Disk, Nav::Next)    => if cfg.alongside { Page::Alongside } else { Page::Options },
+            (Page::Alongside, Nav::Back) => Page::Disk,
+            (Page::Alongside, Nav::Next) => { leave(); return; }
             (Page::Disk, Nav::Back)    => Page::Welcome,
             (Page::Options, Nav::Next) => Page::Confirm,
             (Page::Options, Nav::Back) => Page::Disk,
@@ -609,23 +591,25 @@ fn check_line(row: u64, ok: bool, label: &str, detail: &str) {
 }
 
 // ── 1. Welcome ───────────────────────────────────────────────────────────────
-fn page_welcome(disks: &[VDisk], img: &Images) -> Nav {
+fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
     slog("[INSTALLER] page: welcome\r\n");
     let usable = disks.iter().filter(|d| !d.too_small()).count();
     let ready = !img.efi.is_empty() && !img.kernel.is_empty() && usable > 0;
-    let keys: &[(&str, &str)] = if ready { &[("Enter", "Begin"), ("Esc", "Quit")] } else { &[("Esc", "Quit")] };
+    let keys: &[(&str, &str)] = if ready { &[("\u{2191}\u{2193}", "Mode"), ("Enter", "Begin"), ("Esc", "Quit")] } else { &[("Esc", "Quit")] };
     chrome(0, "Welcome to AETERNA", FG_TITLE, "This wizard installs ospab.os onto a disk in this computer.", keys);
 
-    t(2, R_BODY, "The installer will:", FG);
-    t(4, R_BODY + 1, "\u{2022}  create a new GPT partition table on the disk you choose", FG_DIM);
-    t(4, R_BODY + 2, "\u{2022}  format an EFI System Partition (FAT32) for the bootloader", FG_DIM);
-    t(4, R_BODY + 3, "\u{2022}  copy the Limine UEFI loader and the AETERNA kernel", FG_DIM);
-    t(4, R_BODY + 4, "\u{2022}  read everything back to verify it", FG_DIM);
+    t(2, R_BODY, "How do you want to install?", FG);
+    let modes: [(&str, &str); 2] = [
+        ("Erase entire disk and install", "new GPT, ESP and AETERNA partition; ALL data on the disk is lost"),
+        ("Install alongside other systems", "keeps Windows/Linux: one new partition + \\EFI\\ospab on the ESP"),
+    ];
+    let sel0 = cfg.alongside as usize;
+    let _ = sel0;
 
     t(2, R_BODY + 6, "System check", FG_TITLE);
     check_line(R_BODY + 7, !img.kernel.is_empty(), "Kernel image",
         &if img.kernel.is_empty() { String::from("not found \u{2014} boot the live ISO") } else { fmt_bytes(img.kernel.len() as u64) });
-    check_line(R_BODY + 8, !img.efi.is_empty(), "Limine UEFI loader",
+    check_line(R_BODY + 8, !img.efi.is_empty(), "ospab UEFI loader",
         &if img.efi.is_empty() { String::from("not found \u{2014} boot the live ISO") } else { fmt_bytes(img.efi.len() as u64) });
     check_line(R_BODY + 9, usable > 0, "Storage devices",
         &if disks.is_empty() { String::from("no disks detected") }
@@ -633,7 +617,7 @@ fn page_welcome(disks: &[VDisk], img: &Images) -> Nav {
          else { format!("{} found", disks.len()) });
 
     if ready {
-        t(2, R_BODY + 12, "Nothing is written to disk until you confirm on the Confirm page.", FG_DIM);
+        t(2, R_BODY + 12, "Nothing is written to disk until you confirm on a later page.", FG_DIM);
         t(2, R_BODY + 13, "Press Enter to begin, or Esc to leave the installer.", FG);
     } else {
         draw_box(R_BODY + 11, 4, FG_ERR, ERR_BG, "Cannot install");
@@ -642,7 +626,19 @@ fn page_welcome(disks: &[VDisk], img: &Images) -> Nav {
     }
 
     loop {
+        for (i, (name, desc)) in modes.iter().enumerate() {
+            let selb = (i == 1) == cfg.alongside;
+            let bg = if selb { SEL_BG } else { BG };
+            let r = R_BODY + 1 + (i as u64) * 2;
+            let mut p = Pen::at(0, r).on(bg);
+            p.put(if selb { "\u{25B6} " } else { "  " }, ACCENT).put(name, if selb { FG_TITLE } else { FG });
+            p.pad(width());
+            Pen::at(4, r + 1).put(&truncate(desc, (width() as usize).saturating_sub(6)), FG_DIM);
+        }
         match key() {
+            keyboard::KEY_UP | keyboard::KEY_DOWN | '\t' => cfg.alongside = !cfg.alongside,
+            '1' => cfg.alongside = false,
+            '2' => cfg.alongside = true,
             '\n' if ready => return Nav::Next,
             ESC | CTRL_C | 'q' | 'Q' => return Nav::Quit,
             _ => {}
@@ -656,7 +652,8 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
     let mut sel = cfg.disk.unwrap_or(0).min(disks.len().saturating_sub(1));
     let mut msg: Option<String> = None;
     chrome(1, "Choose the target disk", FG_TITLE,
-           "The whole disk is used. Everything on it will be erased.",
+           if cfg.alongside { "Existing systems are kept; only free space on this disk is used." }
+           else { "The whole disk is used. Everything on it will be erased." },
            &[("\u{2191}\u{2193}", "Select"), ("Enter", "Use this disk"), ("Esc", "Back"), ("Q", "Quit")]);
     Pen::at(2, R_BODY).put("DEVICE", FG_DIM).pad(18).put("SIZE", FG_DIM).pad(30).put("BUS", FG_DIM).pad(38).put("MODEL", FG_DIM);
     hrule(R_BODY + 1);
@@ -670,7 +667,7 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
             p.put("/dev/", FG_DIM).put(d.name(), if i == sel { FG_TITLE } else { fg }).pad(18);
             p.put(&fmt_size(d.size_mb), fg).pad(30);
             p.put(d.bus, FG_DIM).pad(38);
-            if d.too_small() { p.put("too small (min 100 MiB)", FG_ERR); }
+            if d.too_small() && !cfg.alongside { p.put("too small (min 100 MiB)", FG_ERR); }
             else { p.put(&truncate(if d.model.is_empty() { "(unknown model)" } else { d.model }, (width() - 40) as usize), fg); }
             p.pad(width());
         }
@@ -683,7 +680,7 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
             keyboard::KEY_DOWN => { sel = (sel + 1) % disks.len(); msg = None; }
             '\n' => {
                 let d = &disks[sel];
-                if d.too_small() {
+                if d.too_small() && !cfg.alongside {
                     msg = Some(format!("/dev/{} is too small \u{2014} at least 100 MiB is required.", d.name()));
                 } else {
                     cfg.disk = Some(sel);
@@ -833,7 +830,7 @@ fn page_confirm(disks: &[VDisk], cfg: &Config, img: &Images) -> Nav {
     kv(R_BODY,     "Target disk", &format!("/dev/{}   {}   {}", d.name(), fmt_size(d.size_mb), truncate(model, 30)), FG_TITLE);
     kv(R_BODY + 1, "Partition 1", &format!("EFI System (FAT32)   {:<9}  LBA {}\u{2013}{}", fmt_size(cfg.esp_mb), l.esp_start, l.esp_end), FG);
     kv(R_BODY + 2, "Partition 2", &format!("AETERNA root         {:<9}  LBA {}\u{2013}{}", fmt_size(l.root_mb), l.root_start, l.root_end), FG);
-    kv(R_BODY + 3, "Bootloader",  &format!("Limine UEFI \u{2192} /EFI/BOOT/BOOTX64.EFI  ({})", fmt_bytes(img.efi.len() as u64)), FG);
+    kv(R_BODY + 3, "Bootloader",  &format!("ospab-boot \u{2192} /EFI/BOOT/BOOTX64.EFI  ({})", fmt_bytes(img.efi.len() as u64)), FG);
     kv(R_BODY + 4, "Kernel",      &format!("AETERNA {} \u{2192} /boot/KERNEL  ({})", crate::version::VERSION_STR, fmt_bytes(img.kernel.len() as u64)), FG);
     kv(R_BODY + 5, "Hostname",    cfg.hostname(), FG);
     kv(R_BODY + 6, "Locale",      LOCALES[cfg.locale], FG);
@@ -876,6 +873,19 @@ fn page_confirm(disks: &[VDisk], cfg: &Config, img: &Images) -> Nav {
 // ════════════════════════════════════════════════════════════════════════════
 // 5. Install — writes everything to disk
 // ════════════════════════════════════════════════════════════════════════════
+static ALONG_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn set_alongside(on: bool) { ALONG_MODE.store(on, Ordering::Relaxed); }
+fn is_alongside() -> bool { ALONG_MODE.load(Ordering::Relaxed) }
+const ALONG_LABELS: [&str; 7] = [
+    "Re-checking the partition table",
+    "Copying loader, config and kernel",
+    "Updating the ESP allocation table",
+    "Linking \\EFI\\ospab on the ESP",
+    "Preparing the AETERNA partition",
+    "Adding the AETERNA GPT entry",
+    "Verifying (read-back)",
+];
+fn labels() -> &'static [&'static str; 7] { if is_alongside() { &ALONG_LABELS } else { &STEP_LABELS } }
 const STEP_LABELS: [&str; 7] = [
     "Creating partition table (GPT)",
     "Formatting EFI partition (FAT32)",
@@ -900,7 +910,7 @@ fn step_draw(i: usize, st: St, detail: &str) {
         St::Fail    => ("\u{2717}", FG_ERR, FG_ERR, "FAILED",  FG_ERR),
     };
     t(2, r, icon, ic);
-    t(4, r, STEP_LABELS[i], lc);
+    t(4, r, labels()[i], lc);
     if !detail.is_empty() { t(STEP_BAR_COL, r, detail, if st == St::Fail { FG_ERR } else { FG_DIM }); }
     t(width() - clen(status) - 1, r, status, sc);
     slog("[INSTALLER] step "); slog_dec(i as u64 + 1);
@@ -928,9 +938,14 @@ fn install_failed(i: usize, why: &str) {
     footer(&[("Enter", "Return to shell")], "");
     let r = R_CHECKS;
     draw_box(r, 6, FG_ERR, ERR_BG, "Installation failed");
-    Pen::at(3, r + 1).on(ERR_BG).put(&format!("Step {} of {}: ", i + 1, STEP_LABELS.len()), FG_DIM).put(why, FG_ERR);
-    Pen::at(3, r + 2).on(ERR_BG).put("The disk was only partly written and will not boot.", FG);
-    Pen::at(3, r + 3).on(ERR_BG).put("Check the disk / VM settings and run `install` again.", FG);
+    Pen::at(3, r + 1).on(ERR_BG).put(&format!("Step {} of {}: ", i + 1, labels().len()), FG_DIM).put(why, FG_ERR);
+    if is_alongside() {
+        Pen::at(3, r + 2).on(ERR_BG).put("Existing partitions were not modified. Files may remain in \\EFI\\ospab.", FG);
+        Pen::at(3, r + 3).on(ERR_BG).put("Remove that folder from Windows/Linux before trying again.", FG);
+    } else {
+        Pen::at(3, r + 2).on(ERR_BG).put("The disk was only partly written and will not boot.", FG);
+        Pen::at(3, r + 3).on(ERR_BG).put("Check the disk / VM settings and run `install` again.", FG);
+    }
     Pen::at(3, r + 4).on(ERR_BG).put("Details were logged to the serial console (COM1).", FG_DIM);
     drain_keys();
     loop { if key() == '\n' { break; } }
@@ -968,7 +983,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     chrome(4, "Installing AETERNA", FG_TITLE,
            &format!("Writing to /dev/{} \u{2014} do not power off or remove the disk.", disk.name()), &[]);
     footer(&[], "Installing\u{2026} please wait");
-    for i in 0..STEP_LABELS.len() { step_draw(i, St::Pending, ""); }
+    for i in 0..labels().len() { step_draw(i, St::Pending, ""); }
     t(2, R_OVR, "Overall progress", FG_DIM);
     WRITE_ERRS.store(0, Ordering::Relaxed);
 
@@ -994,7 +1009,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let spc: u8 = {
         let mut s: u32 = 8;
         loop {
-            let tmp2 = 256 * s + NFAT as u32;
+            let tmp2 = (256 * s + NFAT as u32) / 2; // FAT32: halved (Microsoft FAT spec)
             let fsz  = (fat32_total - RSVD as u32 + tmp2 - 1) / tmp2;
             let drel = RSVD as u32 + fsz * NFAT as u32;
             let dcls = (fat32_total.saturating_sub(drel)) / s;
@@ -1005,7 +1020,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     };
 
     let tmp1    = fat32_total - RSVD as u32;
-    let tmp2    = 256u32 * spc as u32 + NFAT as u32;
+    let tmp2    = (256u32 * spc as u32 + NFAT as u32) / 2; // FAT32: halved (Microsoft FAT spec)
     let fat_sec = (tmp1 + tmp2 - 1) / tmp2;
     let data_rel = RSVD as u32 + fat_sec * NFAT as u32;
     let data_clusters = (fat32_total - data_rel) / spc as u32;
@@ -1015,7 +1030,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let ker_nc = if kernel_size > 0 { ((kernel_size + cb - 1) / cb) as u32 } else { 1 };
     let efi_w = ((efi_size + 511) / 512) as u64 + 2 * efi_nc as u64;
     let ker_w = ((kernel_size + 511) / 512) as u64 + 2 * ker_nc as u64;
-    let conf_content = build_limine_conf();
+    let conf_content = build_ospab_cfg(false);
 
     // Expected sector writes, mirrors the write sequence below
     let total_writes: u64 = 1 + 64 + 2                       // MBR, entries + backup, headers
@@ -1138,7 +1153,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
 
         let mut fsi = [0u8; 512];
         w32(&mut fsi,0,0x41615252); w32(&mut fsi,484,0x61417272);
-        w32(&mut fsi,488,data_clusters.saturating_sub(8)); w32(&mut fsi,492,8);
+        w32(&mut fsi,488,0xFFFF_FFFF); w32(&mut fsi,492,0xFFFF_FFFF); // unknown: let the OS recount
         fsi[510]=0x55; fsi[511]=0xAA;
         disk_write(disk.index,esp_start+1,1,&fsi);
         disk_write(disk.index,esp_start+6,1,&vbr);  // backup VBR
@@ -1179,11 +1194,10 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let efi_dc   = nc; nc += 1;  // 3  /EFI/
     let boot_dc  = nc; nc += 1;  // 4  /EFI/BOOT/
     let sysb_c   = nc; nc += 1;  // 5  /boot/
-    let conf_c   = nc; nc += 1;  // 6  /limine.conf
 
     let efi_c  = nc; nc += efi_nc;
-    let ker_c  = nc; // nc += ker_nc; (last allocation)
-    let _ = nc;
+    let ker_c  = nc; nc += ker_nc;
+    let conf_c = nc; // /boot/ospab.cfg (one cluster, last allocation)
 
     // Zero directory clusters
     let zero = [0u8; 512];
@@ -1198,23 +1212,8 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         d[0..11].copy_from_slice(b"AETERNA ESP"); d[11]=0x08; // volume label
         dir_ent(&mut d, 32, b"EFI        ", 0x10, efi_dc, 0);
         dir_ent(&mut d, 64, b"BOOT       ", 0x10, sysb_c, 0);
-        // "limine.conf" — extension .conf is 4 chars, doesn't fit 8.3.
-        // Without an LFN entry, FAT shows "LIMINE.CFG" and Limine
-        // can't find its config.  We write 1 LFN entry + 8.3 short entry.
-        {
-            let sn: &[u8; 11] = b"LIMINE~1CON";
-            let cksum = lfn_checksum(sn);
-            // "limine.conf" in UCS-2LE
-            let long_name: [u16; 11] = [
-                0x6C, 0x69, 0x6D, 0x69, 0x6E, 0x65,  // l i m i n e
-                0x2E,                                  // .
-                0x63, 0x6F, 0x6E, 0x66,                // c o n f
-            ];
-            lfn_entry(&mut d, 96, 0x41, &long_name, cksum); // seq=1|LAST
-            dir_ent(&mut d, 128, sn, 0x20, conf_c, conf_content.len() as u32);
-        }
         disk_write(disk.index, clba(root_c), 1, &d);
-        slog("[INSTALLER] Root dir: LFN entry for limine.conf written\r\n");
+        slog("[INSTALLER] Root dir written\r\n");
     }
     // /EFI/
     {
@@ -1235,6 +1234,8 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         let mut d = [0u8; 512];
         dot_ents(&mut d, sysb_c, root_c);
         dir_ent(&mut d, 64, b"KERNEL     ", 0x20, ker_c, kernel_size as u32);
+        dir_ent(&mut d, 96, b"OSPAB   CFG", 0x20, conf_c, conf_content.len() as u32);
+        d[96 + 12] = 0x18; // NT case flags: shown as ospab.cfg
         disk_write(disk.index, clba(sysb_c), 1, &d);
     }
 
@@ -1280,10 +1281,10 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     step_end(4, St::Ok, &fmt_bytes(kernel_size as u64));
 
     // ══════════════════════════════════════════════════════════════════════
-    // 6 — /limine.conf (chain = 1 cluster) + AETERNA identity sector
+    // 6 — /boot/ospab.cfg (chain = 1 cluster) + AETERNA identity sector
     step_begin(5, 0);
     let errs0 = WRITE_ERRS.load(Ordering::Relaxed);
-    slog("[INSTALLER] Writing /limine.conf at cluster "); slog_dec(conf_c as u64); slog("\r\n");
+    slog("[INSTALLER] Writing /boot/ospab.cfg at cluster "); slog_dec(conf_c as u64); slog("\r\n");
     write_chain(disk.index, fat1_lba, fat2_lba, conf_c, 1);
     {
         let cb_lba = clba(conf_c);
@@ -1298,7 +1299,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         }
     }
 
-    // Flush after all ESP file writes (EFI + kernel + limine.conf)
+    // Flush after all ESP file writes (EFI + kernel + ospab.cfg)
     slog("[INSTALLER] Flushing write-cache after ESP files...\r\n");
     disk_flush(disk.index);
 
@@ -1325,8 +1326,8 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     // Final flush: all FAT32 + kernel + identity data committed before readback
     slog("[INSTALLER] Final flush before verification...\r\n");
     disk_flush(disk.index);
-    if WRITE_ERRS.load(Ordering::Relaxed) != errs0 { die!(5, "write errors while writing limine.conf"); }
-    step_end(5, St::Ok, "/limine.conf");
+    if WRITE_ERRS.load(Ordering::Relaxed) != errs0 { die!(5, "write errors while writing ospab.cfg"); }
+    step_end(5, St::Ok, "/boot/ospab.cfg");
     P_TOTAL.store(0, Ordering::Relaxed);
     draw_overall(1000);
 
@@ -1432,7 +1433,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         let mut buf = [0u8; 512];
         let ok = disk_read(disk.index, clba(conf_c), 1, &mut buf)
             && buf[..conf_content.len().min(512)] == conf_content.as_bytes()[..conf_content.len().min(512)];
-        checks.push(Check { label: "/limine.conf", ok });
+        checks.push(Check { label: "/boot/ospab.cfg", ok });
     }
     {
         let mut buf = [0u8; 512];
@@ -1598,7 +1599,13 @@ fn write_chain(disk: usize, fat1: u64, fat2: u64, start: u32, nc: u32) {
     }
 }
 
-// ── limine.conf — matches the live ISO format exactly ────────────────────────
-fn build_limine_conf() -> &'static str {
-    "timeout: 5\nserial: yes\n\n/AETERNA Microkernel\n\tprotocol: limine\n\tkernel_path: boot():/boot/KERNEL\n"
+// ── ospab.cfg — read by the ospab UEFI loader (boot/uefi parse_config) ───────
+/// Config of an installed system: one entry, no installer entry, no modules.
+/// `alongside` = files live in \EFI\ospab\ on a shared ESP instead of /boot.
+fn build_ospab_cfg(alongside: bool) -> &'static str {
+    if alongside {
+        "# ospab.os loader configuration (installed next to other systems)\ntimeout=3\ndefault=1\nresolution=auto\n\nentry=ospab.os\n    kernel=/EFI/ospab/KERNEL\n"
+    } else {
+        "# ospab.os loader configuration (installed)\ntimeout=3\ndefault=1\nresolution=auto\n\nentry=ospab.os\n    kernel=/boot/KERNEL\n"
+    }
 }

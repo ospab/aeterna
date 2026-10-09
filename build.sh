@@ -130,7 +130,7 @@ if [ "$BUILD_IMAGE" = true ]; then
     fi
     IMG_PATH="$ISOS_DIR/ospab-os-v2-${NEXT_NUM}.img"
     echo "--- Creating disk image ---"
-    "$MKIMAGE" "$IMG_PATH"         "EFI/BOOT/BOOTX64.EFI=$LOADER_EFI"         "boot/KERNEL=$KERNEL_BIN"         "boot/ospab.cfg=$PROJECT_ROOT/boot/ospab.cfg"
+    "$MKIMAGE" "$IMG_PATH"         "EFI/BOOT/BOOTX64.EFI=$LOADER_EFI"         "EFI/OSPAB/OSPABLDR.EFI=$LOADER_EFI"         "boot/KERNEL=$KERNEL_BIN"         "boot/ospab.cfg=$PROJECT_ROOT/boot/ospab.cfg"
     echo ""
     echo "DONE. Image: $IMG_PATH"
     echo "Run (UEFI only): qemu-system-x86_64 -drive file=\"$IMG_PATH\",format=raw -m 512M -serial stdio \\"
