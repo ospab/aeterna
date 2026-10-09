@@ -156,5 +156,10 @@ pub fn run(_args: &str) {
 
     if line_num <= 2 {
         dim("  (no tasks)\n");
+    } else if line_num == 3 {
+        // Only the boot thread is alive: everything still runs inside it.
+        dim("\n  PID 0 is the kernel itself: the shell, coreutils, drivers and the network\n");
+        dim("  stack all run in it (ring 0). Separate processes appear only for ring-3\n");
+        dim("  programs; the boot self-tests run and exit before the console starts.\n");
     }
 }
