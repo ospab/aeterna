@@ -221,6 +221,8 @@ pub fn register_devices() {
     let disk_count = crate::drivers::disk_count();
     for i in 0..disk_count {
         if let Some(d) = crate::drivers::disk_info(i) {
+            // NVMe was registered above with its partitions
+            if d.kind == crate::drivers::DiskKind::Nvme { continue; }
             let name = crate::drivers::dev_name_for_index(i);
             let mut path = [0u8; 16];
             let prefix = b"/dev/";
@@ -230,7 +232,7 @@ pub fn register_devices() {
             path[prefix.len()..plen].copy_from_slice(&nb[..plen - prefix.len()]);
             let path_str = core::str::from_utf8(&path[..plen]).unwrap_or("/dev/sdX");
 
-            let meta = b"block:ata";
+            let meta: &[u8] = if d.kind == crate::drivers::DiskKind::Virtio { b"block:virtio" } else { b"block:ata" };
             let _ = crate::fs::write_file(path_str, meta);
             s("[DevFS] ");
             s(path_str);

@@ -4,6 +4,11 @@
  * Provides unified disk detection and I/O across:
  *   ata  — ATA PIO (IDE) — QEMU PIIX IDE, legacy hardware
  *   ahci — AHCI SATA    — QEMU ich9-ahci, VMware SATA, modern bare metal
+ *   nvme — NVMe         — VMware default, QEMU -device nvme, bare metal (namespace 1)
+ *   virtio_blk — virtio-blk (legacy + modern PCI) — QEMU/KVM/cloud
+ *
+ * Everything in DISKS is addressed in 512-byte sectors; 4K-native NVMe
+ * namespaces are translated inside nvme.rs.
  *
  * Usage from terminal / installer:
  *   ospab_os::drivers::init()          — probe all storage
@@ -17,6 +22,7 @@ pub mod ahci;
 pub mod audio;
 pub mod gpu;
 pub mod nvme;
+pub mod virtio_blk;
 pub mod gpt;
 pub mod block;
 pub mod driver_trait;
@@ -36,6 +42,8 @@ pub struct DiskInfo {
 pub enum DiskKind {
     Ata,
     Ahci,
+    Nvme,
+    Virtio,
 }
 
 static mut DISKS: [DiskInfo; 8] = [DiskInfo {
@@ -85,7 +93,48 @@ pub fn init() -> usize {
         }
     }
 
+    // NVMe (first controller, namespace 1)
+    if registry::try_init_driver("NVMe SSD", || nvme::probe_and_init()) && nvme::is_initialized() {
+        let idx = unsafe { DISK_COUNT };
+        if idx < 8 {
+            let sectors = nvme::sectors512();
+            unsafe {
+                DISKS[idx].index   = idx;
+                DISKS[idx].kind    = DiskKind::Nvme;
+                DISKS[idx].size_mb = sectors >> 11;
+                DISKS[idx].sectors = sectors;
+                DISKS[idx].model   = *nvme::model();
+                DISK_COUNT += 1;
+            }
+        }
+    }
+
+    // virtio-blk (any number, legacy or modern transport)
+    let vcount = virtio_blk::init();
+    for i in 0..vcount {
+        if let Some(v) = virtio_blk::drive_info(i) {
+            let idx = unsafe { DISK_COUNT };
+            if idx >= 8 { break; }
+            unsafe {
+                DISKS[idx].index   = idx;
+                DISKS[idx].kind    = DiskKind::Virtio;
+                DISKS[idx].size_mb = v.size_mb;
+                DISKS[idx].sectors = v.sectors;
+                DISKS[idx].model   = v.model;
+                DISK_COUNT += 1;
+            }
+        }
+    }
+
     unsafe { DISK_COUNT }
+}
+
+/// Index of `disk` among disks of its own kind (the n in sdn / vdn / hdn).
+pub fn kind_index(disk: usize) -> usize {
+    match disk_info(disk) {
+        Some(d) => disk_info_count_before(disk, d.kind),
+        None => 0,
+    }
 }
 
 pub fn disk_count() -> usize {
@@ -134,6 +183,8 @@ pub fn read(disk: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
             };
             ahci::read_sectors(ahci_idx, lba, count, buf)
         }
+        DiskKind::Nvme => nvme::read512(lba, count, buf),
+        DiskKind::Virtio => virtio_blk::read_sectors(kind_index(disk), lba, count, buf),
     }
 }
 
@@ -166,6 +217,31 @@ pub fn write(disk: usize, lba: u64, count: u32, data: &[u8]) -> bool {
             };
             ahci::write_sectors(ahci_idx, lba, count, data)
         }
+        DiskKind::Nvme => nvme::write512(lba, count, data),
+        DiskKind::Virtio => virtio_blk::write_sectors(kind_index(disk), lba, count, data),
+    }
+}
+
+/// Flush the device write cache of disk n (no-op for ATA/AHCI, which this
+/// driver set already drives write-through).
+pub fn flush(disk: usize) -> bool {
+    match disk_info(disk) {
+        Some(d) => match d.kind {
+            DiskKind::Nvme => nvme::flush(),
+            DiskKind::Virtio => virtio_blk::flush(kind_index(disk)),
+            _ => true,
+        },
+        None => false,
+    }
+}
+
+/// Short bus label for listings (lsblk / installer)
+pub fn bus_label(kind: DiskKind) -> &'static str {
+    match kind {
+        DiskKind::Ata => "IDE",
+        DiskKind::Ahci => "SATA",
+        DiskKind::Nvme => "NVMe",
+        DiskKind::Virtio => "virtio",
     }
 }
 
@@ -176,6 +252,8 @@ pub fn dev_name_for_index(idx: usize) -> &'static str {
         match d.kind {
             DiskKind::Ahci => match before { 0 => "sda", 1 => "sdb", 2 => "sdc", _ => "sdX" },
             DiskKind::Ata  => match before { 0 => "hda", 1 => "hdb", 2 => "hdc", _ => "hdX" },
+            DiskKind::Nvme => "nvme0n1",
+            DiskKind::Virtio => match before { 0 => "vda", 1 => "vdb", 2 => "vdc", 3 => "vdd", _ => "vdX" },
         }
     } else {
         "unknown"

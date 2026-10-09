@@ -91,10 +91,7 @@ fn select_disk() -> Option<(usize, crate::drivers::DiskKind, usize)> {
     }
     // Fallback: first disk of any kind
     if let Some(info) = crate::drivers::disk_info(0) {
-        let kind_idx = match info.kind {
-            crate::drivers::DiskKind::Ahci => crate::drivers::disk_info_count_before(0, crate::drivers::DiskKind::Ahci),
-            crate::drivers::DiskKind::Ata => crate::drivers::disk_info_count_before(0, crate::drivers::DiskKind::Ata),
-        };
+        let kind_idx = crate::drivers::disk_info_count_before(0, info.kind);
         return Some((0, info.kind, kind_idx));
     }
     None
@@ -317,10 +314,11 @@ pub fn write_to_disk(data: *const u8, total_bytes: usize, sector_count: u32, buf
         crate::drivers::DiskKind::Ahci => {
             return crate::drivers::ahci::dma_write(per_kind_idx, base, sector_count, buffer_phys);
         }
-        crate::drivers::DiskKind::Ata => {
-            // Fallback: copy through existing ATA path via unified driver
+        // ATA / NVMe / virtio-blk: copy through the unified driver path
+        _ => {
             let slice = unsafe { core::slice::from_raw_parts(data, total_bytes) };
-            return crate::drivers::write(global_idx, base, sector_count, slice);
+            if !crate::drivers::write(global_idx, base, sector_count, slice) { return false; }
+            return crate::drivers::flush(global_idx);
         }
     }
 }
@@ -519,7 +517,7 @@ pub fn sync_filesystem() -> bool {
     let base = match base_lba(global_idx) { Some(b) => b, None => return false };
     let read_ok = match kind {
         crate::drivers::DiskKind::Ahci => crate::drivers::ahci::read_sectors(per_kind_idx, base, 1, &mut verify),
-        crate::drivers::DiskKind::Ata => crate::drivers::read(global_idx, base, 1, &mut verify),
+        _ => crate::drivers::read(global_idx, base, 1, &mut verify),
     };
     if !read_ok || verify.len() < 8 || u64::from_le_bytes(verify[0..8].try_into().unwrap_or_default()) != SUPER_MAGIC {
         crate::arch::x86_64::serial::write_str("[FS] write verification failed — superblock magic mismatch\r\n");

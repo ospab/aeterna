@@ -65,79 +65,16 @@ pub fn run_fdisk(args: &str) {
 
     let mut found_any = false;
 
-    // ── NVMe disk ────────────────────────────────────────────────────────
-    if crate::drivers::nvme::is_initialized() {
-        found_any = true;
-        let sectors = crate::drivers::nvme::sector_count();
-        let ss = crate::drivers::nvme::sector_size() as u64;
-        let bytes = sectors * ss;
-        let mib = bytes / (1024 * 1024);
-
-        hl("Disk /dev/nvme0n1: ");
-        put_size_mib(mib);
-        puts(", ");
-        put_u64(bytes);
-        puts(" bytes, ");
-        put_u64(sectors);
-        puts(" sectors\n");
-        dim("Disk model: NVMe-SSD\n");
-        dim("Units: sectors of ");
-        put_u64(ss);
-        puts(" bytes\n");
-
-        // Parse and display GPT
-        let part_count = crate::drivers::gpt::partition_count();
-        if part_count == 0 {
-            dim("Partition table type: none (unpartitioned)\n\n");
-        } else {
-            dim("Partition table type: GPT\n");
-            puts("Device\t\t\tStart\t\tEnd\t\tSize\tType\n");
-            dim("─────────────────────────────────────────────────────────────────\n");
-            for i in 0..part_count {
-                if let Some(part) = crate::drivers::gpt::get_partition(i) {
-                    puts("/dev/nvme0n1p");
-                    put_u64((i + 1) as u64);
-                    puts("\t");
-                    put_u64(part.start_lba);
-                    puts("\t\t");
-                    put_u64(part.end_lba);
-                    puts("\t\t");
-                    let size_sec = part.end_lba.saturating_sub(part.start_lba) + 1;
-                    let size_mib = size_sec * ss / (1024 * 1024);
-                    put_size_mib(size_mib);
-                    puts("\t");
-                    // Print GUID type short label
-                    let type_label = guid_type_label(&part.type_guid);
-                    puts(type_label);
-                    if !part.name.is_empty() {
-                        puts(" (");
-                        puts(&part.name);
-                        puts(")");
-                    }
-                    puts("\n");
-                }
-            }
-            puts("\n");
-        }
-    }
-
-    // ── AHCI/ATA disks ───────────────────────────────────────────────────
+    // ── All disks (ATA, AHCI, NVMe, virtio-blk) ──────────────────────────
     let n = crate::drivers::disk_count();
     for i in 0..n {
         if let Some(d) = crate::drivers::disk_info(i) {
             found_any = true;
-            let dev_name = match d.kind {
-                crate::drivers::DiskKind::Ahci => {
-                    let idx = crate::drivers::disk_info_count_before(
-                        i, crate::drivers::DiskKind::Ahci);
-                    match idx { 0 => "sda", 1 => "sdb", 2 => "sdc", _ => "sdX" }
-                }
-                crate::drivers::DiskKind::Ata => {
-                    let idx = crate::drivers::disk_info_count_before(
-                        i, crate::drivers::DiskKind::Ata);
-                    match idx { 0 => "hda", 1 => "hdb", 2 => "hdc", _ => "hdX" }
-                }
-            };
+            let dev_name = crate::drivers::dev_name_for_index(i);
+            let is_nvme = d.kind == crate::drivers::DiskKind::Nvme;
+            let psep = if is_nvme { "p" } else { "" };
+            // GPT of an NVMe disk is read in the namespace's native LBA size
+            let ss: u64 = if is_nvme { crate::drivers::nvme::sector_size() as u64 } else { 512 };
             hl("Disk /dev/");
             hl(dev_name);
             puts(": ");
@@ -145,17 +82,23 @@ pub fn run_fdisk(args: &str) {
             puts(", ");
             put_u64(d.size_mb as u64 * 1024 * 1024);
             puts(" bytes, ");
-            put_u64(d.sectors);
+            put_u64(d.sectors * 512 / ss);
             puts(" sectors\n");
             puts("Disk model: ");
             puts(crate::drivers::model_str(d));
             puts("\n");
-            dim("Units: sectors of 512 bytes\n");
+            dim("Units: sectors of ");
+            put_u64(ss);
+            puts(" bytes\n");
 
-            // Try to read GPT from AHCI disk
-            let mut ahci_dev = crate::drivers::block::AhciDisk { disk_idx: i };
-            let ahci_parts = crate::drivers::gpt::parse(&mut ahci_dev);
-            let pc = ahci_parts.unwrap_or(0);
+            // Read the GPT
+            let pc = if is_nvme {
+                let mut nd = crate::drivers::block::NvmeDisk::new();
+                crate::drivers::gpt::parse(&mut nd).unwrap_or(0)
+            } else {
+                let mut ad = crate::drivers::block::AhciDisk { disk_idx: i };
+                crate::drivers::gpt::parse(&mut ad).unwrap_or(0)
+            };
             if pc == 0 {
                 dim("Partition table type: none\n\n");
             } else {
@@ -166,6 +109,7 @@ pub fn run_fdisk(args: &str) {
                     if let Some(part) = crate::drivers::gpt::get_partition(j) {
                         puts("/dev/");
                         puts(dev_name);
+                        puts(psep);
                         put_u64((j + 1) as u64);
                         puts("\t");
                         put_u64(part.start_lba);
@@ -173,7 +117,7 @@ pub fn run_fdisk(args: &str) {
                         put_u64(part.end_lba);
                         puts("\t\t");
                         let size_sec = part.end_lba.saturating_sub(part.start_lba) + 1;
-                        let size_mib = size_sec * 512 / (1024 * 1024);
+                        let size_mib = size_sec * ss / (1024 * 1024);
                         put_size_mib(size_mib);
                         puts("\t");
                         puts(guid_type_label(&part.type_guid));
@@ -199,54 +143,23 @@ pub fn run_fdisk(args: &str) {
 
 /// Extended `lsblk` with NVMe support.
 pub fn run_lsblk(_args: &str) {
-    if !crate::drivers::nvme::is_initialized() && crate::drivers::disk_count() == 0 {
+    if crate::drivers::disk_count() == 0 {
         puts("lsblk: no block devices found\n");
         return;
     }
     puts("NAME           TYPE    SIZE       RO  MODEL\n");
     dim("──────────────────────────────────────────────────────────\n");
 
-    // NVMe
-    if crate::drivers::nvme::is_initialized() {
-        let sectors = crate::drivers::nvme::sector_count();
-        let ss = crate::drivers::nvme::sector_size() as u64;
-        let mib = sectors * ss / (1024 * 1024);
-        puts("nvme0n1        NVMe    ");
-        put_size_mib(mib);
-        puts("   0   NVMe-SSD\n");
-
-        // GPT partitions
-        for i in 0..crate::drivers::gpt::partition_count() {
-            if let Some(part) = crate::drivers::gpt::get_partition(i) {
-                puts("  nvme0n1p");
-                put_u64((i + 1) as u64);
-                puts("      part    ");
-                let psize = (part.end_lba.saturating_sub(part.start_lba) + 1) * ss;
-                put_size_mib(psize / (1024 * 1024));
-                puts("   0   ");
-                if !part.name.is_empty() { puts(&part.name); }
-                puts("\n");
-            }
-        }
-    }
-
-    // AHCI / ATA
+    // All disks
     let n = crate::drivers::disk_count();
     for i in 0..n {
         if let Some(d) = crate::drivers::disk_info(i) {
-            let base_name = match d.kind {
-                crate::drivers::DiskKind::Ahci => {
-                    let idx = crate::drivers::disk_info_count_before(i, crate::drivers::DiskKind::Ahci);
-                    match idx { 0 => "sda", 1 => "sdb", 2 => "sdc", _ => "sdX" }
-                }
-                crate::drivers::DiskKind::Ata => {
-                    let idx = crate::drivers::disk_info_count_before(i, crate::drivers::DiskKind::Ata);
-                    match idx { 0 => "hda", 1 => "hdb", 2 => "hdc", _ => "hdX" }
-                }
-            };
+            let base_name = crate::drivers::dev_name_for_index(i);
             let kind_s = match d.kind {
-                crate::drivers::DiskKind::Ahci => "SATA  ",
-                crate::drivers::DiskKind::Ata  => "IDE   ",
+                crate::drivers::DiskKind::Ahci   => "SATA  ",
+                crate::drivers::DiskKind::Ata    => "IDE   ",
+                crate::drivers::DiskKind::Nvme   => "NVMe  ",
+                crate::drivers::DiskKind::Virtio => "virtio",
             };
             puts(base_name);
             puts("             ");
@@ -256,6 +169,23 @@ pub fn run_lsblk(_args: &str) {
             puts("   0   ");
             puts(crate::drivers::model_str(d));
             puts("\n");
+
+            // NVMe partitions come from the GPT parsed at boot / by fdisk
+            if d.kind == crate::drivers::DiskKind::Nvme {
+                let ss = crate::drivers::nvme::sector_size() as u64;
+                for pi in 0..crate::drivers::gpt::partition_count() {
+                    if let Some(part) = crate::drivers::gpt::get_partition(pi) {
+                        puts("  nvme0n1p");
+                        put_u64((pi + 1) as u64);
+                        puts("      part    ");
+                        let psize = (part.end_lba.saturating_sub(part.start_lba) + 1) * ss;
+                        put_size_mib(psize / (1024 * 1024));
+                        puts("   0   ");
+                        if !part.name.is_empty() { puts(&part.name); }
+                        puts("\n");
+                    }
+                }
+            }
         }
     }
 }
@@ -333,7 +263,7 @@ pub fn run_mkfs(args: &str) {
         let (disk_name, part_str) = split_dev_name(name);
         let disk_idx = match ahci_name_to_idx(disk_name) {
             Some(i) => i,
-            None => { err("mkfs: unknown device (only /dev/nvme0n1pN and /dev/sdaN supported)\n"); return; }
+            None => { err("mkfs: unknown device (only /dev/nvme0n1pN, /dev/sdaN and /dev/vdaN supported)\n"); return; }
         };
         let part_num: usize = match parse_usize(part_str) {
             Some(n) if n >= 1 => n,
@@ -430,11 +360,14 @@ fn ahci_name_to_idx(name: &str) -> Option<usize> {
     let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
     let letter = base.chars().last()?;
     let idx = (letter as u8).wrapping_sub(b'a') as usize;
+    let want = if base.starts_with("vd") { crate::drivers::DiskKind::Virtio }
+               else if base.starts_with("hd") { crate::drivers::DiskKind::Ata }
+               else { crate::drivers::DiskKind::Ahci };
     let n = crate::drivers::disk_count();
     let mut ahci_found = 0usize;
     for i in 0..n {
         if let Some(d) = crate::drivers::disk_info(i) {
-            if matches!(d.kind, crate::drivers::DiskKind::Ahci) {
+            if d.kind == want {
                 if ahci_found == idx { return Some(i); }
                 ahci_found += 1;
             }

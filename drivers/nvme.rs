@@ -23,6 +23,15 @@
  */
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use crate::mm::r#virtual::{self as vmm, FLAG_NX, FLAG_PCD, FLAG_PWT, FLAG_WRITABLE};
+
+/// Uncached virtual window for the controller registers (BAR0 may sit above
+/// 4 GiB where the HHDM does not necessarily reach).
+const NVME_UC_VIRT_BASE: u64 = 0xFFFF_FF20_0000_0000;
+const NVME_UC_MAX_PAGES: u64 = 32;
+
+#[inline]
+fn now_us() -> u64 { crate::arch::x86_64::tsc::tsc_stamp_us() }
 
 // ─── MMIO register offsets ────────────────────────────────────────────────
 
@@ -188,6 +197,11 @@ static mut DMA_BUF:   DmaBuf       = DmaBuf([0u8; 8192]);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static DETACHED: AtomicBool = AtomicBool::new(false);
+/// Set after any command timeout: the queues are in an unknown state, so all
+/// further I/O fails immediately instead of stalling for seconds each time.
+static BROKEN: AtomicBool = AtomicBool::new(false);
+/// Controller model string from Identify Controller (NUL-terminated, trimmed).
+static mut MODEL: [u8; 41] = [0u8; 41];
 
 /// Detach kernel driver from hardware.
 pub fn detach() {
@@ -293,7 +307,7 @@ unsafe fn admin_submit_poll(cmd: &SqEntry) -> Result<u32, u16> {
     write_doorbell(0, ADMIN_SQ_TAIL as u32);
 
     // Poll CQ for matching completion (phase-bit based)
-    let deadline_ticks = crate::arch::x86_64::idt::timer_ticks() + 500; // 5 second timeout
+    let t0 = now_us();
     loop {
         let entry = &ADMIN_CQ.0[ADMIN_CQ_HEAD];
         let phase = entry.phase();
@@ -315,8 +329,9 @@ unsafe fn admin_submit_poll(cmd: &SqEntry) -> Result<u32, u16> {
                 return Err(status);
             }
         }
-        if crate::arch::x86_64::idt::timer_ticks() >= deadline_ticks {
-            crate::arch::x86_64::serial::write_str("[NVMe] Admin command timed out\r\n");
+        if now_us().wrapping_sub(t0) >= 3_000_000 {
+            crate::arch::x86_64::serial::write_str("[NVME] Admin command timed out\r\n");
+            BROKEN.store(true, Ordering::Relaxed);
             return Err(0xFFFF);
         }
         core::arch::asm!("pause");
@@ -337,7 +352,7 @@ unsafe fn io_submit_poll(cmd: &SqEntry) -> Result<u32, u16> {
     // I/O SQ doorbell: index 2
     write_doorbell(2, IO_SQ_TAIL as u32);
 
-    let deadline_ticks = crate::arch::x86_64::idt::timer_ticks() + 300; // 3 second
+    let t0 = now_us();
     loop {
         let entry = &IO_CQ.0[IO_CQ_HEAD];
         let phase = entry.phase();
@@ -358,8 +373,9 @@ unsafe fn io_submit_poll(cmd: &SqEntry) -> Result<u32, u16> {
                 return Err(status);
             }
         }
-        if crate::arch::x86_64::idt::timer_ticks() >= deadline_ticks {
-            crate::arch::x86_64::serial::write_str("[NVMe] I/O command timed out\r\n");
+        if now_us().wrapping_sub(t0) >= 3_000_000 {
+            crate::arch::x86_64::serial::write_str("[NVME] I/O command timed out, disabling disk\r\n");
+            BROKEN.store(true, Ordering::Relaxed);
             return Err(0xFFFF);
         }
         core::arch::asm!("pause");
@@ -454,17 +470,60 @@ pub fn probe_and_init() -> bool {
     serial_hex64(phys_bar0);
     s("\r\n");
 
-    // Map BAR0 via HHDM
-    let mmio_virt = phys_bar0 + HHDM;
+    // Map BAR0 uncached into a dedicated window: registers + doorbells for
+    // stride 0 first (4 pages), extended below if CAP.DSTRD asks for more.
+    let page_off = phys_bar0 & 0xFFF;
+    let base_page = phys_bar0 & !0xFFF;
+    let mut mapped_pages = 0u64;
+    while mapped_pages < 4 {
+        if !vmm::map_page_current(NVME_UC_VIRT_BASE + mapped_pages * 0x1000,
+                                  base_page + mapped_pages * 0x1000,
+                                  FLAG_WRITABLE | FLAG_PCD | FLAG_PWT | FLAG_NX) {
+            s("[NVME] failed to map BAR0\r\n");
+            return false;
+        }
+        mapped_pages += 1;
+    }
+    let mmio_virt = NVME_UC_VIRT_BASE + page_off;
 
     unsafe {
         MMIO_BASE = mmio_virt;
 
         // Read CAP register to get DSTRD and MPSMIN
         let cap = mmio_r64(REG_CAP);
+        if cap == u64::MAX {
+            s("[NVME] BAR0 reads all-ones: device gone\r\n");
+            return false;
+        }
         DSTRD = ((cap >> 32) & 0xF) as u32; // bits[35:32]
         let mpsmin = (cap >> 48) & 0xF;     // bits[51:48]
         let to_500ms = (cap >> 24) & 0xFF;  // TO: units of 500ms
+        let mqes = cap & 0xFFFF;            // max queue entries - 1
+        let css_nvm = (cap >> 37) & 1;      // NVM command set supported
+
+        if mpsmin != 0 {
+            s("[NVME] controller needs host pages > 4 KiB, unsupported\r\n");
+            return false;
+        }
+        if css_nvm == 0 {
+            s("[NVME] controller has no NVM command set\r\n");
+            return false;
+        }
+        if (mqes + 1) < IO_Q_DEPTH as u64 {
+            s("[NVME] max queue size too small\r\n");
+            return false;
+        }
+        let db_end = 0x1000u64 + 4 * (4u64 << DSTRD) + page_off;
+        let need_pages = ((db_end + 0xFFF) / 0x1000).min(NVME_UC_MAX_PAGES);
+        while mapped_pages < need_pages {
+            if !vmm::map_page_current(NVME_UC_VIRT_BASE + mapped_pages * 0x1000,
+                                      base_page + mapped_pages * 0x1000,
+                                      FLAG_WRITABLE | FLAG_PCD | FLAG_PWT | FLAG_NX) {
+                s("[NVME] failed to map doorbells\r\n");
+                return false;
+            }
+            mapped_pages += 1;
+        }
 
         s("[NVMe] CAP=0x"); serial_hex64(cap);
         s(" DSTRD="); serial_dec(DSTRD as u64);
@@ -479,13 +538,13 @@ pub fn probe_and_init() -> bool {
         if cc & CC_EN != 0 {
             mmio_w32(REG_CC, cc & !CC_EN);
             // Wait for CSTS.RDY = 0
-            let deadline = crate::arch::x86_64::idt::timer_ticks()
-                + (to_500ms as u64 + 1) * 50; // TO×500ms converted to 10ms ticks
+            let t0 = now_us();
+            let limit = (to_500ms + 1) * 500_000;
             loop {
                 let csts = mmio_r32(REG_CSTS);
                 if csts & CSTS_RDY == 0 { break; }
-                if crate::arch::x86_64::idt::timer_ticks() >= deadline {
-                    s("[NVMe] Controller disable timeout\r\n");
+                if now_us().wrapping_sub(t0) >= limit {
+                    s("[NVME] Controller disable timeout\r\n");
                     return false;
                 }
                 core::arch::asm!("pause");
@@ -512,17 +571,17 @@ pub fn probe_and_init() -> bool {
         mmio_w32(REG_CC, cc_new);
 
         // Step 4: Wait CSTS.RDY = 1
-        let deadline = crate::arch::x86_64::idt::timer_ticks()
-            + (to_500ms as u64 + 2) * 50;
+        let t0 = now_us();
+        let limit = (to_500ms + 2) * 500_000;
         loop {
             let csts = mmio_r32(REG_CSTS);
             if csts & CSTS_FATAL != 0 {
-                s("[NVMe] Controller fatal error during init\r\n");
+                s("[NVME] Controller fatal error during init\r\n");
                 return false;
             }
             if csts & CSTS_RDY != 0 { break; }
-            if crate::arch::x86_64::idt::timer_ticks() >= deadline {
-                s("[NVMe] Controller enable timeout\r\n");
+            if now_us().wrapping_sub(t0) >= limit {
+                s("[NVME] Controller enable timeout\r\n");
                 return false;
             }
             core::arch::asm!("pause");
@@ -571,6 +630,15 @@ unsafe fn identify_controller() -> bool {
 
     // Model number is at bytes 24..63 in identify data (ASCII, space-padded)
     let model = &IDENTIFY.0[24..64];
+    {
+        let mut n = 0usize;
+        for &b in model {
+            if b >= 0x20 && b < 0x7F { MODEL[n] = b; n += 1; }
+        }
+        while n > 0 && MODEL[n - 1] == b' ' { n -= 1; }
+        MODEL[n] = 0;
+        if n == 0 { MODEL[..8].copy_from_slice(b"NVMe SSD"); MODEL[8] = 0; }
+    }
     s("[NVMe] Controller model: ");
     for &b in model {
         if b >= 0x20 && b < 0x7F { crate::arch::x86_64::serial::write_byte(b); }
@@ -673,6 +741,19 @@ unsafe fn identify_namespace() -> bool {
     // Byte 0-1: Metadata Size (MS); Byte 2: LBADS (log2 sector size); Byte 3: RP
     let lbads = if lbaf_off + 3 < 4096 { IDENTIFY.0[lbaf_off + 2] } else { 9 };
     // LBADS is log2 of sector size (9 = 512B, 12 = 4096B)
+    if lbads != 9 && lbads != 12 {
+        s("[NVME] unsupported LBA size 2^"); serial_dec(lbads as u64); s(" bytes, ignoring namespace\r\n");
+        return false;
+    }
+    let ms = u16::from_le_bytes([IDENTIFY.0[lbaf_off], IDENTIFY.0[lbaf_off + 1]]);
+    if ms != 0 && flbas & 0x10 != 0 {
+        s("[NVME] namespace uses extended-LBA metadata, unsupported\r\n");
+        return false;
+    }
+    if nsze == 0 {
+        s("[NVME] namespace 1 is empty\r\n");
+        return false;
+    }
     LBA_SHIFT = lbads as u32;
     SECTOR_COUNT = nsze;
 
@@ -697,6 +778,76 @@ unsafe fn next_cid() -> u16 {
 
 pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::Relaxed) && !DETACHED.load(Ordering::SeqCst)
+        && !BROKEN.load(Ordering::Relaxed)
+}
+
+/// Controller model string (NUL-terminated).
+pub fn model() -> &'static [u8; 41] {
+    unsafe { &*core::ptr::addr_of!(MODEL) }
+}
+
+/// Namespace size in 512-byte units (the unit the rest of the OS uses).
+pub fn sectors512() -> u64 {
+    unsafe { SECTOR_COUNT << (LBA_SHIFT - 9) }
+}
+
+/// Read `count` 512-byte sectors (translating for 4K-native namespaces).
+pub fn read512(lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    if !is_initialized() { return false; }
+    if buf.len() < count as usize * 512 { return false; }
+    let shift = unsafe { LBA_SHIFT };
+    if shift == 9 { return read_sectors(lba, count, buf); }
+    if shift != 12 { return false; }
+    let mut cur = lba;
+    let mut rem = count as u64;
+    let mut off = 0usize;
+    let mut tmp = [0u8; 4096];
+    while rem > 0 {
+        let nat = cur >> 3;
+        let sub = (cur & 7) as usize;
+        if sub == 0 && rem >= 8 {
+            let n = (rem >> 3) as u32;
+            let bytes = n as usize * 4096;
+            if !read_sectors(nat, n, &mut buf[off..off + bytes]) { return false; }
+            cur += n as u64 * 8; rem -= n as u64 * 8; off += bytes;
+        } else {
+            if !read_sectors(nat, 1, &mut tmp) { return false; }
+            let take = (8 - sub).min(rem as usize);
+            buf[off..off + take * 512].copy_from_slice(&tmp[sub * 512..(sub + take) * 512]);
+            cur += take as u64; rem -= take as u64; off += take * 512;
+        }
+    }
+    true
+}
+
+/// Write `count` 512-byte sectors (read-modify-write for 4K-native namespaces).
+pub fn write512(lba: u64, count: u32, buf: &[u8]) -> bool {
+    if !is_initialized() { return false; }
+    if buf.len() < count as usize * 512 { return false; }
+    let shift = unsafe { LBA_SHIFT };
+    if shift == 9 { return write_sectors(lba, count, buf); }
+    if shift != 12 { return false; }
+    let mut cur = lba;
+    let mut rem = count as u64;
+    let mut off = 0usize;
+    let mut tmp = [0u8; 4096];
+    while rem > 0 {
+        let nat = cur >> 3;
+        let sub = (cur & 7) as usize;
+        if sub == 0 && rem >= 8 {
+            let n = (rem >> 3) as u32;
+            let bytes = n as usize * 4096;
+            if !write_sectors(nat, n, &buf[off..off + bytes]) { return false; }
+            cur += n as u64 * 8; rem -= n as u64 * 8; off += bytes;
+        } else {
+            if !read_sectors(nat, 1, &mut tmp) { return false; }
+            let take = (8 - sub).min(rem as usize);
+            tmp[sub * 512..(sub + take) * 512].copy_from_slice(&buf[off..off + take * 512]);
+            if !write_sectors(nat, 1, &tmp) { return false; }
+            cur += take as u64; rem -= take as u64; off += take * 512;
+        }
+    }
+    true
 }
 
 pub fn sector_count() -> u64 {
