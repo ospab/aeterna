@@ -29,6 +29,7 @@ pub mod dns;
 pub mod sntp;
 pub mod tls;
 pub mod resolver;
+pub mod ostp;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 

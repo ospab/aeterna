@@ -1,0 +1,9 @@
+name = "hello-tmt"
+version = "0.1.0"
+description = "Greeting program: prints its pid, arguments and uptime"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/hello-tmt"
+dest = "/usr/bin/hello-tmt"

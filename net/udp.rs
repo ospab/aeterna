@@ -35,6 +35,12 @@ pub fn handle_udp(data: &[u8], _src_ip: [u8; 4]) {
         return;
     }
 
+    // OSTP tunnel client (its datagrams are larger than the generic 512-byte slot)
+    if super::ostp::wants(dst_port) {
+        super::ostp::on_udp(payload);
+        return;
+    }
+
     // DNS resolver listens on its current ephemeral source port
     let dns_port = super::dns::current_src_port();
     if dns_port != 0 && dst_port == dns_port {

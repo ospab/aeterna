@@ -1,0 +1,9 @@
+[package]
+name = "cowsay"
+description = "Text tool: a cow says what you tell it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../../user/liboos" }

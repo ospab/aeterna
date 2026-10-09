@@ -1,0 +1,9 @@
+[package]
+name = "hello-tmt"
+description = "Greeting program: prints its pid, arguments and uptime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../../user/liboos" }

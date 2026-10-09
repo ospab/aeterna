@@ -1064,3 +1064,110 @@ pub fn cmd_curl(args: &str) {
         break 'redir;
     }
 }
+
+// ─── http_get — shared HTTP(S) GET helper (tomato and other in-kernel clients) ─
+
+/// Split `http[s]://host[:port]/path` into (tls, host, port, path).
+fn parse_url(s: &str) -> Result<(bool, alloc::string::String, u16, alloc::string::String), alloc::string::String> {
+    use alloc::string::String;
+    let (tls, rest) = if let Some(r) = s.strip_prefix("https://") { (true, r) }
+        else if let Some(r) = s.strip_prefix("http://") { (false, r) }
+        else { return Err(format!("unsupported URL (need http:// or https://): {}", s)); };
+    let dflt = if tls { 443u16 } else { 80u16 };
+    let (hp, p) = match rest.find('/') { Some(i) => (&rest[..i], &rest[i..]), None => (rest, "/") };
+    let (h, po) = match hp.rfind(':') {
+        Some(c) => (&hp[..c], hp[c + 1..].parse::<u16>().map_err(|_| String::from("bad port in URL"))?),
+        None => (hp, dflt),
+    };
+    if h.is_empty() { return Err(String::from("empty host in URL")); }
+    Ok((tls, String::from(h), po, String::from(p)))
+}
+
+/// GET `url` (http:// or https://) and return the response body. Follows up to 5
+/// redirects, requires HTTP 200, decodes chunked bodies, and refuses bodies larger
+/// than `max_bytes`. Ctrl+C aborts. Errors are human-readable strings.
+pub fn http_get(url: &str, max_bytes: usize) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    if !crate::userspace::net::is_up() { return Err(String::from("network is down")); }
+    let mut cur = String::from(url);
+    for _hop in 0..=5usize {
+        let (use_tls, host, port, path) = parse_url(&cur)?;
+        let ip = crate::userspace::net::resolver::resolve_host(&host)
+            .map_err(|e| format!("cannot resolve '{}': {}", host, e.as_str()))?;
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: tomato/1.0 (AETERNA)\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path, host);
+
+        let mut acc: Vec<u8> = Vec::with_capacity(16 * 1024);
+        let mut buf = [0u8; 4096];
+        // Headers + body are read until complete; body limit applies to the whole buffer.
+        let limit = max_bytes.saturating_add(16 * 1024);
+        if use_tls {
+            let mut tls = crate::userspace::net::tls::connect(ip, port, &host)
+                .map_err(|e| format!("TLS failed: {}", e))?;
+            if tls.send(req.as_bytes()).is_err() { tls.close(); return Err(String::from("TLS send failed")); }
+            loop {
+                if check_ctrl_c() { tls.close(); return Err(String::from("interrupted")); }
+                match tls.recv(&mut buf, 1000) {
+                    Ok(0) => break,
+                    Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+                if http_response_complete(&acc, false) || acc.len() > limit { break; }
+            }
+            tls.close();
+        } else {
+            let conn = crate::userspace::net::tcp::tcp_connect(ip, port)
+                .map_err(|e| format!("connect failed: {}", e.as_str()))?;
+            if crate::userspace::net::tcp::tcp_send(conn, req.as_bytes()).is_err() {
+                crate::userspace::net::tcp::tcp_close(conn);
+                return Err(String::from("send failed"));
+            }
+            loop {
+                if check_ctrl_c() { crate::userspace::net::tcp::tcp_close(conn); return Err(String::from("interrupted")); }
+                match crate::userspace::net::tcp::tcp_recv(conn, &mut buf, 1000) {
+                    Ok(0) => break,
+                    Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+                if http_response_complete(&acc, false) || acc.len() > limit { break; }
+            }
+            crate::userspace::net::tcp::tcp_close(conn);
+        }
+
+        let sep = acc.windows(4).position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| String::from("no valid HTTP response from server"))?;
+        let head = core::str::from_utf8(&acc[..sep]).unwrap_or("");
+        let mut status = 0u16;
+        let mut chunked = false;
+        let mut clen: Option<usize> = None;
+        let mut location: Option<String> = None;
+        for (i, line) in head.split("\r\n").enumerate() {
+            if i == 0 {
+                status = line.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+            } else if let Some(col) = line.find(':') {
+                let (k, v) = (line[..col].trim(), line[col + 1..].trim());
+                if k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked") { chunked = true; }
+                else if k.eq_ignore_ascii_case("content-length") { clen = v.parse().ok(); }
+                else if k.eq_ignore_ascii_case("location") { location = Some(String::from(v)); }
+            }
+        }
+        if (301..=308).contains(&status) {
+            let loc = location.ok_or_else(|| format!("HTTP {} without Location", status))?;
+            cur = if loc.starts_with("http://") || loc.starts_with("https://") { loc }
+                else { format!("{}://{}{}", if use_tls { "https" } else { "http" }, host, loc) };
+            continue;
+        }
+        if status != 200 { return Err(format!("{}: HTTP {}", url, status)); }
+        let body_raw = &acc[sep + 4..];
+        let body = if chunked { decode_chunked(body_raw) } else { body_raw.to_vec() };
+        if let Some(cl) = clen {
+            if !chunked && body.len() < cl { return Err(format!("{}: truncated download ({} of {} bytes)", url, body.len(), cl)); }
+        }
+        if body.len() > max_bytes { return Err(format!("{}: response larger than {} bytes", url, max_bytes)); }
+        return Ok(body);
+    }
+    Err(String::from("too many redirects"))
+}

@@ -1,0 +1,9 @@
+name = "calc"
+version = "0.1.0"
+description = "Command-line calculator: + - * / % ^ and parentheses"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/calc"
+dest = "/usr/bin/calc"

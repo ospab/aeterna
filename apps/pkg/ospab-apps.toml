@@ -1,0 +1,9 @@
+name = "ospab-apps"
+version = "0.1.0"
+description = "Meta package: the sample programs hello-tmt, cowsay and calc"
+arch = "x86_64"
+depends = ["hello-tmt", "cowsay", "calc"]
+
+[[files]]
+src = "ospab-apps.txt"
+dest = "/usr/share/doc/ospab-apps/README"

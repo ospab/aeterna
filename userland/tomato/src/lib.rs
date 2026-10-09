@@ -4,26 +4,29 @@ Copyright (c) 2026 ospab
 
 tomato — package manager for ospab.os (AETERNA)
 
-Honest current state:
-  - There is NO remote package repository or package server yet, so
-    `-Sy`, `-Syu` and installing by name from the network are not
-    possible; tomato says so instead of pretending.
-  - What works: local binary packages in the .tmt format (see below).
-    Create one from files in the VFS, install it, query it, remove it:
+Packages are `.tmt` files (format below). They can be installed from a local
+file, from the local cache, or from a signed repository:
 
-      tomato --tmt pack hello 1.0 /tmp/hello.tmt /etc/hello.txt
-      tomato -U /tmp/hello.tmt          install a package file
-      tomato -S hello                   install from the local cache
-                                        (.tmt files in /var/cache/tomato/pkg)
-      tomato -Q / -Qi hello / -Ql hello query installed packages
-      tomato -Ss text                   search the local cache
-      tomato -R hello                   remove (only files it installed)
+  tomato -Sy                  download + verify the repository index
+  tomato -S <name>...         install (dependencies are resolved from the index)
+  tomato -Syu | -Su           upgrade installed packages
+  tomato -Ss [text]           search the synced index
+  tomato -U <file.tmt>        install a package file (no signature: the file's
+                              own SHA-256 only detects corruption, not forgery)
+  tomato -Q / -Qi / -Ql / -R  query / remove installed packages
 
-  - Package contents are plain files.  ospab.os cannot execute programs
-    from packages yet (no ELF loader), so packages carry data/scripts.
+Repository: https://tmt.ospab.org/x86_64/ (built in), overridable with
+`repo=<url>` lines in /etc/tomato.conf (http:// is allowed for local testing).
+The repository serves two files that matter:
+    index      "tmt-index 1" + one TAB-separated line per package:
+               name version size sha256 depends(comma list or "-") filename description
+    index.sig  64-byte Ed25519 signature over the exact bytes of `index`
+The signature is checked against the public key compiled into this kernel
+(userland/tomato/repo_key.pub); a package is only installed if its size and
+SHA-256 match the (signed) index. Anything that fails is refused.
 
 Installed package records: /var/lib/tomato/local/<name>
-  (name=, version=, installed_from=, file=<path> per installed file)
+  (name=, version=, depends=, installed_from=, file=<path> per installed file)
 */
 
 extern crate alloc;
@@ -34,26 +37,37 @@ use alloc::vec::Vec;
 use crate::userspace::plum::io;
 
 const LOCAL_PATH: &str = "/var/lib/tomato/local";
+const SYNC_PATH: &str = "/var/lib/tomato/sync";
 const CACHE_PATH: &str = "/var/cache/tomato/pkg";
+const CONF_PATH: &str = "/etc/tomato.conf";
+const DEFAULT_REPO: &str = "https://tmt.ospab.org/x86_64/";
+/// Ed25519 public key of the official repository (32 bytes, hex).
+const REPO_PUBKEY_HEX: &str = include_str!("../repo_key.pub");
+const MAX_INDEX: usize = 1024 * 1024;
+const MAX_PACKAGE: usize = 8 * 1024 * 1024;
 
 fn ensure_dirs() {
-    for d in ["/var", "/var/lib", "/var/lib/tomato", LOCAL_PATH, "/var/cache", "/var/cache/tomato", CACHE_PATH] {
+    for d in ["/etc", "/var", "/var/lib", "/var/lib/tomato", LOCAL_PATH, SYNC_PATH, "/var/cache", "/var/cache/tomato", CACHE_PATH] {
         if !crate::fs::exists(d) { crate::fs::mkdir(d); }
     }
 }
 
 fn usage() {
     io::out_c("tomato", io::FG_OK);
-    io::out(" - package manager for ospab.os (local .tmt packages)\n\n");
+    io::out(" - package manager for ospab.os (.tmt packages)\n\n");
+    io::out("  tomato -Sy                  synchronize: download and verify the package index\n");
+    io::out("  tomato -S <name>...         install packages (+ dependencies) from the repository\n");
+    io::out("  tomato -Syu | -Su           upgrade installed packages (-Syu syncs first)\n");
+    io::out("  tomato -Ss [text]           search the synced index\n");
     io::out("  tomato -U <file.tmt>...     install package files\n");
-    io::out("  tomato -S <name>...         install from the local cache (/var/cache/tomato/pkg)\n");
     io::out("  tomato -R <name>...         remove packages (only the files they installed)\n");
     io::out("  tomato -Q                   list installed packages\n");
     io::out("  tomato -Qi <name>           package info      -Ql <name>  list its files\n");
-    io::out("  tomato -Ss [text]           search the local cache\n");
-    io::out("  tomato -Sy | -Syu           (not available: there is no package repository yet)\n");
     io::out("  tomato --tmt pack <name> <version> <out.tmt> [-d desc] <file>...  build a package\n");
     io::out("  tomato --tmt list|verify|install <file.tmt>\n");
+    io::out("\nrepository: ");
+    io::out(&repos().join(" "));
+    io::out("  (override with repo=<url> in /etc/tomato.conf)\n");
 }
 
 fn record_path(name: &str) -> String {
@@ -86,13 +100,17 @@ pub fn run(args: &str) {
     let targets: Vec<&str> = parts.collect();
     match op {
         "" | "-h" | "--help" | "help" => usage(),
-        "-Sy" | "-Syu" | "-Su" | "-Syy" => {
-            io::err("tomato: no package repository is configured: ospab.os has no package server yet.\n");
-            io::err("        Nothing was synchronized or upgraded. Install local packages with: tomato -U <file.tmt>\n");
+        "-Sy" | "-Syy" => {
+            if !sync() { return; }
+            if !targets.is_empty() { for t in &targets { install_by_name(t); } }
         }
+        "-Syu" | "-Syyu" => {
+            if sync() { upgrade(); }
+        }
+        "-Su" => upgrade(),
         "-S" => {
             if targets.is_empty() { io::err("tomato: no targets specified\n"); return; }
-            for t in targets { install_by_name(t); }
+            install_many(&targets);
         }
         "-U" => {
             if targets.is_empty() { io::err("tomato: no package files specified\n"); return; }
@@ -101,9 +119,9 @@ pub fn run(args: &str) {
                 tmt_install(&p);
             }
         }
-        "-R" | "-Rs" | "-Rns" => {
+        "-R" | "-Rs" | "-Rns" | "-Rdd" => {
             if targets.is_empty() { io::err("tomato: no targets specified\n"); return; }
-            for t in targets { remove(t); }
+            for t in targets { remove(t, op == "-Rdd"); }
         }
         "-Q" => {
             if targets.is_empty() {
@@ -130,6 +148,313 @@ pub fn run(args: &str) {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  Repository: configuration, signed index, dependency resolution, download
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Repository base URLs (each ends with '/'), from /etc/tomato.conf or the built-in default.
+fn repos() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if let Some(d) = crate::fs::read_file(CONF_PATH) {
+        for line in String::from_utf8_lossy(&d).lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("repo") {
+                if let Some(url) = rest.trim_start().strip_prefix('=') {
+                    let url = url.trim();
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        let mut u = String::from(url);
+                        if !u.ends_with('/') { u.push('/'); }
+                        v.push(u);
+                    }
+                }
+            }
+        }
+    }
+    if v.is_empty() { v.push(String::from(DEFAULT_REPO)); }
+    v
+}
+
+/// One package line of the repository index.
+#[derive(Clone)]
+struct RepoPkg {
+    name: String,
+    version: String,
+    size: usize,
+    sha256: [u8; 32],
+    depends: Vec<String>,
+    filename: String,
+    desc: String,
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 || !s.is_ascii() { return None; }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in 0..s.len() / 2 {
+        out.push(u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?);
+    }
+    Some(out)
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b { s.push_str(&alloc::format!("{:02x}", x)); }
+    s
+}
+
+/// Check `sig` (64 bytes) over `msg` against the compiled-in repository key.
+fn verify_index_signature(msg: &[u8], sig: &[u8]) -> Result<(), &'static str> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let key: [u8; 32] = unhex(REPO_PUBKEY_HEX).and_then(|k| k.try_into().ok()).ok_or("built-in repository key is malformed")?;
+    let vk = VerifyingKey::from_bytes(&key).map_err(|_| "built-in repository key is invalid")?;
+    let sig: [u8; 64] = sig.try_into().map_err(|_| "signature file is not 64 bytes")?;
+    vk.verify(msg, &Signature::from_bytes(&sig)).map_err(|_| "signature does not match")
+}
+
+/// Parse a (already verified) index.
+fn parse_index(idx: &[u8]) -> Option<Vec<RepoPkg>> {
+    let text = core::str::from_utf8(idx).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "tmt-index 1" { return None; }
+    let mut v = Vec::new();
+    for l in lines {
+        if l.is_empty() { continue; }
+        let f: Vec<&str> = l.splitn(7, '\t').collect();
+        if f.len() < 7 || !valid_pkg_name(f[0]) { return None; }
+        let sha: [u8; 32] = unhex(f[3])?.try_into().ok()?;
+        if f[5].contains('/') || f[5].contains("..") || f[5].is_empty() { return None; }
+        v.push(RepoPkg {
+            name: String::from(f[0]),
+            version: String::from(f[1]),
+            size: f[2].parse().ok()?,
+            sha256: sha,
+            depends: if f[4] == "-" || f[4].is_empty() { Vec::new() } else { f[4].split(',').map(String::from).collect() },
+            filename: String::from(f[5]),
+            desc: String::from(f[6]),
+        });
+    }
+    Some(v)
+}
+
+/// Synced index + the repository it came from. The signature is re-checked on every load,
+/// so a tampered file in /var/lib/tomato/sync is rejected as well.
+fn load_synced() -> Option<(String, Vec<RepoPkg>)> {
+    let idx = crate::fs::read_file(&alloc::format!("{}/index", SYNC_PATH))?;
+    let sig = crate::fs::read_file(&alloc::format!("{}/index.sig", SYNC_PATH))?;
+    let base = String::from_utf8_lossy(&crate::fs::read_file(&alloc::format!("{}/repo", SYNC_PATH))?).trim().into();
+    if let Err(e) = verify_index_signature(&idx, &sig) {
+        io::err("tomato: the synced index failed signature verification (");
+        io::err(e);
+        io::err("); ignoring it - run 'tomato -Sy'\n");
+        return None;
+    }
+    Some((base, parse_index(&idx)?))
+}
+
+fn http_get(url: &str, max: usize) -> Result<Vec<u8>, String> {
+    crate::userspace::axon::net_tools::http_get(url, max)
+}
+
+/// `tomato -Sy`: fetch index + signature, verify, store. Returns true on success.
+fn sync() -> bool {
+    ensure_dirs();
+    let mut last_err = String::new();
+    for base in repos() {
+        io::out(&alloc::format!(":: synchronizing {}\n", base));
+        let idx = match http_get(&alloc::format!("{}index", base), MAX_INDEX) {
+            Ok(d) => d,
+            Err(e) => { last_err = alloc::format!("{}: {}", base, e); io::err(&alloc::format!("tomato: {}\n", last_err)); continue; }
+        };
+        let sig = match http_get(&alloc::format!("{}index.sig", base), 1024) {
+            Ok(d) => d,
+            Err(e) => { last_err = alloc::format!("{}: {}", base, e); io::err(&alloc::format!("tomato: {}\n", last_err)); continue; }
+        };
+        if let Err(e) = verify_index_signature(&idx, &sig) {
+            io::err(&alloc::format!(
+                "tomato: SIGNATURE CHECK FAILED for {}index ({}).\n        The index was not signed by the ospab.os repository key; refusing to use it.\n",
+                base, e));
+            last_err = String::from("signature check failed");
+            continue;
+        }
+        let pkgs = match parse_index(&idx) {
+            Some(p) => p,
+            None => { io::err("tomato: the index is signed but malformed; refusing to use it\n"); continue; }
+        };
+        crate::fs::write_file(&alloc::format!("{}/index", SYNC_PATH), &idx);
+        crate::fs::write_file(&alloc::format!("{}/index.sig", SYNC_PATH), &sig);
+        crate::fs::write_file(&alloc::format!("{}/repo", SYNC_PATH), base.as_bytes());
+        io::out(&alloc::format!("   index signature OK, {} package(s) available\n", pkgs.len()));
+        return true;
+    }
+    io::err("tomato: synchronization failed");
+    if !last_err.is_empty() { io::err(": "); io::err(&last_err); }
+    io::err("\n");
+    false
+}
+
+/// Numeric-aware version comparison: 1.10 > 1.9, 1.0.1 > 1.0.
+fn ver_cmp(a: &str, b: &str) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let mut ai = a.split(|c| c == '.' || c == '-' || c == '+');
+    let mut bi = b.split(|c| c == '.' || c == '-' || c == '+');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return Ordering::Equal,
+            (Some(x), None) => return if x.parse::<u64>() == Ok(0) { Ordering::Equal } else { Ordering::Greater },
+            (None, Some(y)) => return if y.parse::<u64>() == Ok(0) { Ordering::Equal } else { Ordering::Less },
+            (Some(x), Some(y)) => {
+                let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(p), Ok(q)) => p.cmp(&q),
+                    _ => x.cmp(y),
+                };
+                if o != Ordering::Equal { return o; }
+            }
+        }
+    }
+}
+
+/// Add `name` and (first) its dependencies to `plan`, dependencies before dependents.
+fn resolve(name: &str, pkgs: &[RepoPkg], plan: &mut Vec<RepoPkg>, stack: &mut Vec<String>, force: bool) -> Result<(), String> {
+    if plan.iter().any(|p| p.name == name) { return Ok(()); }
+    if stack.iter().any(|s| s == name) {
+        return Err(alloc::format!("dependency cycle involving '{}'", name));
+    }
+    let p = pkgs.iter().find(|p| p.name == name)
+        .ok_or_else(|| alloc::format!("target not found: {}", name))?;
+    // A dependency that is already installed is satisfied; explicit targets are (re)installed.
+    if !force {
+        if let Some(rec) = read_record(name) {
+            if ver_cmp(record_field(&rec, "version").unwrap_or("0"), &p.version) != core::cmp::Ordering::Less {
+                return Ok(());
+            }
+        }
+    }
+    stack.push(String::from(name));
+    for d in &p.depends {
+        resolve(d, pkgs, plan, stack, false).map_err(|e| {
+            if e.starts_with("target not found") {
+                alloc::format!("{} (required by {})", e, name)
+            } else { e }
+        })?;
+    }
+    stack.pop();
+    plan.push(p.clone());
+    Ok(())
+}
+
+/// Download `p` from `base`, verify size + SHA-256 against the signed index, cache it.
+/// Returns the verified package bytes.
+fn fetch_verified(base: &str, p: &RepoPkg) -> Option<Vec<u8>> {
+    let url = alloc::format!("{}{}", base, p.filename);
+    io::out(&alloc::format!("   downloading {} ({} bytes)\n", p.filename, p.size));
+    let data = match http_get(&url, p.size.max(1).min(MAX_PACKAGE)) {
+        Ok(d) => d,
+        Err(e) => { io::err(&alloc::format!("tomato: {}\n", e)); return None; }
+    };
+    if data.len() != p.size {
+        io::err(&alloc::format!(
+            "tomato: {}: size {} does not match the signed index ({}); refusing to install\n",
+            p.filename, data.len(), p.size));
+        return None;
+    }
+    if sha256_hash(&data) != p.sha256 {
+        io::err(&alloc::format!(
+            "tomato: {}: SHA-256 does not match the signed index; the download is corrupted or tampered with.\n        refusing to install\n",
+            p.filename));
+        return None;
+    }
+    Some(data)
+}
+
+/// Install the planned packages in order. Everything is downloaded and verified
+/// before the first file is written.
+fn install_plan(base: &str, plan: &[RepoPkg]) -> bool {
+    if plan.is_empty() { return true; }
+    let names: Vec<String> = plan.iter().map(|p| alloc::format!("{}-{}", p.name, p.version)).collect();
+    io::out(&alloc::format!("Packages ({}): {}\n", plan.len(), names.join(" ")));
+    let total: usize = plan.iter().map(|p| p.size).sum();
+    io::out(&alloc::format!("Total download size: {} bytes\n", total));
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for p in plan {
+        match fetch_verified(base, p) {
+            Some(d) => blobs.push(d),
+            None => { io::err("tomato: nothing was installed\n"); return false; }
+        }
+    }
+    for (p, blob) in plan.iter().zip(blobs.iter()) {
+        match tmt_parse_header(blob) {
+            Some(h) if h.name == p.name && h.pkg_version == p.version => {}
+            _ => {
+                io::err(&alloc::format!("tomato: {}: package header does not match the index entry; refusing to install\n", p.filename));
+                return false;
+            }
+        }
+        let cached = alloc::format!("{}/{}", CACHE_PATH, p.filename);
+        crate::fs::write_file(&cached, blob);
+        if !install_blob(blob, &cached) { return false; }
+    }
+    true
+}
+
+fn install_many(targets: &[&str]) {
+    ensure_dirs();
+    let synced = load_synced();
+    let mut plan: Vec<RepoPkg> = Vec::new();
+    let mut local: Vec<&str> = Vec::new();
+    for t in targets {
+        match &synced {
+            Some((_, pkgs)) if pkgs.iter().any(|p| p.name == *t) => {
+                if let Err(e) = resolve(t, pkgs, &mut plan, &mut Vec::new(), true) {
+                    io::err(&alloc::format!("tomato: {}\n", e));
+                    io::err("tomato: nothing was installed\n");
+                    return;
+                }
+            }
+            _ => local.push(t),
+        }
+    }
+    if let Some((base, _)) = &synced {
+        if !install_plan(base, &plan) { return; }
+    }
+    for t in local {
+        install_by_name_local(t, synced.is_some());
+    }
+}
+
+fn install_by_name(name: &str) { install_many(&[name]); }
+
+/// Upgrade every installed package that is older than the synced index.
+fn upgrade() {
+    ensure_dirs();
+    let (base, pkgs) = match load_synced() {
+        Some(s) => s,
+        None => { io::err("tomato: no valid synced index; run 'tomato -Sy' first\n"); return; }
+    };
+    let mut plan: Vec<RepoPkg> = Vec::new();
+    if let Some(entries) = crate::fs::readdir(LOCAL_PATH) {
+        for e in entries {
+            let rec = match read_record(&e.name) { Some(r) => r, None => continue };
+            let have = record_field(&rec, "version").unwrap_or("0");
+            if let Some(p) = pkgs.iter().find(|p| p.name == e.name) {
+                if ver_cmp(have, &p.version) == core::cmp::Ordering::Less {
+                    io::out(&alloc::format!(":: {} {} -> {}\n", e.name, have, p.version));
+                    if let Err(err) = resolve(&e.name, &pkgs, &mut plan, &mut Vec::new(), true) {
+                        io::err(&alloc::format!("tomato: {}\n", err));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if plan.is_empty() {
+        io::out("there is nothing to do: all installed packages are up to date\n");
+        return;
+    }
+    install_plan(&base, &plan);
+}
+
+// ─── local cache (packages copied into /var/cache/tomato/pkg by hand) ──────────
+
 /// Packages in the local cache: (path, header, description)
 fn cache_packages() -> Vec<(String, TmtHeader, String)> {
     let mut v = Vec::new();
@@ -151,16 +476,20 @@ fn cache_packages() -> Vec<(String, TmtHeader, String)> {
     v
 }
 
-fn install_by_name(name: &str) {
+fn install_by_name_local(name: &str, have_index: bool) {
     ensure_dirs();
     match cache_packages().into_iter().find(|(_, h, _)| h.name == name) {
         Some((path, _, _)) => { tmt_install(&path); }
         None => {
             io::err("tomato: target not found: ");
             io::err(name);
-            io::err("\n        (there is no remote repository yet; tomato only knows packages in ");
-            io::err(CACHE_PATH);
-            io::err(".\n         Use 'tomato -U <file.tmt>' for a package file elsewhere.)\n");
+            if have_index {
+                io::err("\n");
+            } else {
+                io::err("\n        (no package index yet: run 'tomato -Sy'; local packages are looked up in ");
+                io::err(CACHE_PATH);
+                io::err(")\n");
+            }
         }
     }
 }
@@ -168,6 +497,26 @@ fn install_by_name(name: &str) {
 fn search(q: &str) {
     let q = q.to_ascii_lowercase();
     let mut found = 0;
+    if let Some((base, pkgs)) = load_synced() {
+        io::out_c(&alloc::format!("repository {}\n", base), io::FG_DIM);
+        for p in &pkgs {
+            if !q.is_empty() && !p.name.to_ascii_lowercase().contains(&q) && !p.desc.to_ascii_lowercase().contains(&q) {
+                continue;
+            }
+            found += 1;
+            io::out_c(&p.name, io::FG_OK);
+            io::out(" ");
+            io::out_c(&p.version, io::FG_WARN);
+            if let Some(rec) = read_record(&p.name) {
+                io::out_c(&alloc::format!(" [installed {}]", record_field(&rec, "version").unwrap_or("?")), io::FG_DIM);
+            }
+            io::out("\n    ");
+            io::out(if p.desc.is_empty() { "(no description)" } else { &p.desc });
+            io::out("\n");
+        }
+        if found == 0 { io::err("tomato: no matching packages in the synced index\n"); }
+        return;
+    }
     for (path, h, desc) in cache_packages() {
         if !q.is_empty() && !h.name.to_ascii_lowercase().contains(&q) && !desc.to_ascii_lowercase().contains(&q) {
             continue;
@@ -182,9 +531,9 @@ fn search(q: &str) {
         io::out_c(&alloc::format!("  ({})\n", path), io::FG_DIM);
     }
     if found == 0 {
-        io::err("tomato: no matching packages in the local cache ");
+        io::err("tomato: no synced index (run 'tomato -Sy') and no matching packages in ");
         io::err(CACHE_PATH);
-        io::err(" (there is no remote repository yet)\n");
+        io::err("\n");
     }
 }
 
@@ -221,15 +570,29 @@ fn info(name: &str, files_only: bool) {
     io::out(&alloc::format!("Name           : {}\n", name));
     io::out(&alloc::format!("Version        : {}\n", record_field(&rec, "version").unwrap_or("?")));
     io::out(&alloc::format!("Description    : {}\n", record_field(&rec, "description").unwrap_or("")));
+    io::out(&alloc::format!("Depends on     : {}\n", record_field(&rec, "depends").filter(|d| !d.is_empty()).unwrap_or("None")));
     io::out(&alloc::format!("Installed from : {}\n", record_field(&rec, "installed_from").unwrap_or("?")));
     io::out(&alloc::format!("Files          : {}\n", files));
 }
 
-fn remove(name: &str) {
+fn remove(name: &str, skip_dep_check: bool) {
     let rec = match read_record(name) {
         Some(r) => r,
         None => { io::err("tomato: target not found: "); io::err(name); io::err("\n"); return; }
     };
+    if !skip_dep_check {
+        if let Some(entries) = crate::fs::readdir(LOCAL_PATH) {
+            for e in entries {
+                if e.name == name { continue; }
+                let other = read_record(&e.name).unwrap_or_default();
+                let needs = record_field(&other, "depends").unwrap_or("").split(',').any(|d| d == name);
+                if needs {
+                    io::err(&alloc::format!("tomato: cannot remove {}: required by {} (use -Rdd to override)\n", name, e.name));
+                    return;
+                }
+            }
+        }
+    }
     let mut removed = 0;
     let mut missing = 0;
     for l in rec.lines() {
@@ -579,11 +942,25 @@ pub fn tmt_install(vfs_path: &str) -> bool {
         Some(d) => d,
         None => { io::err("tomato: "); io::err(vfs_path); io::err(": No such file\n"); return false; }
     };
-    let hdr = match tmt_parse_header(&data) {
+    if tmt_parse_header(&data).is_none() {
+        io::err("tomato: "); io::err(vfs_path); io::err(": not a .tmt package\n");
+        return false;
+    }
+    install_blob(&data, vfs_path)
+}
+
+/// Verify the package's own checksum and extract it. `source` is recorded as `installed_from`.
+fn install_blob(data: &[u8], source: &str) -> bool {
+    let vfs_path = source;
+    let hdr = match tmt_parse_header(data) {
         Some(h) => h,
         None => { io::err("tomato: "); io::err(vfs_path); io::err(": not a .tmt package\n"); return false; }
     };
-    if !tmt_verify(&data) {
+    if hdr.arch != TMT_ARCH_ANY && hdr.arch != TMT_ARCH_X64 {
+        io::err("tomato: package is built for another architecture; nothing installed\n");
+        return false;
+    }
+    if !tmt_verify(data) {
         io::err("tomato: SHA-256 checksum mismatch - package is corrupted; nothing installed\n");
         return false;
     }
@@ -639,6 +1016,18 @@ pub fn tmt_install(vfs_path: &str) -> bool {
         rec.push_str("description=");
         rec.push_str(d);
         rec.push('\n');
+    }
+    if let Some(d) = record_field(&meta, "depends") {
+        if !d.is_empty() {
+            rec.push_str("depends=");
+            rec.push_str(d);
+            rec.push('\n');
+            for dep in d.split(',') {
+                if read_record(dep).is_none() {
+                    io::err(&alloc::format!("tomato: warning: dependency '{}' is not installed\n", dep));
+                }
+            }
+        }
     }
     let mut n = 0;
     for (p, d) in &entries {

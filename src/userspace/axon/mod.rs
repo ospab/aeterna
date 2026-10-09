@@ -32,6 +32,7 @@ pub mod disk_tools;
 pub mod lspci;
 pub mod net_tools;
 pub mod netstat;
+pub mod ostp;
 pub mod ping;
 pub mod proc_tools;
 pub mod ps;
@@ -104,6 +105,7 @@ pub fn run(name: &str, args: &[String]) -> bool {
         "top" => proc_tools::cmd_top(&joined()),
         "kill" => proc_tools::cmd_kill(&joined()),
         "netstat" => netstat::run(&joined()),
+        "ostp" => ostp::run(&joined()),
         "ping" => ping::run(&joined()),
         "traceroute" => net_tools::cmd_traceroute(&joined()),
         "ip" => net_tools::cmd_ip_show(&joined()),
@@ -129,7 +131,7 @@ pub fn command_list() -> &'static [&'static str] {
         "find", "tee", "wc", "head", "tail", "grep", "egrep", "sort", "uniq", "cut", "tr", "rev",
         "nl", "xxd", "diff", "awk", "basename", "dirname", "seq", "yes", "printf", "xargs",
         "sleep", "ps", "top", "kill", "netstat", "ping", "traceroute", "ip", "curl", "nslookup",
-        "lspci", "fdisk", "lsblk", "mkfs", "mount",
+        "lspci", "fdisk", "lsblk", "mkfs", "mount", "ostp",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }

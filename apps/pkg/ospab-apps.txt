@@ -1,0 +1,4 @@
+ospab-apps installs the sample programs from the ospab.os program SDK (apps/):
+  hello-tmt   greeting
+  cowsay      text tool
+  calc        calculator

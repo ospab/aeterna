@@ -16,6 +16,12 @@ linked_list_allocator = "0.10"
 # Для будущего парсинга конфигов ИИ
 crossbeam-utils = { version = "0.8", default-features = false }
 
+# OSTP protocol core (no_std + alloc; branch no-std-core of the ostp repo)
+ostp-core = { path = "../ostp-nostd/ostp-core", default-features = false }
+
+# tomato: verify the Ed25519 signature of the tmt.ospab.org package index (no_std)
+ed25519-dalek = { version = "2", default-features = false }
+
 [profile.release]
 panic = "abort"
 lto = true          # Максимальная оптимизация для ИИ

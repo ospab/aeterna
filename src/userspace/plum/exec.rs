@@ -538,17 +538,7 @@ pub fn run_argv(argv: &[String]) -> i32 {
                 io::err(": Is a directory\n");
                 126
             }
-            Some(_) => {
-                let data = crate::fs::read_file(&path).unwrap_or_default();
-                if data.starts_with(b"\x7FELF") {
-                    io::err("plum: ");
-                    io::err(name);
-                    io::err(": cannot execute: running ELF programs is not supported yet\n");
-                    126
-                } else {
-                    super::builtins::run_script(&path, args)
-                }
-            }
+            Some(_) => exec_file(name, &path, args),
         };
     }
 
@@ -575,10 +565,85 @@ pub fn run_argv(argv: &[String]) -> i32 {
         return 126;
     }
 
+    // 6. program on $PATH (ELF executables are run as ring-3 processes)
+    if let Some(path) = find_in_path(name) {
+        return exec_file(name, &path, args);
+    }
+
     io::err("plum: ");
     io::err(name);
     io::err(": command not found\n");
     127
+}
+
+/// First regular file called `name` in $PATH (default `/usr/bin:/bin`).
+fn find_in_path(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains('/') { return None; }
+    let path = super::getenv("PATH").map(String::from).unwrap_or_else(|| String::from("/usr/bin:/bin"));
+    for dir in path.split(':') {
+        if dir.is_empty() { continue; }
+        let cand = alloc::format!("{}/{}", dir.trim_end_matches('/'), name);
+        if let Some(st) = crate::fs::stat(&cand) {
+            if st.node_type != crate::fs::NodeType::Directory { return Some(cand); }
+        }
+    }
+    None
+}
+
+/// Run a file given by absolute path: an ELF image becomes a ring-3 process,
+/// anything else is run as a shell script.
+fn exec_file(name: &str, path: &str, args: &[String]) -> i32 {
+    let data = crate::fs::read_file(path).unwrap_or_default();
+    if data.starts_with(b"\x7FELF") {
+        run_elf(name, &data, args)
+    } else {
+        super::builtins::run_script(path, args)
+    }
+}
+
+/// Spawn an ELF program, wait for it and return its exit code. Ctrl+C kills it.
+/// Note: ring-3 stdout currently goes to the serial port (the write syscall), so the
+/// program's output is neither shown on the framebuffer console nor capturable.
+fn run_elf(name: &str, image: &[u8], args: &[String]) -> i32 {
+    use crate::core::scheduler::{self, Capability};
+    let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    argv.push(name);
+    for a in args { argv.push(a.as_str()); }
+    let prog = name.rsplit('/').next().unwrap_or(name);
+    let caps = alloc::vec![Capability::Serial, Capability::FsRead, Capability::FsWrite];
+    let pid = match crate::core::elf::spawn(prog, image, &argv, caps) {
+        Ok(pid) => pid,
+        Err(e) => {
+            io::err("plum: ");
+            io::err(name);
+            io::err(": cannot execute: ");
+            io::err(e.as_str());
+            io::err("\n");
+            return 126;
+        }
+    };
+    // Wait; Ctrl+C (flagged by the keyboard IRQ) kills the process.
+    let mut killed = false;
+    while scheduler::task_alive(pid) {
+        if io::poll_interrupt() {
+            scheduler::signal_pid(pid, 9);
+            killed = true;
+            break;
+        }
+        scheduler::sys_yield();
+    }
+    let code = scheduler::wait_pid(pid);
+    if killed { return 130; }
+    match code {
+        Some(c) if c == scheduler::EXIT_KILLED => {
+            io::err("plum: ");
+            io::err(name);
+            io::err(": terminated by the kernel (fault)\n");
+            139
+        }
+        Some(c) => (c & 0xFF) as i32,
+        None => 0,
+    }
 }
 
 fn call_function(name: &str, body: &Rc<Node>, args: &[String]) -> i32 {
