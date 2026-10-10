@@ -491,6 +491,18 @@ extern "C" fn apic_timer_dispatch(saved_state: *mut u8, fx_area: *mut u8) {
     // but NIC IRQs will still land on separate PIC-routed vectors).
     crate::arch::x86_64::apic::one_shot_us(1_000);
 
+    // No PIT on this machine: keep the 100 Hz tick counter going from here.
+    if !PIT_ALIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            APIC_SUBTICKS += 1;
+            if APIC_SUBTICKS >= 10 {
+                APIC_SUBTICKS = 0;
+                TIMER_TICKS += 1;
+                crate::drivers::audio::timer_tick();
+            }
+        }
+    }
+
     // Drive scheduler context switch — same interface as PIT handler.
     crate::core::scheduler::on_timer_irq(saved_state as *mut u8, fx_area);
 }
@@ -737,6 +749,11 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
 // ============================================================================
 
 static mut TIMER_TICKS: u64 = 0;
+
+/// False when TSC calibration saw no PIT interrupts; the 1 ms APIC timer then also
+/// advances the 100 Hz tick counter (every 10th interrupt), so timeouts keep working.
+pub static PIT_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static mut APIC_SUBTICKS: u32 = 0;
 
 /// Get current timer tick count
 pub fn timer_ticks() -> u64 {

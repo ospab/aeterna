@@ -50,35 +50,60 @@ pub fn read_serialised() -> u64 {
 // ─────────────────────────────────────────────────────────────
 // Calibration (call once, from arch init, after PIT is live)
 // ─────────────────────────────────────────────────────────────
+/// TSC frequency reported by the CPU: leaf 0x15 (TSC/crystal ratio × crystal Hz), else
+/// leaf 0x16 (base frequency in MHz). None when the CPU reports neither.
+fn cpuid_tsc_mhz() -> Option<u64> {
+    use core::arch::x86_64::__cpuid;
+    let max = unsafe { __cpuid(0) }.eax;
+    if max >= 0x15 {
+        let l = unsafe { __cpuid(0x15) };
+        if l.eax != 0 && l.ebx != 0 && l.ecx != 0 {
+            return Some(l.ecx as u64 * l.ebx as u64 / l.eax as u64 / 1_000_000);
+        }
+    }
+    if max >= 0x16 {
+        let base = unsafe { __cpuid(0x16) }.eax & 0xFFFF;
+        if base != 0 { return Some(base as u64); }
+    }
+    None
+}
+
 /// Calibrate TSC against the 100 Hz PIT timer.
 /// Blocks for ~100 ms (10 PIT ticks) — call early in boot before any UI.
 pub fn calibrate() {
     use crate::arch::x86_64::idt::timer_ticks;
 
+    // Every wait is bounded by TSC cycles: on some machines PIT interrupts never arrive
+    // (8254 gated off, legacy routing disabled), and an unbounded wait hung the boot.
+    // 2^33 cycles is ~3 s at 3 GHz and ~9 s at 1 GHz: far longer than 100 ms of ticks.
+    const LIMIT: u64 = 1 << 33;
+    let begin = read();
+    let expired = || read().wrapping_sub(begin) > LIMIT;
+
     // Wait for a clean tick edge so we start at a boundary
-    let start_tick = {
-        let t0 = timer_ticks();
-        loop {
-            let t = timer_ticks();
-            if t != t0 { break t; }
-            unsafe { asm!("pause"); }
-        }
-    };
+    let t0 = timer_ticks();
+    let mut start_tick = t0;
+    while start_tick == t0 && !expired() {
+        unsafe { asm!("pause"); }
+        start_tick = timer_ticks();
+    }
 
     let tsc0 = read();
 
     // Wait for 10 more ticks  (= 100 ms at 100 Hz)
-    loop {
-        let t = timer_ticks();
-        if t.wrapping_sub(start_tick) >= 10 { break; }
-        unsafe { asm!("hlt"); }   // sleep until next IRQ
+    while start_tick != t0 && timer_ticks().wrapping_sub(start_tick) < 10 && !expired() {
+        unsafe { asm!("pause"); }
     }
 
     let tsc1 = read();
-    let cycles = tsc1.wrapping_sub(tsc0);
-
-    // 10 ticks = 100 ms = 100_000 µs  → MHz = cycles / 100_000
-    let mhz = cycles / 100_000;
+    let mhz = if start_tick != t0 && !expired() {
+        // 10 ticks = 100 ms = 100_000 µs  → MHz = cycles / 100_000
+        tsc1.wrapping_sub(tsc0) / 100_000
+    } else {
+        crate::arch::x86_64::idt::PIT_ALIVE.store(false, Ordering::Relaxed);
+        crate::arch::x86_64::serial::write_str("[TSC] No PIT ticks: frequency from CPUID; ticks will come from the APIC timer\r\n");
+        cpuid_tsc_mhz().unwrap_or(2000)
+    };
     let mhz = if mhz == 0 { 1 } else { mhz };  // safety: never divide-by-zero
 
     TSC_MHZ.store(mhz, Ordering::Relaxed);

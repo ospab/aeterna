@@ -23,6 +23,7 @@ pub enum Resolution {
     /// The display's preferred mode (EDID), else the firmware's current mode.
     Auto,
     Max,
+    /// Exact size, or the closest mode when it is missing (also the hd/fullhd/2k/4k presets).
     Exact(u32, u32),
 }
 
@@ -331,6 +332,10 @@ pub fn parse(text: &str) -> Parsed {
                             "auto" => Some(Resolution::Auto),
                             "max" => Some(Resolution::Max),
                             "keep" => Some(Resolution::Keep),
+                            "hd" => Some(Resolution::Exact(1280, 720)),
+                            "fullhd" => Some(Resolution::Exact(1920, 1080)),
+                            "2k" => Some(Resolution::Exact(2560, 1440)),
+                            "4k" => Some(Resolution::Exact(3840, 2160)),
                             v => v.split_once('x').and_then(|(w, h)| {
                                 let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
                                 (w >= 320 && h >= 200 && w <= 16384 && h <= 16384).then_some(Resolution::Exact(w, h))
@@ -338,7 +343,7 @@ pub fn parse(text: &str) -> Parsed {
                         };
                         match r {
                             Some(r) => cfg.resolution = r,
-                            None => err(&mut errors, n, "resolution must be auto, max, keep or WIDTHxHEIGHT".to_string()),
+                            None => err(&mut errors, n, "resolution must be auto, max, keep, hd, fullhd, 2k, 4k or WIDTHxHEIGHT".to_string()),
                         }
                     }
                     _ => err(&mut errors, n, alloc::format!(

@@ -163,10 +163,14 @@ fn setup_xsave(xcr0: u32) {
 pub fn init() {
     disable_interrupts();
     enable_sse();
-    enable_avx();
 
     serial::init();
     serial::write_str("[BOOT] Serial COM1 ready\r\n");
+
+    // Screen first (see init_framebuffer); then every step is visible before it runs.
+    init_framebuffer();
+    step("CPU: AVX / XSAVE");
+    enable_avx();
 
     if !boot::base_revision_supported() {
         serial::write_str("[BOOT] WARN: Limine base revision not supported\r\n");
@@ -177,32 +181,61 @@ pub fn init() {
         serial::write_str("\r\n");
     }
 
+    step("CPU: GDT and TSS");
     gdt_simple::init();
     serial::write_str("[CPU] GDT + TSS loaded\r\n");
 
+    step("CPU: IDT");
     idt::init();
 
     // Initialize PIC (remap IRQs to IDT 32-47)
+    step("Interrupts: 8259 PIC");
     pic::init();
 
     // Program PIT channel 0 to fire at 100 Hz (preemptive scheduling fallback)
+    step("Timer: PIT 100 Hz");
     pic::init_pit_100hz();
 
     // Initialize PS/2 Mouse
+    step("Input: PS/2 mouse");
     super::mouse::init();
 
-    // Calibrate TSC — must come after PIT is live (uses 10 tick = 100 ms window).
+    // Calibrate TSC against the PIT (bounded; falls back to CPUID if no PIT ticks arrive).
     // Enable interrupts first so that `hlt` in calibrate() actually receives PIT ticks.
+    step("Timer: TSC calibration");
     enable_interrupts();
     super::tsc::calibrate();
     // Seed the wall clock from the CMOS RTC (needs the calibrated TSC).
+    step("Clock: CMOS RTC");
     crate::time::init();
 
     // Init Local APIC one-shot timer (vector 48) — arms 1 ms precision preemption.
     // Requires TSC calibrated and interrupts enabled.
+    step("Timer: local APIC");
     super::apic::init_timer();
 
-    // Initialize framebuffer if available
+    // Enable hardware interrupts
+    enable_interrupts();
+    serial::write_str("[CPU] Interrupts enabled\r\n");
+    // Leave the early lines for the boot log that follows (src/main.rs).
+    if framebuffer::is_initialized() {
+        framebuffer::clear(0x00000000);
+    }
+}
+
+/// Early boot progress: serial always, the screen once it is up (dim, one line per step).
+fn step(what: &str) {
+    serial::write_str("[INIT] ");
+    serial::write_str(what);
+    serial::write_str("\r\n");
+    if framebuffer::is_initialized() {
+        framebuffer::draw_string("  ... ", 0x00707070, 0);
+        framebuffer::draw_string(what, 0x00A0A0A0, 0);
+        framebuffer::draw_char('\n', 0x00A0A0A0, 0);
+    }
+}
+
+fn init_framebuffer() {
     if let Some(fb) = boot::framebuffer() {
         unsafe {
             framebuffer::init(
@@ -227,15 +260,11 @@ pub fn init() {
         // Initialize fbconsole for text output
         super::fbconsole::init();
 
-        // Blank screen; the boot log (src/main.rs) is the only thing drawn on it.
         framebuffer::clear(0x00000000);
+        framebuffer::draw_string("AETERNA: early start\n", 0x00A0A0A0, 0);
     } else {
         serial::write_str("[FB] No framebuffer from the boot loader\r\n");
     }
-
-    // Enable hardware interrupts
-    enable_interrupts();
-    serial::write_str("[CPU] Interrupts enabled\r\n");
 }
 
 pub fn serial_hex(mut val: u64) {

@@ -113,7 +113,8 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     let mhz = ospab_os::arch::x86_64::tsc::mhz();
     let apic = if ospab_os::arch::x86_64::apic::is_present() { ", APIC timer" } else { "" };
     if mhz > 0 {
-        boot_log!(Status::Ok, "CPU", "GDT/TSS, IDT, PIC, PIT 100 Hz, TSC {} MHz{}", mhz, apic);
+        let pit = if ospab_os::arch::x86_64::idt::PIT_ALIVE.load(core::sync::atomic::Ordering::Relaxed) { "PIT 100 Hz" } else { "no PIT (ticks from APIC)" };
+        boot_log!(Status::Ok, "CPU", "GDT/TSS, IDT, PIC, {}, TSC {} MHz{}", pit, mhz, apic);
     } else {
         boot_log!(Status::Warn, "CPU", "TSC not calibrated, timing falls back to the 100 Hz PIT");
     }

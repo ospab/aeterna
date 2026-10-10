@@ -537,6 +537,16 @@ fn boot_kernel(image: Handle, vol: &mut Volume, cfg: &Config, entry: &config::En
     let regions = unsafe { core::slice::from_raw_parts_mut(regions_phys as *mut MemoryRegion, MAX_REGIONS) };
     info.memmap_count = convert_map(&map, &fb, regions) as u64;
 
+    // No console after ExitBootServices: a green bar at the top of the screen tells
+    // whoever is looking that the loader got this far and is about to enter the kernel.
+    if fb.phys_addr != 0 && fb.bpp == 32 {
+        for y in 0..6u64 {
+            for x in 0..fb.width.min(320) {
+                unsafe { ptr::write_volatile((fb.phys_addr + y * fb.pitch + x * 4) as *mut u32, 0x0000C000) };
+            }
+        }
+    }
+
     unsafe {
         // NX bits are used in the tables, so EFER.NXE must be on before CR3 switches.
         let (lo, hi): (u32, u32);
