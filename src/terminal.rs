@@ -497,6 +497,8 @@ fn read_line() -> &'static str {
                     if ospab_os::drivers::disk_count() > 0 {
                         fs::disk_sync::deferred_tick();
                     }
+                    // Keep an OSTP session alive while the console waits for input.
+                    ospab_os::net::ostp::idle_poll();
                     continue;
                 }
             };

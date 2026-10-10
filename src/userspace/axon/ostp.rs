@@ -390,7 +390,7 @@ fn connect(args: Vec<&str>) {
     ));
     match ostp::connect(params) {
         Ok(us) => {
-            info(&format!("Handshake complete (handshake {}); the session is kept alive in the background", fmt_us(us)));
+            info(&format!("Handshake complete (handshake {})", fmt_us(us)));
             match ostp::ping() {
                 Ok(us) => info(&format!("Tunnel ping ok, rtt {}", fmt_us(us))),
                 Err(e) => fail(&format!("tunnel ping failed: {}", e)),

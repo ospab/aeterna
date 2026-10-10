@@ -611,6 +611,35 @@ fn start_pump() {
     }
 }
 
+/// Drive an established session from the console's idle loop (no thread): keepalives
+/// and retransmits at most every 50 ms; a dead session is dropped and the next ostp
+/// command reconnects. Never blocks: skips if a command holds the tunnel.
+pub fn idle_poll() {
+    static LAST_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !WANT.load(Ordering::Acquire) {
+        return;
+    }
+    let now = crate::time::monotonic_ns();
+    if now.wrapping_sub(LAST_NS.load(Ordering::Relaxed)) < 50_000_000 {
+        return;
+    }
+    LAST_NS.store(now, Ordering::Relaxed);
+    if let Some(mut g) = TUNNEL.try_lock() {
+        let mut dead = false;
+        if let Some(t) = g.as_mut() {
+            crate::net::poll_rx();
+            t.pump();
+            dead = t.dead();
+        }
+        if dead {
+            if let Some(old) = g.take() {
+                drop_tunnel(old);
+            }
+            event("session lost; the next ostp command reconnects".to_string());
+        }
+    }
+}
+
 extern "C" fn pump_main() -> ! {
     let mut backoff_s: u64 = 2;
     let mut next_try_ns: u64 = 0;
