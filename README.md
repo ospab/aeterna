@@ -8,20 +8,20 @@
 [![Architecture](https://img.shields.io/badge/Architecture-x86__64-0366d6?style=flat-square)](#)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-2ea44f?style=flat-square)](LICENSE)
 
-[English](README.md) · [Русский](README_ru.md)
+[English](README.md) · [Русский](README_ru.md) · [Documentation](docs/en/README.md) · [Документация](docs/ru/README.md)
 
 </div>
 
 **ospab.os** is a closed, vertically integrated operating system built from scratch in Rust.
 Its kernel is called **AETERNA**. The system does not try to be compatible with Linux or Windows:
-the kernel, drivers, network stack, shell and tools are all written together and designed as one
-whole. It is part of the ospab ecosystem and will ship native, low-level support for the
-[OSTP](https://github.com/ospab/ostp) transport.
+the bootloader, kernel, drivers, network stack, shell, package manager and tools are written
+together and designed as one whole. It is part of the ospab ecosystem and has native support for
+the [OSTP](https://github.com/ospab/ostp) transport.
 
-> **Status: research system, mid-redesign.** Everything below is split into *what works today*
-> and *where it is going*. The kernel is being rebuilt from a single-address-space monolith into a
-> real microkernel. See [AUDIT.md](AUDIT.md) for an honest state of the code and
-> [ROADMAP.md](ROADMAP.md) for the plan.
+> **Status: research system, mid-redesign.** The kernel is moving from a single-address-space
+> monolith to a real microkernel. Ring-3 processes, kernel objects, capabilities and IPC already
+> work; most drivers and the shell still run inside the kernel. See [ROADMAP.md](ROADMAP.md)
+> for the plan and [AUDIT.md](AUDIT.md) for an honest state of the code.
 
 ---
 
@@ -29,64 +29,79 @@ whole. It is part of the ospab ecosystem and will ship native, low-level support
 
 | Area | State |
 |---|---|
-| Boot | Limine protocol, hybrid BIOS/UEFI ISO; runs in QEMU and VMware Workstation |
-| CPU | GDT + TSS, IDT, APIC timer (1 kHz), preemptive scheduler, SSE |
-| Memory | 4-level page tables, per-task address spaces, kernel heap |
-| Ring 3 | SYSCALL/SYSRET path works; one test process round-trips (milestone 1) |
-| Storage | ATA PIO, AHCI, NVMe; GPT; UEFI disk installer (GPT + FAT32 + LFN) |
-| Filesystem | VFS + RamFS with deferred persistence to disk |
-| Network | RTL8139, RTL8169, e1000, virtio-net; ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, SNTP, TLS client |
-| Audio | AC97, ES1371, Intel HDA |
-| Input / video | PS/2 keyboard and mouse, UEFI framebuffer, VMware SVGA |
-| Userland | `plum` shell, `grape` editor, `tomato` package manager, `seed` init, coreutils, DOOM |
+| Boot | Own UEFI loader **ospab-boot** (menu, FAT and ISO9660 readers); Limine for the hybrid BIOS/UEFI ISO |
+| Install | Full-screen installer: erase a disk, or **install alongside** Windows and Linux on the existing ESP |
+| CPU | GDT/TSS, IDT, APIC timer, preemptive scheduler, per-task kernel stacks, XSAVE (AVX state) |
+| Memory | Bitmap frame allocator, 4-level paging, per-process address spaces, NX, SMEP/SMAP |
+| Ring 3 | ELF programs on the `x86_64-unknown-oos` target with the **liboos** runtime |
+| Microkernel | Kernel objects, per-process handle tables with rights, synchronous IPC, notifications |
+| Storage | ATA PIO, AHCI, NVMe, virtio-blk; GPT; persistence of the writable filesystem layer |
+| Network | e1000, RTL8139/8169, virtio-net, AMD PCnet (VMware vlance), vmxnet3; IPv4, TCP, UDP, DHCP, DNS, NTP, TLS 1.3 client |
+| OSTP | Native client: share links, subscriptions, UDP and UoT transports |
+| Audio | Intel HDA, AC97, ES1371/ES1373 (VMware), ES1370 |
+| Input / video | PS/2 and USB (xHCI) keyboard and mouse, VMware mouse, UEFI framebuffer, VMware SVGA II |
+| Host integration | VMware clipboard (Ctrl+V, `clip`), console input over the serial port |
+| Shell | `plum`: variables, pipes, redirects, control flow, functions, scripts; coreutils; Ctrl+C |
+| Packages | `tomato` with the signed repository **tmt.ospab.org**; SDK for your own programs |
+| Power and time | ACPI power-off and reset; system clock counts from the ospab epoch, 2012-08-09 |
 
-**Important:** apart from the ring-3 test process, all of the above currently runs in ring 0, in
-one address space. There is no process isolation yet, and the capability model is not enforced.
+Apart from ring-3 programs, everything above currently runs in ring 0. Moving drivers, the
+network stack and the console into isolated servers is the next stage of the roadmap.
 
-## Where it is going
+## Quick start
 
-- **Microkernel.** The kernel keeps only address spaces, threads, scheduling, IPC, interrupts and
-  capabilities. Drivers, the network stack, filesystems and the console become isolated user-space
-  servers that talk over IPC. A crashing driver is restarted, not a kernel panic.
-- **Capabilities instead of root.** A process can only touch what it holds a handle to.
-- **Own bootloader.** A small UEFI loader in Rust replaces Limine.
-- **liboos** — the user-space runtime, and a Rust target (`x86_64-unknown-oos`) for building
-  programs for ospab.os.
-- **Native OSTP** in the network server, so the whole system can route through an OSTP tunnel.
+1. Download an ISO from the releases or build one (see below).
+2. In VMware Workstation create a VM: **Other 64-bit**, firmware **UEFI** (Secure Boot off),
+   USB controller **USB 3.x**. Attach the ISO and boot.
+3. In the console try `help`, `tutor`, `uname -a`, `tomato -Sy`, `install`.
+
+Full guide: [docs/en/getting-started.md](docs/en/getting-started.md).
 
 ## Building
 
-Requirements: Rust nightly with `rust-src`, and for the ISO: `xorriso`, `mtools`, `mkfs.vfat`
-(on Windows, build the ISO from WSL).
+Requirements: Rust nightly with `rust-src`; for the ISO also `xorriso`, `mtools` and
+`mkfs.vfat` (on Windows, build the ISO from WSL).
 
 ```bash
-./build.sh kernel   # kernel only — fast compile check
-./build.sh          # kernel + DOOM + bootable hybrid ISO in isos/
+./build.sh kernel   # kernel only, fast compile check
+./build.sh          # bootable hybrid ISO in isos/ospab-os-v2-N.iso
+./build.sh image    # GPT disk image with ospab-boot, no WSL needed
 ```
 
-## Running
+The build number `N` appears in `uname -a`. Details: [docs/en/building.md](docs/en/building.md).
 
-```bash
-qemu-system-x86_64 -cdrom isos/ospab-os-v2-N.iso -m 512M -serial stdio
-```
+## Documentation
 
-VMware Workstation: attach the ISO as a CD/DVD drive. Kernel diagnostics go to the serial port
-(COM1); the terminal is drawn on the framebuffer.
+| | |
+|---|---|
+| [Getting started](docs/en/getting-started.md) | Running in VMware and QEMU, first steps |
+| [Building](docs/en/building.md) | Toolchain, build targets, smoke test |
+| [Installation](docs/en/installation.md) | Installer modes, dual boot, boot instructions |
+| [Architecture](docs/en/architecture.md) | Boot flow, rings, memory, scheduler, kernel objects |
+| [Shell and tools](docs/en/shell.md) | plum, coreutils, keys, clipboard |
+| [Packages](docs/en/packages.md) | tomato, the `.tmt` format, the repository, the SDK |
+| [Networking and OSTP](docs/en/networking.md) | Network stack, `ip`, `curl`, `ostp` |
+| [Hardware](docs/en/hardware.md) | Supported devices and VM settings |
 
 ## Project layout
 
 ```
-arch/x86_64/   CPU setup, interrupts, TSS, framebuffer, serial, keyboard, mouse, Limine glue
-core/          scheduler, syscalls, IPC, capabilities
-mm/            physical frames, page tables, kernel heap
-drivers/       storage, PCI, audio, GPU
-net/           NIC drivers and the network stack
-vfs/           VFS, RamFS, on-disk sync
-src/           kernel entry, terminal, installer, DOOM glue
-userland/      grape, tomato, seed (still compiled into the kernel)
-doom_engine/   doomgeneric + freestanding libc shim
+arch/x86_64/   CPU setup, interrupts, TSS, framebuffer, serial, keyboard, mouse, boot protocols
+boot/          ospab-boot UEFI loader and its config
+core/          scheduler, syscalls, kernel objects, IPC, ELF loader
+mm/            frame allocator, page tables, user copies, heap
+drivers/       storage, audio, GPU, VMware integration
+net/           NIC drivers, the network stack, TLS, OSTP
+vfs/           VFS, RamFS, copy-on-write root, disk sync
+src/           kernel entry, console, installer, time, shell and coreutils
+user/          liboos runtime and built-in ring-3 programs
+apps/          SDK workspace for packaged programs
+gui/           software UI toolkit (in progress)
+tools/         mkimage, tmt packer and repository tools
+docs/          documentation in English (docs/en) and Russian (docs/ru)
 ```
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only). Bundled fonts in `gui/fonts`
+are under the SIL Open Font License.
