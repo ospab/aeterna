@@ -1197,7 +1197,8 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
 
     let efi_c  = nc; nc += efi_nc;
     let ker_c  = nc; nc += ker_nc;
-    let conf_c = nc; // /boot/ospab.cfg (one cluster, last allocation)
+    let conf_c = nc; // /boot/ospab.cfg (last allocation, may span several clusters)
+    let conf_nc = ((conf_content.len() + cb - 1) / cb).max(1) as u32;
 
     // Zero directory clusters
     let zero = [0u8; 512];
@@ -1285,7 +1286,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     step_begin(5, 0);
     let errs0 = WRITE_ERRS.load(Ordering::Relaxed);
     slog("[INSTALLER] Writing /boot/ospab.cfg at cluster "); slog_dec(conf_c as u64); slog("\r\n");
-    write_chain(disk.index, fat1_lba, fat2_lba, conf_c, 1);
+    write_chain(disk.index, fat1_lba, fat2_lba, conf_c, conf_nc);
     {
         let cb_lba = clba(conf_c);
         let cb_bytes = conf_content.as_bytes();
@@ -1430,9 +1431,12 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         checks.push(Check { label: "/boot/KERNEL", ok });
     }
     {
-        let mut buf = [0u8; 512];
-        let ok = disk_read(disk.index, clba(conf_c), 1, &mut buf)
-            && buf[..conf_content.len().min(512)] == conf_content.as_bytes()[..conf_content.len().min(512)];
+        let want = conf_content.as_bytes();
+        let mut ok = true;
+        for (i, chunk) in want.chunks(512).enumerate() {
+            let mut buf = [0u8; 512];
+            ok = ok && disk_read(disk.index, clba(conf_c) + i as u64, 1, &mut buf) && buf[..chunk.len()] == *chunk;
+        }
         checks.push(Check { label: "/boot/ospab.cfg", ok });
     }
     {
@@ -1599,13 +1603,103 @@ fn write_chain(disk: usize, fat1: u64, fat2: u64, start: u32, nc: u32) {
     }
 }
 
-// ── ospab.cfg — read by the ospab UEFI loader (boot/uefi parse_config) ───────
-/// Config of an installed system: one entry, no installer entry, no modules.
+// ── ospab.cfg: read by ospab-boot (format version 1, docs/en/boot.md) ──────
+/// Config of an installed system. No installer entry and no modules; the menu has the
+/// normal, desktop and debug boots plus memory test, firmware setup, reboot and power off.
 /// `alongside` = files live in \EFI\ospab\ on a shared ESP instead of /boot.
+macro_rules! installed_cfg {
+    ($kernel:literal, $where:literal) => {
+        concat!(
+            "# ospab.os loader configuration, format version 1 (docs/en/boot.md).
+",
+            "# Written by the installer (", $where, "). Errors in this file are shown in the boot menu.
+",
+            "version = 1
+
+",
+            "[global]
+",
+            "timeout = 5
+",
+            "default = ospab
+",
+            "remember_last = yes
+",
+            "resolution = auto
+",
+            "serial = no
+",
+            "theme = dark
+
+",
+            "[entry ospab]
+",
+            "title = ospab.os
+",
+            "type = ospab
+",
+            "kernel = ", $kernel, "
+
+",
+            "[entry desktop]
+",
+            "title = ospab.os Desktop
+",
+            "type = ospab
+",
+            "kernel = ", $kernel, "
+",
+            "cmdline = session=desktop
+
+",
+            "[entry debug]
+",
+            "title = ospab.os (debug)
+",
+            "type = ospab
+",
+            "kernel = ", $kernel, "
+",
+            "cmdline = debug=1 selftest=ipc persist=ro
+
+",
+            "[entry memtest]
+",
+            "title = Memory test
+",
+            "type = memtest
+",
+            "cmdline = passes=1
+
+",
+            "[entry firmware]
+",
+            "title = Firmware settings
+",
+            "type = firmware
+
+",
+            "[entry reboot]
+",
+            "title = Reboot
+",
+            "type = reboot
+
+",
+            "[entry poweroff]
+",
+            "title = Power off
+",
+            "type = poweroff
+",
+        )
+    };
+}
+
 fn build_ospab_cfg(alongside: bool) -> &'static str {
     if alongside {
-        "# ospab.os loader configuration (installed next to other systems)\ntimeout=3\ndefault=1\nresolution=auto\n\nentry=ospab.os\n    kernel=/EFI/ospab/KERNEL\n"
+        installed_cfg!("/EFI/ospab/KERNEL", "next to other systems, /EFI/ospab")
     } else {
-        "# ospab.os loader configuration (installed)\ntimeout=3\ndefault=1\nresolution=auto\n\nentry=ospab.os\n    kernel=/boot/KERNEL\n"
+        installed_cfg!("/boot/KERNEL", "whole-disk install, /boot")
     }
 }

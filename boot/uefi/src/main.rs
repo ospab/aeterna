@@ -1,12 +1,13 @@
 /*
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-ospab.os UEFI loader.
+ospab-boot, UEFI front-end.
 
-Reads /boot/ospab.cfg (optional), loads the kernel ELF and its modules from the
-boot volume (FAT via the firmware, or ISO9660 directly), sets up GOP, builds page
-tables (HHDM + higher-half kernel), collects the memory map, leaves boot services
-and jumps to the kernel with a `BootInfo` (arch/x86_64/boot/ospab_proto.rs).
+Finds the boot volume (FAT via the firmware, or ISO9660 over BlockIo), reads and checks
+ospab.cfg, shows the menu and runs the chosen entry: boot a kernel (load the ELF and
+modules, set up GOP, build page tables, leave boot services, jump with a `BootInfo`,
+see arch/x86_64/boot/ospab_proto.rs), memory test, EFI chainload, firmware setup,
+reboot or power off. Documentation: docs/en/boot.md.
 */
 #![no_std]
 #![no_main]
@@ -17,215 +18,42 @@ extern crate alloc;
 mod console;
 mod efi;
 mod fs;
+mod memtest_ui;
+mod ops;
 mod paging;
+mod term;
 #[allow(dead_code)]
 #[path = "../../../arch/x86_64/boot/ospab_proto.rs"]
 mod proto;
+#[path = "../../common/config.rs"]
+mod config;
+#[path = "../../common/memtest.rs"]
+mod memtest;
+#[path = "../../common/menu.rs"]
+mod menu;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr;
 
+use config::{Config, EntryType, Resolution};
 use console::{alloc_pages, bs, st, PAGE};
 use efi::*;
 use fs::{Loaded, Volume};
 use paging::{PageTables, NX, W};
 use proto::*;
 
-const LOADER_NAME: &str = "ospab-boot 0.1 (UEFI)";
+const LOADER_NAME: &str = "ospab-boot 0.2 (UEFI)";
 const CONFIG_PATH: &str = "/boot/ospab.cfg";
 const DEFAULT_KERNEL: &str = "/boot/KERNEL";
-/// Layout of an installation next to other systems on a shared ESP (installer
-/// "alongside" mode): everything lives in \EFI\ospab\, next to the loader.
-const ALT_CONFIG_PATH: &str = "/EFI/ospab/ospab.cfg";
-const ALT_KERNEL: &str = "/EFI/ospab/KERNEL";
+const LOADER_ON_MEDIA: &str = "/EFI/OSPAB/OSPABLDR.EFI";
 /// Same offset Limine uses without KASLR, so kernel logs stay comparable.
 const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 const KERNEL_STACK: u64 = 128 * 1024;
 const MAX_REGIONS: usize = 512;
 const GIB: u64 = 1 << 30;
 const MIB2: u64 = 2 << 20;
-
-// ─── Configuration ──────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq)]
-enum Resolution {
-    Keep,
-    /// The display's preferred mode (EDID), else the firmware's current mode.
-    Auto,
-    Max,
-    Exact(u32, u32),
-}
-
-struct Entry {
-    title: String,
-    kernel: String,
-    cmdline: String,
-    modules: Vec<(String, String)>,
-}
-
-struct Config {
-    timeout: u32,
-    default: usize,
-    resolution: Resolution,
-    entries: Vec<Entry>,
-}
-
-/// Format (one `key=value` per line, `#` comments, indentation ignored):
-///   timeout=3            seconds the menu waits (0 = boot the default at once)
-///   default=1            1-based entry number
-///   resolution=auto      auto (EDID preferred) | max | keep | 1280x800
-///   entry=Title          starts an entry; the keys below belong to it
-///   kernel=/boot/KERNEL
-///   cmdline=mode=live
-///   module=/boot/KERNEL kernel     path, then the module command line
-fn parse_config(text: &str) -> Config {
-    let mut cfg = Config { timeout: 3, default: 0, resolution: Resolution::Auto, entries: Vec::new() };
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else { continue };
-        let (key, value) = (key.trim(), value.trim());
-        match key {
-            "timeout" => cfg.timeout = value.parse().unwrap_or(3),
-            "default" => cfg.default = value.parse::<usize>().unwrap_or(1).saturating_sub(1),
-            "resolution" => {
-                cfg.resolution = match value {
-                    "auto" => Resolution::Auto,
-                    "max" => Resolution::Max,
-                    "keep" => Resolution::Keep,
-                    v => match v.split_once('x') {
-                        Some((w, h)) => Resolution::Exact(w.parse().unwrap_or(0), h.parse().unwrap_or(0)),
-                        None => Resolution::Auto,
-                    },
-                }
-            }
-            "entry" => cfg.entries.push(Entry {
-                title: value.to_string(),
-                kernel: DEFAULT_KERNEL.to_string(),
-                cmdline: String::new(),
-                modules: Vec::new(),
-            }),
-            _ => {
-                let Some(e) = cfg.entries.last_mut() else { continue };
-                match key {
-                    "kernel" => e.kernel = value.to_string(),
-                    "cmdline" => e.cmdline = value.to_string(),
-                    "module" => {
-                        let (path, args) = value.split_once(' ').unwrap_or((value, ""));
-                        e.modules.push((path.to_string(), args.trim().to_string()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    cfg
-}
-
-fn default_config() -> Config {
-    parse_config(
-        "timeout=0\nentry=ospab.os\ncmdline=mode=live\n\
-         module=/boot/KERNEL kernel\nmodule=/EFI/BOOT/BOOTX64.EFI efi\n",
-    )
-}
-
-// ─── Menu ───────────────────────────────────────────────────────────────────
-
-fn read_key() -> Option<InputKey> {
-    unsafe {
-        let cin = st().con_in;
-        let mut key = InputKey { scan_code: 0, unicode_char: 0 };
-        if is_error(((*cin).read_key_stroke)(cin, &mut key)) {
-            return None;
-        }
-        Some(key)
-    }
-}
-
-fn set_attr(attr: usize) {
-    unsafe {
-        let out = st().con_out;
-        ((*out).set_attribute)(out, attr);
-    }
-}
-
-/// Redraw the whole menu. `countdown` is the seconds left, or None once a key was pressed.
-fn draw_menu(cfg: &Config, sel: usize, countdown: Option<u32>) {
-    unsafe {
-        let out = st().con_out;
-        set_attr(ATTR_NORMAL);
-        ((*out).clear_screen)(out);
-        ((*out).enable_cursor)(out, false);
-    }
-    set_attr(ATTR_BRIGHT);
-    println!("\n  ospab loader\n");
-    let width = cfg.entries.iter().map(|e| e.title.chars().count()).max().unwrap_or(0) + 4;
-    for (i, e) in cfg.entries.iter().enumerate() {
-        print!("  ");
-        set_attr(if i == sel { ATTR_SELECTED } else { ATTR_NORMAL });
-        print!(" {}. {:<w$}", i + 1, e.title, w = width);
-        set_attr(ATTR_NORMAL);
-        println!();
-    }
-    set_attr(ATTR_DIM);
-    println!("\n  \u{2191}/\u{2193} select   Enter boot   1-{} boot that entry", cfg.entries.len());
-    match countdown {
-        Some(s) => println!("  Booting the selected entry in {} s, any key stops the countdown", s),
-        None => println!(),
-    }
-    set_attr(ATTR_NORMAL);
-}
-
-fn choose_entry(cfg: &Config) -> usize {
-    let count = cfg.entries.len();
-    let mut sel = cfg.default.min(count - 1);
-    if count == 1 || cfg.timeout == 0 {
-        return sel;
-    }
-    let mut countdown = Some(cfg.timeout);
-    draw_menu(cfg, sel, countdown);
-    unsafe {
-        // One-second tick drives the visible countdown.
-        let mut tick: Event = ptr::null_mut();
-        (bs().create_event)(EVT_TIMER, 0, ptr::null_mut(), ptr::null_mut(), &mut tick);
-        (bs().set_timer)(tick, TIMER_PERIODIC, 10_000_000);
-        let chosen = loop {
-            let events = [(*st().con_in).wait_for_key, tick];
-            let mut index = 0usize;
-            (bs().wait_for_event)(2, events.as_ptr(), &mut index);
-            if index == 1 {
-                if let Some(s) = countdown {
-                    if s <= 1 {
-                        break sel;
-                    }
-                    countdown = Some(s - 1);
-                    draw_menu(cfg, sel, countdown);
-                }
-                continue;
-            }
-            let Some(key) = read_key() else { continue };
-            countdown = None; // any key stops the countdown
-            match (key.scan_code, char::from_u32(key.unicode_char as u32).unwrap_or('\0')) {
-                (_, '\r') | (_, '\n') => break sel,
-                (_, c @ '1'..='9') if (c as usize - '1' as usize) < count => break c as usize - '1' as usize,
-                (SCAN_UP, _) | (_, 'k') => sel = if sel == 0 { count - 1 } else { sel - 1 },
-                (SCAN_DOWN, _) | (_, 'j') => sel = (sel + 1) % count,
-                (SCAN_HOME, _) => sel = 0,
-                (SCAN_END, _) => sel = count - 1,
-                _ => {}
-            }
-            draw_menu(cfg, sel, countdown);
-        };
-        (bs().close_event)(tick);
-        let out = st().con_out;
-        ((*out).clear_screen)(out);
-        chosen
-    }
-}
 
 // ─── Hardware info ──────────────────────────────────────────────────────────
 
@@ -593,34 +421,16 @@ fn fail(msg: &str) -> ! {
     halt()
 }
 
-#[no_mangle]
-extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> Status {
-    unsafe {
-        console::init(system_table);
-        (bs().set_watchdog_timer)(0, 0, 0, ptr::null());
-    }
-    println!("{}", LOADER_NAME);
 
-    // Boot volume and configuration.
-    let mut vol: Volume = fs::find_volume(image, &[ALT_CONFIG_PATH, CONFIG_PATH])
-        .or_else(|| fs::find_volume(image, &[DEFAULT_KERNEL, ALT_KERNEL]))
-        .unwrap_or_else(|| fail("no volume with ospab.cfg (/boot or /EFI/ospab) or a kernel"));
-    let cfg_path = [ALT_CONFIG_PATH, CONFIG_PATH].into_iter().find(|p| vol.exists(p));
-    let cfg = match cfg_path.and_then(|p| vol.read_small(p)) {
-        Some(text) => parse_config(core::str::from_utf8(&text).unwrap_or("")),
-        None => default_config(),
-    };
-    if cfg.entries.is_empty() {
-        fail("no entries in ospab.cfg");
-    }
-    let entry = &cfg.entries[choose_entry(&cfg)];
+/// Boot the kernel of an `ospab` entry. Does not return.
+fn boot_kernel(image: Handle, vol: &mut Volume, cfg: &Config, entry: &config::Entry, cmdline: &str) -> ! {
     println!("Booting '{}' from {} volume", entry.title, vol.kind());
 
-    // Kernel file; it is also a module when the config lists it (installer).
+    // Kernel file; it is also a module when the entry lists it (installer).
     let kernel_is_module = entry.modules.iter().any(|(p, _)| *p == entry.kernel);
     let kernel_file = vol
         .load(&entry.kernel, if kernel_is_module { OSPAB_KERNEL_MEMORY } else { OSPAB_RECLAIM_MEMORY })
-        .unwrap_or_else(|| fail("cannot read the kernel file"));
+        .unwrap_or_else(|| fail(&alloc::format!("cannot read the kernel file {}", entry.kernel)));
     println!("Kernel: {} ({} KiB)", entry.kernel, kernel_file.size / 1024);
 
     let mut pt = PageTables::new();
@@ -671,7 +481,7 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> St
         kernel_phys_base: kernel.phys_base,
         kernel_virt_base: kernel.virt_base,
         rsdp,
-        cmdline: strings.push(&entry.cmdline),
+        cmdline: strings.push(cmdline),
         framebuffer: fb,
         memmap: regions_phys,
         memmap_count: 0,
@@ -740,6 +550,112 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> St
             HHDM_OFFSET + stack_phys + KERNEL_STACK,
             kernel.entry,
         )
+    }
+}
+
+
+#[no_mangle]
+extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> Status {
+    unsafe {
+        console::init(system_table);
+        (bs().set_watchdog_timer)(0, 0, 0, ptr::null());
+    }
+    println!("{}", LOADER_NAME);
+
+    // Configuration: next to the loader, then /boot/ospab.cfg, then built-in defaults.
+    let mut cfg_candidates: Vec<String> = Vec::new();
+    if let Some(d) = fs::loader_dir(image) {
+        cfg_candidates.push(alloc::format!("{}/ospab.cfg", d));
+    }
+    if !cfg_candidates.iter().any(|c| c.eq_ignore_ascii_case(CONFIG_PATH)) {
+        cfg_candidates.push(CONFIG_PATH.to_string());
+    }
+    let probes: Vec<&str> = cfg_candidates.iter().map(|s| s.as_str()).collect();
+    let mut vol: Volume = fs::find_volume(image, &probes)
+        .or_else(|| fs::find_volume(image, &[DEFAULT_KERNEL]))
+        .unwrap_or_else(|| fail("no volume with ospab.cfg or /boot/KERNEL"));
+
+    let mut source = String::from("built-in defaults (no ospab.cfg found)");
+    let mut parsed = None;
+    for p in &cfg_candidates {
+        if let Some(text) = vol.read_small(p) {
+            source = p.clone();
+            parsed = Some(config::parse(&String::from_utf8_lossy(&text)));
+            break;
+        }
+    }
+    let config::Parsed { mut cfg, errors } =
+        parsed.unwrap_or_else(|| config::Parsed { cfg: config::builtin(Some(LOADER_ON_MEDIA)), errors: Vec::new() });
+    if cfg.entries.is_empty() {
+        // Nothing usable in the file: errors say so; boot something rather than nothing.
+        cfg = config::builtin(Some(LOADER_ON_MEDIA));
+    }
+    console::set_serial(cfg.serial);
+    for e in &errors {
+        println!("ospab.cfg:{}: {}", e.line, e.msg);
+    }
+
+    let pal = menu::Palette::new(cfg.theme);
+    let mut tm = term::UefiTerm::new();
+
+    // Preselect: remembered entry, else the configured default.
+    let mut selected = cfg.default.min(cfg.entries.len() - 1);
+    if cfg.remember_last {
+        let remembered = ops::last_choice()
+            .and_then(|id| cfg.entries.iter().position(|e| e.id == id && matches!(e.typ, EntryType::Ospab | EntryType::EfiChainload)));
+        if let Some(i) = remembered {
+            selected = i;
+        }
+    }
+
+    // One visible entry and no errors: no menu. timeout = 0: no menu unless a key is waiting.
+    let visible = cfg.entries.iter().filter(|e| !e.hidden).count();
+    let mut skip_menu = errors.is_empty()
+        && (visible <= 1 || (cfg.timeout == Some(0) && menu::Term::poll_key(&mut tm).is_none()));
+
+    loop {
+        let (index, cmdline) = if skip_menu {
+            (selected, cfg.entries[selected].cmdline.clone())
+        } else {
+            let info = menu::MenuInfo { loader: LOADER_NAME, source: &source, errors: &errors, selected };
+            let c = menu::run(&mut tm, &pal, &cfg, &info);
+            (c.index, c.cmdline)
+        };
+        skip_menu = false; // after an entry returns (memtest, failed reboot, ...) the menu is shown again
+        let entry = &cfg.entries[index];
+        match entry.typ {
+            EntryType::Ospab => {
+                if cfg.remember_last {
+                    ops::save_choice(&entry.id);
+                }
+                menu::Term::clear(&mut tm, 0x07);
+                menu::Term::set_cursor(&mut tm, 0, 0, true);
+                boot_kernel(image, &mut vol, &cfg, entry, &cmdline);
+            }
+            EntryType::Memtest => memtest_ui::run(&mut tm, &pal, &cfg, &cmdline),
+            EntryType::Firmware => {
+                if let Err(e) = ops::firmware_setup() {
+                    menu::message(&mut tm, &pal, &entry.title, &[e]);
+                }
+            }
+            EntryType::Reboot => {
+                ops::reset(RESET_COLD);
+                menu::message(&mut tm, &pal, &entry.title, &[String::from("The firmware did not reset.")]);
+            }
+            EntryType::Poweroff => {
+                ops::reset(RESET_SHUTDOWN);
+                menu::message(&mut tm, &pal, &entry.title, &[String::from("The firmware did not power off.")]);
+            }
+            EntryType::EfiChainload => {
+                if cfg.remember_last {
+                    ops::save_choice(&entry.id);
+                }
+                if let Err(e) = ops::chainload(image, vol.fat_handle(), &entry.path) {
+                    menu::message(&mut tm, &pal, &entry.title, &[e]);
+                }
+            }
+        }
+        selected = index;
     }
 }
 

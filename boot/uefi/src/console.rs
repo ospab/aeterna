@@ -12,6 +12,12 @@ use crate::efi::*;
 
 static mut ST: *mut SystemTable = ptr::null_mut();
 static mut BOOT_SERVICES_ACTIVE: bool = false;
+static mut SERIAL_MIRROR: bool = false;
+
+/// Mirror loader messages to COM1 (config `serial = yes`).
+pub fn set_serial(on: bool) {
+    unsafe { SERIAL_MIRROR = on };
+}
 
 pub unsafe fn init(st: *mut SystemTable) {
     ST = st;
@@ -44,6 +50,9 @@ impl fmt::Write for Console {
             if !BOOT_SERVICES_ACTIVE {
                 serial_write(s);
                 return Ok(());
+            }
+            if SERIAL_MIRROR {
+                serial_write(s);
             }
             let out = (*ST).con_out;
             let mut buf = [0u16; 129];

@@ -40,6 +40,13 @@ pub const EDID_ACTIVE_GUID: Guid =
     Guid(0xbd8c1056, 0x9f36, 0x44ec, [0x92, 0xa8, 0xa6, 0x33, 0x7f, 0x81, 0x79, 0x86]);
 pub const EDID_DISCOVERED_GUID: Guid =
     Guid(0x1c0c34f6, 0xd380, 0x41fa, [0xa0, 0x49, 0x8a, 0xd0, 0x6c, 0x1a, 0x66, 0xaa]);
+pub const DEVICE_PATH_GUID: Guid =
+    Guid(0x09576e91, 0x6d3f, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
+pub const GLOBAL_VARIABLE_GUID: Guid =
+    Guid(0x8be4df61, 0x93ca, 0x11d2, [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c]);
+/// Private vendor GUID for the variables ospab-boot stores (last chosen entry).
+pub const OSPAB_VARIABLE_GUID: Guid =
+    Guid(0x6f737061, 0x622d, 0x4f53, [0x80, 0x01, 0x6f, 0x73, 0x70, 0x61, 0x62, 0x00]);
 pub const ACPI20_GUID: Guid =
     Guid(0x8868e871, 0xe4f1, 0x11d3, [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81]);
 pub const ACPI10_GUID: Guid =
@@ -65,7 +72,7 @@ pub struct SystemTable {
     pub con_out: *mut SimpleTextOutput,
     pub stderr_handle: Handle,
     pub std_err: *mut SimpleTextOutput,
-    pub runtime_services: *mut c_void,
+    pub runtime_services: *mut RuntimeServices,
     pub boot_services: *mut BootServices,
     pub number_of_table_entries: usize,
     pub configuration_table: *const ConfigurationTable,
@@ -98,6 +105,7 @@ pub const OSPAB_RECLAIM_MEMORY: u32 = 0x8000_0001;
 
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
+pub const ALLOCATE_ADDRESS: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -142,8 +150,8 @@ pub struct BootServices {
     locate_handle: usize,
     locate_device_path: usize,
     install_configuration_table: usize,
-    load_image: usize,
-    start_image: usize,
+    pub load_image: unsafe extern "efiapi" fn(bool, Handle, *const u8, *const c_void, usize, *mut Handle) -> Status,
+    pub start_image: unsafe extern "efiapi" fn(Handle, *mut usize, *mut *mut u16) -> Status,
     exit: usize,
     unload_image: usize,
     pub exit_boot_services: unsafe extern "efiapi" fn(Handle, usize) -> Status,
@@ -166,12 +174,23 @@ pub struct SimpleTextOutput {
     reset: usize,
     pub output_string: unsafe extern "efiapi" fn(*mut SimpleTextOutput, *const u16) -> Status,
     test_string: usize,
-    query_mode: usize,
+    pub query_mode: unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize, *mut usize, *mut usize) -> Status,
     set_mode: usize,
     pub set_attribute: unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize) -> Status,
     pub clear_screen: unsafe extern "efiapi" fn(*mut SimpleTextOutput) -> Status,
     pub set_cursor_position: unsafe extern "efiapi" fn(*mut SimpleTextOutput, usize, usize) -> Status,
     pub enable_cursor: unsafe extern "efiapi" fn(*mut SimpleTextOutput, bool) -> Status,
+    pub mode: *mut TextMode,
+}
+
+#[repr(C)]
+pub struct TextMode {
+    pub max_mode: i32,
+    pub mode: i32,
+    pub attribute: i32,
+    pub cursor_column: i32,
+    pub cursor_row: i32,
+    pub cursor_visible: bool,
 }
 
 /// Text attributes: foreground | background << 4.
@@ -183,6 +202,9 @@ pub const ATTR_SELECTED: usize = 0x70; // black on light gray
 /// SimpleTextInput scan codes.
 pub const SCAN_UP: u16   = 0x01;
 pub const SCAN_DOWN: u16 = 0x02;
+pub const SCAN_RIGHT: u16 = 0x03;
+pub const SCAN_LEFT: u16 = 0x04;
+pub const SCAN_DELETE: u16 = 0x08;
 pub const SCAN_HOME: u16 = 0x05;
 pub const SCAN_END: u16  = 0x06;
 pub const SCAN_ESC: u16  = 0x17;
@@ -303,4 +325,41 @@ pub struct Gop {
 pub struct Edid {
     pub size: u32,
     pub edid: *const u8,
+}
+
+pub const VAR_NV: u32 = 1;
+pub const VAR_BS: u32 = 2;
+pub const VAR_RT: u32 = 4;
+pub const RESET_COLD: u32 = 0;
+pub const RESET_SHUTDOWN: u32 = 2;
+
+#[repr(C)]
+pub struct EfiTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub pad1: u8,
+    pub nanosecond: u32,
+    pub time_zone: i16,
+    pub daylight: u8,
+    pub pad2: u8,
+}
+
+#[repr(C)]
+pub struct RuntimeServices {
+    pub hdr: TableHeader,
+    pub get_time: unsafe extern "efiapi" fn(*mut EfiTime, *mut c_void) -> Status,
+    set_time: usize,
+    get_wakeup_time: usize,
+    set_wakeup_time: usize,
+    set_virtual_address_map: usize,
+    convert_pointer: usize,
+    pub get_variable: unsafe extern "efiapi" fn(*const u16, *const Guid, *mut u32, *mut usize, *mut u8) -> Status,
+    get_next_variable_name: usize,
+    pub set_variable: unsafe extern "efiapi" fn(*const u16, *const Guid, u32, usize, *const u8) -> Status,
+    get_next_high_monotonic_count: usize,
+    pub reset_system: unsafe extern "efiapi" fn(u32, Status, usize, *const u8),
 }

@@ -22,7 +22,7 @@ use crate::console::{alloc_pages, bs, PAGE};
 use crate::efi::*;
 
 pub enum Volume {
-    Fat(*mut File),
+    Fat(*mut File, Handle),
     Iso(Iso),
 }
 
@@ -36,14 +36,14 @@ pub struct Loaded {
 impl Volume {
     pub fn kind(&self) -> &'static str {
         match self {
-            Volume::Fat(_) => "FAT",
+            Volume::Fat(..) => "FAT",
             Volume::Iso(_) => "ISO9660",
         }
     }
 
     pub fn exists(&mut self, path: &str) -> bool {
         match self {
-            Volume::Fat(root) => match fat_open(*root, path) {
+            Volume::Fat(root, _) => match fat_open(*root, path) {
                 Some(f) => {
                     unsafe { ((*f).close)(f) };
                     true
@@ -57,7 +57,7 @@ impl Volume {
     /// Read a whole file into fresh pages of `mem_type`.
     pub fn load(&mut self, path: &str, mem_type: u32) -> Option<Loaded> {
         match self {
-            Volume::Fat(root) => fat_load(*root, path, mem_type),
+            Volume::Fat(root, _) => fat_load(*root, path, mem_type),
             Volume::Iso(iso) => {
                 let (lba, size) = iso.lookup(path)?;
                 let pages = ((size as u64 + PAGE - 1) / PAGE).max(1) as usize;
@@ -114,6 +114,72 @@ pub fn find_volume(image: Handle, probes: &[&str]) -> Option<Volume> {
     None
 }
 
+/// Handle of the FAT volume (if it is one), for building device paths.
+impl Volume {
+    pub fn fat_handle(&self) -> Option<Handle> {
+        match self {
+            Volume::Fat(_, h) => Some(*h),
+            Volume::Iso(_) => None,
+        }
+    }
+}
+
+/// Directory of the running loader image, e.g. "/EFI/OSPAB" (from LoadedImage.FilePath).
+pub fn loader_dir(image: Handle) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    unsafe {
+        let mut li: *mut c_void = ptr::null_mut();
+        if is_error((bs().handle_protocol)(image, &LOADED_IMAGE_GUID, &mut li)) {
+            return None;
+        }
+        let mut node = (*(li as *mut LoadedImage)).file_path as *const u8;
+        if node.is_null() {
+            return None;
+        }
+        let mut name: Option<String> = None;
+        for _ in 0..64 {
+            let (typ, sub) = (*node, *node.add(1));
+            let len = u16::from_le_bytes([*node.add(2), *node.add(3)]) as usize;
+            if typ == 0x7F || len < 4 {
+                break;
+            }
+            if typ == 4 && sub == 4 {
+                let units = (len - 4) / 2;
+                let mut s = String::new();
+                for i in 0..units {
+                    let c = u16::from_le_bytes([*node.add(4 + 2 * i), *node.add(5 + 2 * i)]);
+                    if c == 0 {
+                        break;
+                    }
+                    s.push(if c == 0x5C { '/' } else { char::from_u32(c as u32).unwrap_or('?') });
+                }
+                name = Some(s);
+            }
+            node = node.add(len);
+        }
+        let name = name?;
+        let cut = name.rfind('/')?;
+        Some(String::from(&name[..cut]))
+    }
+}
+
+/// First FAT volume (the one holding `prefer` first) that contains `path`; returns its handle.
+pub fn find_fat_file(prefer: Option<Handle>, path: &str) -> Option<Handle> {
+    let mut hs: Vec<Handle> = Vec::new();
+    if let Some(h) = prefer {
+        hs.push(h);
+    }
+    hs.extend(handles(&SIMPLE_FS_GUID));
+    for h in hs {
+        if let Some(mut v) = open_fat(h) {
+            if v.exists(path) {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
 fn handles(guid: &Guid) -> Vec<Handle> {
     unsafe {
         let mut count = 0usize;
@@ -140,7 +206,7 @@ fn open_fat(h: Handle) -> Option<Volume> {
         if is_error(((*sfs).open_volume)(sfs, &mut root)) {
             return None;
         }
-        Some(Volume::Fat(root))
+        Some(Volume::Fat(root, h))
     }
 }
 
