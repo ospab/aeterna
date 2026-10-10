@@ -22,6 +22,9 @@ ostp-core = { git = "https://github.com/ospab/ostp", branch = "no-std-core", def
 # tomato: verify the Ed25519 signature of the tmt.ospab.org package index (no_std)
 ed25519-dalek = { version = "2", default-features = false }
 
+# oos-ui: software UI toolkit (gui/), used by the guidemo command
+oos-ui = { path = "gui" }
+
 [profile.release]
 panic = "abort"
 lto = true          # Максимальная оптимизация для ИИ

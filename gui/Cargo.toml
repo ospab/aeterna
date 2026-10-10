@@ -17,10 +17,12 @@ embedded-fonts = []
 # Host-only: tests, PNG mockup tools.
 std = []
 
+
 [dependencies]
 fontdue = { version = "0.9.4", default-features = false, features = ["hashbrown", "simd"] }
 ttf-parser = { version = "0.25", default-features = false, features = ["opentype-layout", "no-std-float"] }
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+libm = "0.2"
 
 [dev-dependencies]
 png = "0.18"

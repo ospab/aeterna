@@ -483,6 +483,30 @@ fn syscall_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
 /// fd=0 → keyboard (stdin), fd≥3 → VFS file read.
 fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     let len = (len as usize).min(MAX_IO_CHUNK);
+    if fd == 0 && CONSOLE_STDOUT.load(core::sync::atomic::Ordering::Relaxed) && len >= 1 {
+        // A program run by the shell reads the shell's stdin: piped / redirected data
+        // (0 bytes = end of input), or, on the console, one typed character (echoed),
+        // sleeping until a key arrives. The shell kills the program on Ctrl+C.
+        if let Some(chunk) = crate::userspace::plum::io::read_stdin_bytes(len) {
+            return match crate::mm::usercopy::copy_to_user(buf_ptr, &chunk) {
+                Ok(()) => chunk.len() as i64,
+                Err(e) => SyscallError::from(e) as i64,
+            };
+        }
+        loop {
+            if let Some(ch) = crate::arch::x86_64::keyboard::poll_key() {
+                let mut tmp = [0u8; 4];
+                let bytes = ch.encode_utf8(&mut tmp).as_bytes();
+                crate::userspace::plum::io::out(core::str::from_utf8(bytes).unwrap_or(""));
+                let n = bytes.len().min(len);
+                return match crate::mm::usercopy::copy_to_user(buf_ptr, &bytes[..n]) {
+                    Ok(()) => n as i64,
+                    Err(e) => SyscallError::from(e) as i64,
+                };
+            }
+            crate::core::scheduler::sys_yield();
+        }
+    }
     if fd == 0 {
         // stdin: read one key from keyboard
         let key = crate::arch::x86_64::keyboard::poll_key();

@@ -28,6 +28,11 @@ pub fn init() {
     outb(COM1 + 4, 0x0B);
 }
 
+/// A received byte, if one is waiting (LSR bit 0, polled).
+pub fn try_read_byte() -> Option<u8> {
+    if inb(COM1 + 5) & 0x01 != 0 { Some(inb(COM1)) } else { None }
+}
+
 pub fn write_byte(b: u8) {
     while (inb(COM1 + 5) & 0x20) == 0 {}
     outb(COM1, b);

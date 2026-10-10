@@ -10,6 +10,7 @@
 
 pub mod vmware_svga;
 pub mod vmmouse;
+pub mod vmclip;
 
 /// Probe all GPU/display accelerators — call after PCI enumeration.
 /// This is **non-destructive**: it detects hardware and reads parameters but

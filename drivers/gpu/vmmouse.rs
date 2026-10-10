@@ -84,7 +84,7 @@ pub struct MouseEvent {
 /// NOTE: rbx cannot be used directly as an asm operand on x86_64 (LLVM restriction).
 /// We manually save/restore rbx via push/pop.
 #[inline(always)]
-unsafe fn backdoor(cmd: u32, ebx_in: u32) -> (u32, u32, u32, u32) {
+pub(crate) unsafe fn backdoor(cmd: u32, ebx_in: u32) -> (u32, u32, u32, u32) {
     let mut rax: u32 = VMWARE_MAGIC;
     let mut rcx: u32 = cmd;
     let mut rdx: u32 = VMWARE_PORT as u32;

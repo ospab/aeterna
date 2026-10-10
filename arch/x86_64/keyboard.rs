@@ -96,7 +96,55 @@ pub fn poll_key() -> Option<char> {
 }
 
 /// Try to read a key (non-blocking). Returns None if no key available.
+// ─── Pasted text and serial input ───────────────────────────────────────────
+//
+// Ctrl+V pastes the host clipboard (VMware backdoor, drivers/gpu/vmclip.rs) by
+// queueing its text here; bytes arriving on COM1 are typed too, so a terminal on the
+// serial line (PuTTY on a VMware named pipe, QEMU -serial stdio) can paste anywhere.
+
+const PASTE_CAP: usize = 4096;
+static mut PASTE_BUF: [u8; PASTE_CAP] = [0; PASTE_CAP];
+static mut PASTE_HEAD: usize = 0;
+static mut PASTE_LEN: usize = 0;
+
+/// Queue text to be read as if typed. Line breaks become spaces and trailing
+/// whitespace is dropped, so a pasted link never runs a command by itself.
+pub fn inject_text(text: &str) {
+    let text = text.trim_end();
+    unsafe {
+        for &b in text.as_bytes() {
+            if PASTE_LEN >= PASTE_CAP { break; }
+            let b = match b { b'\r' | b'\n' | b'\t' => b' ', b => b };
+            PASTE_BUF[(PASTE_HEAD + PASTE_LEN) % PASTE_CAP] = b;
+            PASTE_LEN += 1;
+        }
+    }
+}
+
+fn pop_pasted() -> Option<char> {
+    unsafe {
+        if PASTE_LEN == 0 { return None; }
+        let b = PASTE_BUF[PASTE_HEAD];
+        PASTE_HEAD = (PASTE_HEAD + 1) % PASTE_CAP;
+        PASTE_LEN -= 1;
+        // Non-ASCII bytes of UTF-8 text are dropped: the console line editor is ASCII.
+        if b.is_ascii() { Some(b as char) } else { pop_pasted() }
+    }
+}
+
+fn serial_key() -> Option<char> {
+    match crate::arch::x86_64::serial::try_read_byte()? {
+        b'\r' => Some('\n'),
+        0x7F => Some('\x08'),
+        0x03 => { INTERRUPT_PENDING.store(true, Ordering::Relaxed); Some('\x03') }
+        b if b.is_ascii() => Some(b as char),
+        _ => None,
+    }
+}
+
 pub fn try_read_key() -> Option<char> {
+    if let Some(c) = pop_pasted() { return Some(c); }
+    if let Some(c) = serial_key() { return Some(c); }
     crate::xhci::poll(true); // USB HID keyboards inject set-1 scancodes into the same buffer
     let scancode = crate::arch::x86_64::idt::kb_irq_read()?;
 
@@ -178,7 +226,11 @@ pub fn try_read_key() -> Option<char> {
                 0x1F => Some('\x13'), // Ctrl+S
                 0x14 => Some('\x14'), // Ctrl+T
                 0x16 => Some('\x15'), // Ctrl+U
-                0x2F => Some('\x16'), // Ctrl+V
+                // Ctrl+V: paste the host clipboard when there is one (VMware), else the raw key
+                0x2F => match crate::drivers::gpu::vmclip::host_text() {
+                    Some(text) => { inject_text(&text); pop_pasted().or(Some('\x16')) }
+                    None => Some('\x16'),
+                },
                 0x11 => Some('\x17'), // Ctrl+W
                 0x2D => Some('\x18'), // Ctrl+X
                 0x15 => Some('\x19'), // Ctrl+Y

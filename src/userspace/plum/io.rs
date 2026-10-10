@@ -260,6 +260,26 @@ pub fn take_stdin() -> Option<String> {
     }
 }
 
+/// Read up to `max` bytes of piped / redirected stdin for a ring-3 program.
+/// None = stdin is the console; Some(empty) = end of input.
+pub fn read_stdin_bytes(max: usize) -> Option<Vec<u8>> {
+    unsafe {
+        let i = stdin_owner()?;
+        match &mut STACK[i].stdin {
+            Stdin::Data(s, pos) => {
+                let mut end = (*pos + max).min(s.len());
+                while end > *pos && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let chunk = Vec::from(s[*pos..end].as_bytes());
+                *pos = end;
+                Some(chunk)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Read one line from stdin (without the newline).
 /// Outer None = stdin is the console; inner None = end of input.
 pub fn read_stdin_line() -> Option<Option<String>> {

@@ -29,10 +29,12 @@ use crate::userspace::plum;
 use crate::userspace::plum::io;
 
 pub mod disk_tools;
+pub mod guidemo;
 pub mod lspci;
 pub mod net_tools;
 pub mod netstat;
 pub mod ostp;
+pub mod clip;
 pub mod ping;
 pub mod proc_tools;
 pub mod ps;
@@ -106,12 +108,14 @@ pub fn run(name: &str, args: &[String]) -> bool {
         "kill" => proc_tools::cmd_kill(&joined()),
         "netstat" => netstat::run(&joined()),
         "ostp" => ostp::run(&joined()),
+        "clip" => clip::run(&joined()),
         "ping" => ping::run(&joined()),
         "traceroute" => net_tools::cmd_traceroute(&joined()),
         "ip" => net_tools::cmd_ip_show(&joined()),
         "curl" => net_tools::cmd_curl(&joined()),
         "nslookup" => net_tools::cmd_nslookup(&joined()),
         "lspci" => lspci::run(&joined()),
+        "guidemo" => guidemo::run(&joined()),
         "fdisk" => disk_tools::run_fdisk(&joined()),
         "lsblk" => disk_tools::run_lsblk(&joined()),
         "mkfs" => disk_tools::run_mkfs(&joined()),
@@ -131,7 +135,7 @@ pub fn command_list() -> &'static [&'static str] {
         "find", "tee", "wc", "head", "tail", "grep", "egrep", "sort", "uniq", "cut", "tr", "rev",
         "nl", "xxd", "diff", "awk", "basename", "dirname", "seq", "yes", "printf", "xargs",
         "sleep", "ps", "top", "kill", "netstat", "ping", "traceroute", "ip", "curl", "nslookup",
-        "lspci", "fdisk", "lsblk", "mkfs", "mount", "ostp",
+        "lspci", "fdisk", "lsblk", "mkfs", "mount", "ostp", "clip",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }
