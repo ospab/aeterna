@@ -2,9 +2,10 @@
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
-System calls on kernel objects: handles, channels (IPC), notifications, processes.
+System calls on kernel objects: handles, channels (IPC), notifications, processes,
+memory regions, interrupts and I/O ports.
 The logic is in core/object.rs; here only the user-memory copies and error mapping.
-ABI of each call: docs/SYSCALL-ABI.md.
+ABI of each call: docs/en/syscall-abi.md.
 */
 
 use crate::core::object::{self, Res, UserMessage, USER_MESSAGE_SIZE};
@@ -165,4 +166,57 @@ pub fn process_wait(h: u64, code_ptr: u64, timeout: u64) -> i64 {
 // 233
 pub fn process_kill(h: u64) -> i64 {
     ret_unit(object::process_kill(h as u32))
+}
+
+// 240: mem_create(size) -> h
+pub fn mem_create(size: u64) -> i64 {
+    ret(object::mem_create(size))
+}
+
+// 241: mem_map(h, hint, prot) -> user address
+pub fn mem_map(h: u64, hint: u64, prot: u64) -> i64 {
+    if prot > u32::MAX as u64 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    ret(object::mem_map(h as u32, hint, prot as u32).map(|a| a as i64))
+}
+
+// 242: mem_unmap(addr)
+pub fn mem_unmap(addr: u64) -> i64 {
+    ret_unit(object::mem_unmap(addr))
+}
+
+// 243: mem_create_contig(resource, size) -> h (with PHYS)
+pub fn mem_create_contig(res: u64, size: u64) -> i64 {
+    ret(object::mem_create_contig(res as u32, size))
+}
+
+// 244: mem_phys(h) -> physical address
+pub fn mem_phys(h: u64) -> i64 {
+    ret(object::mem_phys(h as u32).map(|a| a as i64))
+}
+
+// 245: mem_size(h) -> bytes
+pub fn mem_size(h: u64) -> i64 {
+    ret(object::mem_size(h as u32).map(|a| a as i64))
+}
+
+// 250: irq_bind(irq, notification, bits)
+pub fn irq_bind(irq: u64, notif: u64, bits: u64) -> i64 {
+    ret_unit(object::irq_bind(irq as u32, notif as u32, bits as u32))
+}
+
+// 251: irq_ack(irq)
+pub fn irq_ack(irq: u64) -> i64 {
+    ret_unit(object::irq_ack(irq as u32))
+}
+
+// 252: ioport_enable(h)
+pub fn ioport_enable(h: u64) -> i64 {
+    ret_unit(object::ioport_enable(h as u32))
+}
+
+// 253: ioport_disable(h)
+pub fn ioport_disable(h: u64) -> i64 {
+    ret_unit(object::ioport_disable(h as u32))
 }

@@ -11,7 +11,8 @@
 //! * [`theme`] — design tokens (dark minimalism);
 //! * [`ui`], [`menu`], [`window`] — retained widget tree with layout, input,
 //!   focus and damage tracking; client-side window chrome;
-//! * [`desktop`] — an in-process compositor prototype (shell layer);
+//! * [`proto`], [`session`], [`desktop`] — the window-system protocol, the
+//!   session loop and the compositor / window manager;
 //! * [`demo`] — the reference desktop used by the PNG mockups and `guidemo`.
 //!
 //! The `std` feature is for host tools and tests only.
@@ -22,6 +23,7 @@
 extern crate alloc;
 
 mod blend;
+pub mod app;
 pub mod canvas;
 pub mod color;
 pub mod cursor;
@@ -34,6 +36,8 @@ pub mod geom;
 pub mod icons;
 pub mod math;
 pub mod menu;
+pub mod proto;
+pub mod session;
 pub mod shadow;
 pub mod surface;
 pub mod text;

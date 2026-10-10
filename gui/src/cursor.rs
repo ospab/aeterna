@@ -49,9 +49,80 @@ const IBEAM: [&str; 18] = [
     "BBB BBB",
 ];
 
+
+const RESIZE_H: [&str; 9] = [
+    "    B         B    ",
+    "   BB         BB   ",
+    "  BWB         BWB  ",
+    " BWWBBBBBBBBBBBWWB ",
+    "BWWWWWWWWWWWWWWWWWB",
+    " BWWBBBBBBBBBBBWWB ",
+    "  BWB         BWB  ",
+    "   BB         BB   ",
+    "    B         B    ",
+];
+
+const RESIZE_V: [&str; 19] = [
+    "    B    ",
+    "   BWB   ",
+    "  BWWWB  ",
+    " BWWWWWB ",
+    "BBBBWBBBB",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "   BWB   ",
+    "BBBBWBBBB",
+    " BWWWWWB ",
+    "  BWWWB  ",
+    "   BWB   ",
+    "    B    ",
+];
+
+const RESIZE_NWSE: [&str; 13] = [
+    "BBBBBBB      ",
+    "BWWWWB       ",
+    "BWWWB        ",
+    "BWWWWB       ",
+    "BWBBWWB      ",
+    "BB  BWWB     ",
+    "     BWB     ",
+    "     BWWB  BB",
+    "      BWWBBWB",
+    "       BWWWWB",
+    "        BWWWB",
+    "       BWWWWB",
+    "      BBBBBBB",
+];
+
+const RESIZE_NESW: [&str; 13] = [
+    "      BBBBBBB",
+    "       BWWWWB",
+    "        BWWWB",
+    "       BWWWWB",
+    "      BWWBBWB",
+    "     BWWB  BB",
+    "     BWB     ",
+    "BB  BWWB     ",
+    "BWBBWWB      ",
+    "BWWWWB       ",
+    "BWWWB        ",
+    "BWWWWB       ",
+    "BBBBBBB      ",
+];
+
 fn art(shape: CursorShape) -> (&'static [&'static str], i32, i32) {
     match shape {
         CursorShape::Text => (&IBEAM, 3, 9),
+        CursorShape::ResizeH => (&RESIZE_H, 9, 4),
+        CursorShape::ResizeV => (&RESIZE_V, 4, 9),
+        CursorShape::ResizeNwse => (&RESIZE_NWSE, 6, 6),
+        CursorShape::ResizeNesw => (&RESIZE_NESW, 6, 6),
         _ => (&ARROW, 0, 0),
     }
 }

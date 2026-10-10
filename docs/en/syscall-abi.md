@@ -1,7 +1,8 @@
 # System call ABI: objects, handles, IPC
 
 Implementation: `core/object.rs` (logic), `core/syscall/objects.rs` (glue); program wrappers are
-in `user/liboos/src/ipc.rs`. Other calls (write, mmap, ...) are in `core/syscall/mod.rs`.
+in `user/liboos/src/ipc.rs` (IPC), `user/liboos/src/mem.rs` (memory regions) and
+`user/liboos/src/hw.rs` (interrupts, I/O ports, DMA). Other calls (write, mmap, ...) are in `core/syscall/mod.rs`.
 
 ## Convention
 
@@ -14,6 +15,8 @@ in `user/liboos/src/ipc.rs`. Other calls (write, mmap, ...) are in `core/syscall
 | -2 | PermissionDenied | the handle lacks a required right |
 | -3 | InvalidArgument | bad argument (length > 128, duplicate handle, ...) |
 | -5 | Busy | the channel queue is full |
+| -6 | OutOfMemory | no frames, no free virtual range, object table full |
+| -7 | NotSupported | the object cannot do this (e.g. `mem_phys` of anonymous memory) |
 | -9 | NoSuchProcess | |
 | -10 | BadAddress | pointer outside the process address space |
 | -11 | BadHandle | value not in the table (never issued, closed or stale) |
@@ -29,11 +32,14 @@ generation, so an old value is refused (`BadHandle`) even if the slot is reused.
 the kernel before a program starts get the values 1, 2, 3... in the order they were granted.
 
 Rights: `READ`=1 (receive, wait), `WRITE`=2 (call, send, signal, reply, kill), `DUP`=4 (may be
-duplicated), `TRANSFER`=8 (may be sent in a message). A duplicate can only lose rights.
+duplicated), `TRANSFER`=8 (may be sent in a message). Memory objects add `MAP`=16 (may be
+mapped), `EXEC`=32 (may be mapped executable; not handed out by any call yet) and `PHYS`=64 (the
+physical address may be read). A duplicate can only lose rights.
 
 Objects: **Process**, **Thread** (one thread per process for now), **Channel**, **Notification**,
 **Reply** (the right to answer one call; created by the kernel on `call` and handed to the
-receiver in `recv`). An object lives while at least one handle or in-flight message refers to it.
+receiver in `recv`), **MemoryRegion**, **MmioRegion**, **Interrupt**, **IoPortRange**,
+**Resource** (see below). An object lives while at least one handle or in-flight message refers to it.
 When a process exits all its handles are closed, objects are freed and waiters are woken.
 
 ## Message
@@ -49,7 +55,7 @@ the receiver's table.
 |---|---|---|
 | 200 | handle_close | h → 0 |
 | 201 | handle_dup | h, rights → new h (needs DUP) |
-| 202 | handle_info | h → type \| rights<<8 (1 Process, 2 Thread, 3 Channel, 4 Notification, 5 Reply) |
+| 202 | handle_info | h → type \| rights<<8 (1 Process, 2 Thread, 3 Channel, 4 Notification, 5 Reply, 6 MemoryRegion, 7 MmioRegion, 8 Interrupt, 9 IoPortRange, 10 Resource) |
 | 210 | channel_create | → h (all rights) |
 | 211 | ipc_call | ch (WRITE), req*, reply* → reply.len; sleeps until the server replies |
 | 212 | ipc_send | ch (WRITE), msg* → 0; one-way, does not block |
@@ -61,14 +67,69 @@ the receiver's table.
 | 230 / 231 | process_self / thread_self | → h (all rights) |
 | 232 | process_wait | h (READ), code*, timeout → 0; the exit code is written to `code*` |
 | 233 | process_kill | h (WRITE) → 0 (a process cannot kill itself; use exit) |
+| 240 | mem_create | size → h (READ\|WRITE\|MAP\|DUP\|TRANSFER); zeroed pages, size rounded up, ≤ 64 MiB |
+| 241 | mem_map | h (MAP+READ, +WRITE, +EXEC), hint, prot → address of the mapping |
+| 242 | mem_unmap | addr (exactly what mem_map returned) → 0 |
+| 243 | mem_create_contig | resource (DMA, WRITE), size → h (as mem_create + PHYS); contiguous, ≤ 4 MiB |
+| 244 | mem_phys | h (PHYS) → physical address (contiguous and MMIO regions) |
+| 245 | mem_size | h → size in bytes |
+| 250 | irq_bind | irq (READ), notification (WRITE), bits → 0 |
+| 251 | irq_ack | irq (WRITE) → 0; unmasks the line |
+| 252 | ioport_enable | h (READ+WRITE) → 0; the ports become accessible to IN/OUT |
+| 253 | ioport_disable | h → 0 |
 
 `timeout` is in 100 Hz ticks; 0 waits forever. Waiting does not spin: the task becomes Waiting,
 the CPU halts, and the other side (or the deadline) wakes it. When no handle with `READ` is left on
 a channel, the channel closes and every pending `call` gets `PeerClosed`.
 
-## Drivers in ring 3 (stage 2, item 13)
+## Shared memory (stage 2, item 12)
 
-Interrupts and device memory or I/O ports will become objects of the same kind: an Interrupt that
-signals a Notification, and MemoryRegion/IoPort objects with `READ`/`WRITE`/`DUP`/`TRANSFER`
-rights. A driver process receives them as handles from its parent, and clients talk to it over a
-Channel.
+A **MemoryRegion** is a set of physical pages owned by the kernel object. `mem_create` makes an
+anonymous region; the handle is passed to another process in a message (usually a duplicate with
+fewer rights). Each process maps it with `mem_map` and sees the other's writes.
+
+- `prot` for `mem_map`: `READ`=1, `WRITE`=2, `EXEC`=4. `READ` is required; `WRITE|EXEC` together
+  is refused (W^X) with `InvalidArgument`. Rights needed: `MAP`+`READ`, plus `WRITE` for a
+  writable mapping and `EXEC` for an executable one. **Pages are no-execute by default**; `EXEC`
+  is granted by no call yet, so shared memory is never executable. A process that writes through
+  a read-only mapping gets a page fault and is killed.
+- `hint` is reserved (pass 0): the kernel picks the address in the process's mmap area.
+- The whole region is mapped; `mem_unmap` takes exactly the address `mem_map` returned (partial
+  unmaps are not supported).
+- A mapping holds its own reference: closing the handle does not unmap. The pages are freed when
+  the last handle is closed **and** the last mapping is gone. Process exit closes the handles and
+  drops the mappings.
+- Removed: the old SMR mechanism (calls 120–122, raw physical addresses with no owner),
+  `dma_alloc` (130), which returned a physical address to ring 3, raw port I/O (60/61),
+  `irq_wait` (62) and `vfs_register` (100).
+
+**DMA.** `mem_create_contig(resource, size)` allocates physically contiguous pages and the handle
+carries `PHYS`; `mem_phys` returns the address to program into a device. Only a process with a
+**Resource** handle of kind DMA (with `WRITE`) can do this; a duplicate without `PHYS` can be
+handed to clients so they do not learn the address.
+
+## Hardware as handles (stage 2, item 13)
+
+Interrupt, IoPortRange, MmioRegion and Resource objects cannot be created by any system call. They
+are made only by the privileged root (today the kernel boot code, `core::object::kernel_new_*`;
+later `seed`) and given to a driver as bootstrap handles (`core::elf::spawn_with_handles`).
+
+- **Interrupt**: a legacy (8259) IRQ line, currently only 3, 6 or 8 (lines no kernel driver
+  uses); one object per line; MSI is not supported yet. After `irq_bind` every interrupt **masks
+  the line**, ORs `bits` into the notification and wakes its waiter; the kernel sends EOI. The
+  driver services the device and calls `irq_ack`, which unmasks the line. The line is masked from
+  creation until the first `irq_ack`, and again when the object goes away.
+- **IoPortRange**: ports `[base, base+count)`. Mechanism: the **I/O permission bitmap in the
+  TSS**. `IOPL` stays 0; `ioport_enable` builds the process's bitmap (one bit per port, 1 =
+  denied) and the scheduler copies it into the TSS on a switch to that process (only the bytes in
+  use, and only when another process's bitmap is loaded). For processes without ports the bitmap
+  is switched off (`iopb_offset` beyond the TSS limit), so any IN/OUT raises #GP and the process
+  is killed. Port access itself costs nothing (no system call per access). Like a mapping, an
+  enabled range holds a reference and lasts until `ioport_disable` or exit.
+- **MmioRegion**: a device physical range (e.g. a PCI BAR); `mem_map` works on it as on a
+  MemoryRegion, but the pages are mapped **uncached** (PCD|PWT) and never freed. RAM managed by
+  the frame allocator cannot be wrapped as MMIO.
+- **Resource**: authority to create special objects; kind DMA allows `mem_create_contig`.
+
+Tests: boot with the kernel parameter `selftest=mem` (`user/memtest`, `user/uartdrv`). The COM2
+driver (`uartdrv`) needs a second serial port in QEMU: `-serial file:com1.log -serial file:com2.log`.

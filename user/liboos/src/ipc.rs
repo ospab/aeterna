@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Kernel objects and IPC: handles, channels, notifications, processes.
-//! Safe wrappers over the syscalls described in `docs/SYSCALL-ABI.md`.
+//! Safe wrappers over the syscalls described in `docs/en/syscall-abi.md`.
+//! Memory regions are in [`crate::mem`], hardware objects in [`crate::hw`].
 //!
 //! A [`Handle`] owns one reference to a kernel object and closes it when dropped.
 //! The kernel checks the object type and the handle's [`Rights`] on every call.
@@ -30,11 +31,13 @@ pub enum Error {
     Busy,
     BadAddress,
     OutOfMemory,
+    /// The object does not support this operation (e.g. `phys` of an anonymous region).
+    NotSupported,
     Other(i64),
 }
 
 impl Error {
-    fn from_code(c: i64) -> Error {
+    pub(crate) fn from_code(c: i64) -> Error {
         match c {
             sys::err::PERMISSION_DENIED => Error::PermissionDenied,
             sys::err::INVALID_ARGUMENT => Error::InvalidArgument,
@@ -46,6 +49,7 @@ impl Error {
             sys::err::BUSY => Error::Busy,
             sys::err::BAD_ADDRESS => Error::BadAddress,
             sys::err::OUT_OF_MEMORY => Error::OutOfMemory,
+            sys::err::NOT_SUPPORTED => Error::NotSupported,
             other => Error::Other(other),
         }
     }
@@ -53,7 +57,7 @@ impl Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-fn check(r: i64) -> Result<i64> {
+pub(crate) fn check(r: i64) -> Result<i64> {
     if r < 0 { Err(Error::from_code(r)) } else { Ok(r) }
 }
 
@@ -70,7 +74,14 @@ impl Rights {
     pub const DUP: Rights = Rights(4);
     /// May be moved to another process inside a message.
     pub const TRANSFER: Rights = Rights(8);
+    /// The four generic rights above (what `create` calls hand out for IPC objects).
     pub const ALL: Rights = Rights(15);
+    /// Memory: may be mapped (READ is needed for any mapping, WRITE for a writable one).
+    pub const MAP: Rights = Rights(16);
+    /// Memory: may be mapped executable.
+    pub const EXEC: Rights = Rights(32);
+    /// Memory: the physical address may be read (DMA regions).
+    pub const PHYS: Rights = Rights(64);
 
     pub fn contains(self, other: Rights) -> bool {
         self.0 & other.0 == other.0
@@ -92,6 +103,12 @@ pub enum ObjectType {
     Channel,
     Notification,
     Reply,
+    MemoryRegion,
+    MmioRegion,
+    Interrupt,
+    IoPortRange,
+    Resource,
+    Unknown(u8),
 }
 
 /// An owned reference to a kernel object. Closed on drop.
@@ -137,7 +154,13 @@ impl Handle {
             2 => ObjectType::Thread,
             3 => ObjectType::Channel,
             4 => ObjectType::Notification,
-            _ => ObjectType::Reply,
+            5 => ObjectType::Reply,
+            6 => ObjectType::MemoryRegion,
+            7 => ObjectType::MmioRegion,
+            8 => ObjectType::Interrupt,
+            9 => ObjectType::IoPortRange,
+            10 => ObjectType::Resource,
+            t => ObjectType::Unknown(t as u8),
         };
         Ok((ty, Rights((r >> 8) as u32)))
     }

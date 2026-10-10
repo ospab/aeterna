@@ -58,6 +58,8 @@ pub enum Axis {
     Column,
     /// Children overlap, each placed by the container's alignment.
     Stack,
+    /// Children fill a grid with this many equal-width columns, row by row.
+    Grid(u16),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,7 +149,13 @@ pub enum Widget {
     Separator,
     Spacer,
     Icon { icon: Icon, size: i32, color: Option<Color> },
-    Terminal { lines: Vec<Vec<Span>>, cursor: Option<(usize, usize)> },
+    Terminal { lines: Vec<Vec<Span>>, cursor: Option<(usize, usize)>, scroll: usize },
+    /// Multi-line monospace text editor.
+    Editor { lines: Vec<String>, row: usize, col: usize, top: usize, scroll_x: i32 },
+    /// Horizontal slider, value 0..=1000.
+    Slider { value: u16 },
+    /// Segmented tab bar; selecting a tab emits `Action::Selected`.
+    Tabs { labels: Vec<String>, selected: usize },
     Progress { value: f32 },
 }
 
@@ -177,6 +185,8 @@ pub enum Action {
     Selected(NodeId, usize),
     Activated(NodeId, usize),
     MenuChosen(NodeId, usize),
+    /// Slider moved (0..=1000).
+    ValueChanged(NodeId, u16),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,6 +194,7 @@ enum Drag {
     None,
     TextSelect(NodeId),
     Thumb { list: NodeId, grab: i32 },
+    Slider(NodeId),
 }
 
 pub struct Ui {
@@ -237,7 +248,7 @@ impl Ui {
     pub fn add(&mut self, parent: NodeId, widget: Widget) -> NodeId {
         let layout = match &widget {
             Widget::Spacer => Layout { width: Length::Fill(1), height: Length::Fill(1), ..Layout::default() },
-            Widget::List { .. } | Widget::Terminal { .. } => Layout { width: Length::Fill(1), height: Length::Fill(1), ..Layout::default() },
+            Widget::List { .. } | Widget::Terminal { .. } | Widget::Editor { .. } => Layout { width: Length::Fill(1), height: Length::Fill(1), ..Layout::default() },
             _ => Layout::default(),
         };
         let id = self.nodes.len();
@@ -286,9 +297,47 @@ impl Ui {
         self.add(parent, Widget::Icon { icon, size, color })
     }
     pub fn terminal(&mut self, parent: NodeId, lines: Vec<Vec<Span>>) -> NodeId {
-        self.add(parent, Widget::Terminal { lines, cursor: None })
+        self.add(parent, Widget::Terminal { lines, cursor: None, scroll: 0 })
     }
     pub fn progress(&mut self, parent: NodeId, value: f32) -> NodeId { self.add(parent, Widget::Progress { value }) }
+    pub fn editor(&mut self, parent: NodeId, text: &str) -> NodeId {
+        let lines = split_lines(text);
+        self.add(parent, Widget::Editor { lines, row: 0, col: 0, top: 0, scroll_x: 0 })
+    }
+    pub fn tabs(&mut self, parent: NodeId, labels: &[&str], selected: usize) -> NodeId {
+        self.add(parent, Widget::Tabs { labels: labels.iter().map(|s| String::from(*s)).collect(), selected })
+    }
+    pub fn grid(&mut self, parent: NodeId, columns: u16) -> NodeId { self.container(parent, Axis::Grid(columns.max(1)), BoxStyle::default()) }
+    pub fn slider(&mut self, parent: NodeId, value: u16) -> NodeId { self.add(parent, Widget::Slider { value: value.min(1000) }) }
+
+    /// Editor contents joined with newlines.
+    pub fn editor_text(&self, id: NodeId) -> String {
+        if let Widget::Editor { lines, .. } = &self.nodes[id].widget { lines.join("
+") } else { String::new() }
+    }
+    pub fn set_editor_text(&mut self, id: NodeId, text: &str) {
+        if let Widget::Editor { lines, row, col, top, scroll_x } = &mut self.nodes[id].widget {
+            *lines = split_lines(text);
+            *row = 0; *col = 0; *top = 0; *scroll_x = 0;
+        }
+        self.invalidate(id);
+    }
+    /// Caret (line, column), zero-based.
+    pub fn editor_pos(&self, id: NodeId) -> (usize, usize) {
+        if let Widget::Editor { row, col, .. } = &self.nodes[id].widget { (*row, *col) } else { (0, 0) }
+    }
+    pub fn slider_value(&self, id: NodeId) -> u16 {
+        if let Widget::Slider { value } = &self.nodes[id].widget { *value } else { 0 }
+    }
+    pub fn set_slider(&mut self, id: NodeId, v: u16) {
+        if let Widget::Slider { value } = &mut self.nodes[id].widget { *value = v.min(1000); }
+        self.invalidate(id);
+    }
+    /// Scroll a terminal back by `lines` (0 = follow the bottom).
+    pub fn set_terminal_scroll(&mut self, id: NodeId, lines: usize) {
+        if let Widget::Terminal { scroll, .. } = &mut self.nodes[id].widget { *scroll = lines; }
+        self.invalidate(id);
+    }
 
     /// Mutable layout props (marks the tree for relayout).
     pub fn layout_mut(&mut self, id: NodeId) -> &mut Layout {
@@ -366,11 +415,19 @@ impl Ui {
     }
 
     pub fn selected(&self, id: NodeId) -> Option<usize> {
-        if let Widget::List { selected, .. } = &self.nodes[id].widget { *selected } else { None }
+        match &self.nodes[id].widget {
+            Widget::List { selected, .. } => *selected,
+            Widget::Tabs { selected, .. } => Some(*selected),
+            _ => None,
+        }
     }
 
     pub fn set_selected(&mut self, id: NodeId, sel: Option<usize>) {
-        if let Widget::List { selected, .. } = &mut self.nodes[id].widget { *selected = sel; }
+        match &mut self.nodes[id].widget {
+            Widget::List { selected, .. } => *selected = sel,
+            Widget::Tabs { selected, labels } => *selected = sel.unwrap_or(0).min(labels.len().saturating_sub(1)),
+            _ => {}
+        }
         self.ensure_visible(id);
         self.invalidate(id);
     }
@@ -381,8 +438,14 @@ impl Ui {
     }
 
     pub fn set_terminal(&mut self, id: NodeId, lines: Vec<Vec<Span>>, cursor: Option<(usize, usize)>) {
-        if let Widget::Terminal { lines: l, cursor: c } = &mut self.nodes[id].widget { *l = lines; *c = cursor; }
+        if let Widget::Terminal { lines: l, cursor: c, .. } = &mut self.nodes[id].widget { *l = lines; *c = cursor; }
         self.invalidate(id);
+    }
+
+    /// Edit a terminal's lines and cursor in place (no copy); repaints it.
+    pub fn terminal_mut(&mut self, id: NodeId) -> Option<(&mut Vec<Vec<Span>>, &mut Option<(usize, usize)>)> {
+        self.invalidate(id);
+        if let Widget::Terminal { lines, cursor, .. } = &mut self.nodes[id].widget { Some((lines, cursor)) } else { None }
     }
 
     pub fn set_progress(&mut self, id: NodeId, v: f32) {
@@ -515,18 +578,36 @@ impl Ui {
                 let mut main = 0;
                 let mut cross = 0;
                 for (i, &c) in kids.iter().enumerate() {
-                    let child_w = match axis { Axis::Column | Axis::Stack => inner_w, Axis::Row => None };
+                    let child_w = match axis { Axis::Column | Axis::Stack => inner_w, Axis::Row | Axis::Grid(_) => None };
                     let cs = self.resolved(c, child_w, text, theme);
                     match axis {
                         Axis::Row => { main += cs.w; cross = cross.max(cs.h); }
                         Axis::Column => { main += cs.h; cross = cross.max(cs.w); }
-                        Axis::Stack => { main = main.max(cs.w); cross = cross.max(cs.h); }
+                        Axis::Stack | Axis::Grid(_) => { main = main.max(cs.w); cross = cross.max(cs.h); }
                     }
-                    if i > 0 && *axis != Axis::Stack { main += n.layout.gap; }
+                    if i > 0 && matches!(axis, Axis::Row | Axis::Column) { main += n.layout.gap; }
                 }
                 match axis {
                     Axis::Row | Axis::Stack => Size::new(main, cross),
                     Axis::Column => Size::new(cross, main),
+                    Axis::Grid(cols) => {
+                        let cols = *cols as usize;
+                        let mut w = 0;
+                        let mut h = 0;
+                        for (r, chunk) in kids.chunks(cols).enumerate() {
+                            let mut rw = 0;
+                            let mut rh = 0;
+                            for &c in chunk {
+                                let cs = self.resolved(c, None, text, theme);
+                                rw += cs.w;
+                                rh = rh.max(cs.h);
+                            }
+                            rw += n.layout.gap * (chunk.len() as i32 - 1);
+                            w = w.max(rw);
+                            h += rh + if r > 0 { n.layout.gap } else { 0 };
+                        }
+                        Size::new(w, h)
+                    }
                 }
             }
             Widget::Label { text: s, role, wrap, .. } => {
@@ -558,6 +639,13 @@ impl Ui {
             Widget::Spacer => Size::new(0, 0),
             Widget::Icon { size, .. } => Size::new(*size, *size),
             Widget::Terminal { .. } => Size::new(320, 200),
+            Widget::Editor { .. } => Size::new(320, 200),
+            Widget::Slider { .. } => Size::new(160, 20),
+            Widget::Tabs { labels, .. } => {
+                let st = theme.text.body;
+                let w: i32 = labels.iter().map(|l| text.measure(st.font, st.size, l) + 28).sum();
+                Size::new(w + 4, m.control_h)
+            }
             Widget::Progress { .. } => Size::new(120, 6),
         };
         s.w += pad.horizontal();
@@ -584,6 +672,26 @@ impl Ui {
         let kids: Vec<NodeId> = self.nodes[id].children.iter().copied().filter(|&c| self.nodes[c].visible).collect();
         if kids.is_empty() { return; }
 
+        if let Axis::Grid(cols) = axis {
+            let cols = cols as usize;
+            let cw = (content.w - lay.gap * (cols as i32 - 1)) / cols as i32;
+            let mut y = content.y;
+            for chunk in kids.chunks(cols) {
+                let mut rh = 0;
+                for &c in chunk { rh = rh.max(self.resolved(c, Some(cw), text, theme).h); }
+                for (i, &c) in chunk.iter().enumerate() {
+                    let x = content.x + i as i32 * (cw + lay.gap);
+                    let s = self.resolved(c, Some(cw), text, theme);
+                    let cl = self.nodes[c].layout;
+                    let w = if matches!(cl.width, Length::Fill(_)) || lay.cross == Align::Stretch { cw } else { s.w.min(cw) };
+                    let h = if matches!(cl.height, Length::Fill(_)) { rh } else { s.h.min(rh) };
+                    let yo = align_off(lay.main, rh - h);
+                    self.arrange(c, Rect::new(x, y + yo, w, h), text, theme);
+                }
+                y += rh + lay.gap;
+            }
+            return;
+        }
         if axis == Axis::Stack {
             for &c in &kids {
                 let cl = self.nodes[c].layout;
@@ -662,7 +770,7 @@ impl Ui {
     // ── Hit testing ──────────────────────────────────────────────────────
 
     fn interactive(w: &Widget) -> bool {
-        matches!(w, Widget::Button { .. } | Widget::IconButton { .. } | Widget::TextField { .. } | Widget::Checkbox { .. } | Widget::Toggle { .. } | Widget::List { .. })
+        matches!(w, Widget::Button { .. } | Widget::IconButton { .. } | Widget::TextField { .. } | Widget::Checkbox { .. } | Widget::Toggle { .. } | Widget::List { .. } | Widget::Editor { .. } | Widget::Slider { .. } | Widget::Tabs { .. })
     }
 
     fn hit(&self, id: NodeId, x: i32, y: i32) -> Option<NodeId> {
@@ -678,7 +786,7 @@ impl Ui {
 
     pub fn cursor_at(&self, x: i32, y: i32) -> CursorShape {
         match self.hit_test(x, y).map(|h| &self.nodes[h].widget) {
-            Some(Widget::TextField { .. }) => CursorShape::Text,
+            Some(Widget::TextField { .. }) | Some(Widget::Editor { .. }) => CursorShape::Text,
             _ => CursorShape::Arrow,
         }
     }
@@ -769,6 +877,7 @@ impl Ui {
                 match self.drag {
                     Drag::TextSelect(id) => { self.field_caret_to(id, x, text, theme, true); return true; }
                     Drag::Thumb { list, grab } => { self.thumb_drag(list, y - grab); return true; }
+                    Drag::Slider(id) => { self.slider_to(id, x); return true; }
                     Drag::None => {}
                 }
                 let h = self.hit_test(x, y);
@@ -804,6 +913,32 @@ impl Ui {
                         self.field_caret_to(id, x, text, theme, false);
                         self.drag = Drag::TextSelect(id);
                     }
+                    Widget::Slider { .. } => {
+                        self.slider_to(id, x);
+                        self.drag = Drag::Slider(id);
+                    }
+                    Widget::Tabs { ref labels, selected } => {
+                        let b = self.nodes[id].bounds;
+                        let n = labels.len().max(1) as i32;
+                        let i = (((x - b.x) * n) / b.w.max(1)).clamp(0, n - 1) as usize;
+                        if i != selected {
+                            if let Widget::Tabs { selected, .. } = &mut self.nodes[id].widget { *selected = i; }
+                            self.actions.push(Action::Selected(id, i));
+                        }
+                    }
+                    Widget::Editor { .. } => {
+                        let st = theme.text.mono;
+                        let cell = text.mono_advance(st.font, st.size);
+                        let (gutter, b) = (self.editor_gutter(id, cell), self.nodes[id].bounds);
+                        if let Widget::Editor { lines, row, col, top, scroll_x } = &mut self.nodes[id].widget {
+                            let r = (*top + ((y - b.y - 6).max(0) / st.line) as usize).min(lines.len() - 1);
+                            let c = ((x - b.x - gutter + *scroll_x + cell / 2).max(0) / cell) as usize;
+                            *row = r;
+                            *col = c.min(lines[r].chars().count());
+                        }
+                        self.caret_epoch = self.now;
+                        self.caret_on = true;
+                    }
                     Widget::List { .. } => {
                         if let Some(t) = self.list_thumb(id) {
                             if Rect::new(t.x - 4, t.y, t.w + 8, t.h).contains(x, y) {
@@ -837,12 +972,25 @@ impl Ui {
                 p.is_some()
             }
             Event::Wheel { x, y, dy } => {
-                let mut t = self.hit_test(x, y);
-                while let Some(id) = t {
-                    if let Widget::List { .. } = self.nodes[id].widget { break; }
-                    t = self.nodes[id].parent;
-                }
+                let t = self.scroll_target(self.root, x, y);
                 if let Some(id) = t {
+                    let st = theme.text.mono;
+                    match &mut self.nodes[id].widget {
+                        Widget::Terminal { lines, scroll, .. } => {
+                            let n = lines.len();
+                            *scroll = (*scroll as i32 + dy * 3).clamp(0, n.saturating_sub(1) as i32) as usize;
+                            self.invalidate(id);
+                            return true;
+                        }
+                        Widget::Editor { lines, top, .. } => {
+                            let n = lines.len();
+                            *top = (*top as i32 - dy * 3).clamp(0, n.saturating_sub(1) as i32) as usize;
+                            let _ = st;
+                            self.invalidate(id);
+                            return true;
+                        }
+                        _ => {}
+                    }
                     let max = self.list_scroll_max(id);
                     if let Widget::List { scroll, row_h, .. } = &mut self.nodes[id].widget {
                         *scroll = (*scroll - dy * *row_h).clamp(0, max);
@@ -882,6 +1030,122 @@ impl Ui {
             _ => {}
         }
         self.invalidate(id);
+    }
+
+    fn scroll_target(&self, id: NodeId, x: i32, y: i32) -> Option<NodeId> {
+        let n = &self.nodes[id];
+        if !n.visible || !n.bounds.contains(x, y) { return None; }
+        for &c in n.children.iter().rev() {
+            if let Some(t) = self.scroll_target(c, x, y) { return Some(t); }
+        }
+        match n.widget {
+            Widget::List { .. } | Widget::Terminal { .. } | Widget::Editor { .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    fn slider_to(&mut self, id: NodeId, x: i32) {
+        let b = self.nodes[id].bounds;
+        let v = (((x - b.x - 8) * 1000) / (b.w - 16).max(1)).clamp(0, 1000) as u16;
+        if let Widget::Slider { value } = &mut self.nodes[id].widget {
+            if *value != v { *value = v; self.actions.push(Action::ValueChanged(id, v)); }
+        }
+        self.invalidate(id);
+    }
+
+    fn editor_gutter(&self, id: NodeId, cell: i32) -> i32 {
+        if let Widget::Editor { lines, .. } = &self.nodes[id].widget {
+            let mut n = lines.len().max(1);
+            let mut digits = 1;
+            while n >= 10 { n /= 10; digits += 1; }
+            digits.max(3) * cell + 20
+        } else { 0 }
+    }
+
+    fn editor_key(&mut self, id: NodeId, key: Key, mods: crate::event::Modifiers, ch: Option<char>, text: &mut TextEngine, theme: &Theme) -> bool {
+        let st = theme.text.mono;
+        let cell = text.mono_advance(st.font, st.size);
+        let gutter = self.editor_gutter(id, cell);
+        let b = self.nodes[id].bounds;
+        let rows_vis = ((b.h - 12) / st.line).max(1) as usize;
+        let mut changed = false;
+        if let Widget::Editor { lines, row, col, top, scroll_x } = &mut self.nodes[id].widget {
+            let byte = |s: &str, i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
+            let len = |s: &String| s.chars().count();
+            *col = (*col).min(len(&lines[*row]));
+            match key {
+                Key::Left => { if *col > 0 { *col -= 1; } else if *row > 0 { *row -= 1; *col = len(&lines[*row]); } }
+                Key::Right => { if *col < len(&lines[*row]) { *col += 1; } else if *row + 1 < lines.len() { *row += 1; *col = 0; } }
+                Key::Up => { if *row > 0 { *row -= 1; } }
+                Key::Down => { if *row + 1 < lines.len() { *row += 1; } }
+                Key::Home => *col = 0,
+                Key::End => *col = len(&lines[*row]),
+                Key::PageUp => *row = row.saturating_sub(rows_vis),
+                Key::PageDown => *row = (*row + rows_vis).min(lines.len() - 1),
+                Key::Enter => {
+                    let b0 = byte(&lines[*row], *col);
+                    let rest = lines[*row].split_off(b0);
+                    let indent: String = lines[*row].chars().take_while(|c| *c == ' ').collect();
+                    let n = indent.chars().count();
+                    lines.insert(*row + 1, indent + &rest);
+                    *row += 1;
+                    *col = n;
+                    changed = true;
+                }
+                Key::Backspace => {
+                    if *col > 0 {
+                        let (a, c) = (byte(&lines[*row], *col - 1), byte(&lines[*row], *col));
+                        lines[*row].replace_range(a..c, "");
+                        *col -= 1;
+                        changed = true;
+                    } else if *row > 0 {
+                        let cur = lines.remove(*row);
+                        *row -= 1;
+                        *col = len(&lines[*row]);
+                        lines[*row].push_str(&cur);
+                        changed = true;
+                    }
+                }
+                Key::Delete => {
+                    if *col < len(&lines[*row]) {
+                        let (a, c) = (byte(&lines[*row], *col), byte(&lines[*row], *col + 1));
+                        lines[*row].replace_range(a..c, "");
+                        changed = true;
+                    } else if *row + 1 < lines.len() {
+                        let next = lines.remove(*row + 1);
+                        lines[*row].push_str(&next);
+                        changed = true;
+                    }
+                }
+                Key::Tab => {
+                    let b0 = byte(&lines[*row], *col);
+                    lines[*row].insert_str(b0, "    ");
+                    *col += 4;
+                    changed = true;
+                }
+                _ => match ch {
+                    Some(c) if !c.is_control() && !mods.ctrl && !mods.alt => {
+                        let b0 = byte(&lines[*row], *col);
+                        lines[*row].insert(b0, c);
+                        *col += 1;
+                        changed = true;
+                    }
+                    _ => return false,
+                },
+            }
+            *col = (*col).min(len(&lines[*row]));
+            if *row < *top { *top = *row; }
+            if *row >= *top + rows_vis { *top = *row + 1 - rows_vis; }
+            let cx = *col as i32 * cell;
+            let vis_w = b.w - gutter - 12;
+            if cx - *scroll_x > vis_w - cell { *scroll_x = cx - vis_w + cell * 4; }
+            if cx < *scroll_x { *scroll_x = (cx - cell * 4).max(0); }
+        }
+        if changed { self.actions.push(Action::TextChanged(id)); }
+        self.caret_epoch = self.now;
+        self.caret_on = true;
+        self.invalidate(id);
+        true
     }
 
     fn thumb_drag(&mut self, list: NodeId, thumb_y: i32) {
@@ -928,6 +1192,28 @@ impl Ui {
         }
         let id = match self.focus { Some(f) => f, None => return false };
         if !self.nodes[id].enabled { return false; }
+        if matches!(self.nodes[id].widget, Widget::Editor { .. }) { return self.editor_key(id, key, mods, ch, text, theme); }
+        if let Widget::Tabs { ref labels, selected } = self.nodes[id].widget {
+            let n = labels.len();
+            let ns = match key { Key::Left => selected.saturating_sub(1), Key::Right => (selected + 1).min(n.saturating_sub(1)), _ => return false };
+            if ns != selected {
+                self.set_selected(id, Some(ns));
+                self.actions.push(Action::Selected(id, ns));
+            }
+            return true;
+        }
+        if let Widget::Slider { value } = self.nodes[id].widget {
+            let nv = match key {
+                Key::Left | Key::Down => value.saturating_sub(50),
+                Key::Right | Key::Up => (value + 50).min(1000),
+                Key::Home => 0,
+                Key::End => 1000,
+                _ => return false,
+            };
+            self.set_slider(id, nv);
+            self.actions.push(Action::ValueChanged(id, nv));
+            return true;
+        }
         let is_field = matches!(self.nodes[id].widget, Widget::TextField { .. });
         if is_field { return self.field_key(id, key, mods, ch, text, theme); }
         match (&self.nodes[id].widget, key) {
@@ -1005,6 +1291,23 @@ impl Ui {
                 Key::End => { *caret = len; if !mods.shift { *anchor = len; } }
                 Key::Enter => submit = true,
                 Key::Char('a') if mods.ctrl => { *anchor = 0; *caret = len; }
+                Key::Char('c') | Key::Char('x') if mods.ctrl => {
+                    if lo != hi {
+                        let (a, b) = (byte(s, lo), byte(s, hi));
+                        crate::app::clipboard_set(&s[a..b]);
+                        if key == Key::Char('x') { delete_sel(s, caret, anchor); changed = true; }
+                    }
+                }
+                Key::Char('v') if mods.ctrl => {
+                    let clip = crate::app::clipboard_get();
+                    let clip: String = clip.chars().filter(|c| !c.is_control()).collect();
+                    delete_sel(s, caret, anchor);
+                    let b0 = byte(s, *caret);
+                    s.insert_str(b0, &clip);
+                    *caret += clip.chars().count();
+                    *anchor = *caret;
+                    changed = true;
+                }
                 _ => {
                     if let Some(c) = ch {
                         if !c.is_control() && !mods.ctrl {
@@ -1049,7 +1352,7 @@ impl Ui {
     pub fn tick(&mut self, now_ms: u64, theme: &Theme) {
         self.now = now_ms;
         if let Some(f) = self.focus {
-            if let Widget::TextField { .. } = self.nodes[f].widget {
+            if let Widget::TextField { .. } | Widget::Editor { .. } = self.nodes[f].widget {
                 let on = self.active && ((now_ms.saturating_sub(self.caret_epoch)) / theme.motion.caret_blink as u64) % 2 == 0;
                 if on != self.caret_on { self.caret_on = on; self.invalidate(f); }
             }
@@ -1267,12 +1570,14 @@ impl Ui {
                 let r = Rect::new(b.x + (b.w - size) / 2, b.y + (b.h - size) / 2, *size, *size);
                 icons::draw(c, *icon, r, color.unwrap_or(col.text_secondary));
             }
-            Widget::Terminal { lines, cursor } => {
+            Widget::Terminal { lines, cursor, scroll } => {
                 let st = theme.text.mono;
                 let inner = b.inset_by(n.layout.padding);
                 let cell = text.mono_advance(st.font, st.size);
                 let visible = (inner.h / st.line).max(1) as usize;
-                let first = lines.len().saturating_sub(visible);
+                let end = lines.len().saturating_sub(*scroll).max(visible.min(lines.len()));
+                let first = end.saturating_sub(visible);
+                let lines = &lines[..end];
                 let lm = text.metrics(st.font, st.size);
                 let saved = c.save();
                 c.clip_to(inner);
@@ -1284,8 +1589,14 @@ impl Ui {
                         col_i += text.draw_mono(c, inner.x + col_i * cell, ty, st.font, st.size, sp.color, &sp.text);
                     }
                 }
+                if *scroll > 0 {
+                    let total = lines.len() + *scroll;
+                    let th = (inner.h * visible as i32 / total.max(1) as i32).max(20);
+                    let ty = inner.y + (inner.h - th) * first as i32 / (total - visible).max(1) as i32;
+                    c.fill_round_rect(Rect::new(b.right() - 9, ty, 6, th), 3, Color::white_a(70));
+                }
                 if let Some((r, cc)) = cursor {
-                    if *r >= first {
+                    if *r >= first && *r < end {
                         let y = inner.y + (*r - first) as i32 * st.line;
                         let blink = self.active;
                         let cur = Rect::new(inner.x + *cc as i32 * cell, y + 1, cell, st.line - 2);
@@ -1293,6 +1604,63 @@ impl Ui {
                     }
                 }
                 c.restore(saved);
+            }
+            Widget::Editor { lines, row, col: ccol, top, scroll_x } => {
+                let st = theme.text.mono;
+                let cell = text.mono_advance(st.font, st.size);
+                let gutter = self.editor_gutter(id, cell);
+                let lm = text.metrics(st.font, st.size);
+                c.fill_rect(Rect::new(b.x, b.y, gutter - 8, b.h), Color::hex(0x111215));
+                let saved = c.save();
+                c.clip_to(b);
+                let rows = ((b.h - 12) / st.line + 1) as usize;
+                for i in 0..rows {
+                    let li = *top + i;
+                    if li >= lines.len() { break; }
+                    let y = b.y + 6 + i as i32 * st.line;
+                    if li == *row && focus { c.fill_rect(Rect::new(b.x + gutter - 8, y, b.w - gutter + 8, st.line), Color::white_a(7)); }
+                    let num = alloc::format!("{}", li + 1);
+                    let nw = num.len() as i32 * cell;
+                    let ty = y + (st.line - lm.height) / 2;
+                    text.draw_mono(c, b.x + gutter - 18 - nw, ty, st.font, st.size, if li == *row { col.text_secondary } else { col.text_disabled }, &num);
+                    let inner = c.save();
+                    c.clip_to(Rect::new(b.x + gutter, b.y, b.w - gutter, b.h));
+                    text.draw_mono(c, b.x + gutter - scroll_x, ty, st.font, st.size, col.text, &lines[li]);
+                    if li == *row && focus && (self.caret_on || n.force & FORCE_FOCUS != 0) {
+                        let cx = b.x + gutter - scroll_x + (*ccol).min(lines[li].chars().count()) as i32 * cell;
+                        c.fill_rect(Rect::new(cx, y + 2, 2, st.line - 4), col.accent_text);
+                    }
+                    c.restore(inner);
+                }
+                c.restore(saved);
+            }
+            Widget::Tabs { labels, selected } => {
+                c.fill_round_rect(b, theme.radius.md + 1, col.field);
+                c.stroke_round_rect(b, theme.radius.md + 1, 1, col.hairline);
+                let n = labels.len().max(1) as i32;
+                let st = theme.text.body;
+                let lm = text.metrics(st.font, st.size);
+                for (i, l) in labels.iter().enumerate() {
+                    let x0 = b.x + b.w * i as i32 / n;
+                    let x1 = b.x + b.w * (i as i32 + 1) / n;
+                    let seg = Rect::new(x0 + 2, b.y + 2, x1 - x0 - 4, b.h - 4);
+                    let sel = i == *selected;
+                    if sel { c.fill_round_rect(seg, theme.radius.md - 1, col.control_hover); }
+                    let tw = text.measure(st.font, st.size, l);
+                    let fg = if !enabled { col.text_disabled } else if sel { col.text } else { col.text_secondary };
+                    text.draw(c, seg.x + (seg.w - tw) / 2, b.y + (b.h - lm.height) / 2, st.font, st.size, fg, l);
+                }
+                if focus { Self::focus_ring(c, b, theme.radius.md + 1, theme); }
+            }
+            Widget::Slider { value } => {
+                let tr = Rect::new(b.x + 8, b.y + b.h / 2 - 2, b.w - 16, 4);
+                c.fill_round_rect(tr, 2, col.control_hover);
+                let kx = tr.x + tr.w * *value as i32 / 1000;
+                c.fill_round_rect(Rect::new(tr.x, tr.y, kx - tr.x + 2, 4), 2, if enabled { col.accent } else { col.text_disabled });
+                let cy = (b.y + b.h / 2) as f32;
+                c.fill_circle(kx as f32 + 0.5, cy + 0.5, 8.5, Color::black_a(60));
+                c.fill_circle(kx as f32 + 0.5, cy, 8.0, if hover || pressed { Color::WHITE } else { Color::hex(0xE4E6EA) });
+                if focus { c.stroke_circle(kx as f32 + 0.5, cy, 11.0, 2.0, col.focus_ring); }
             }
             Widget::Progress { value } => {
                 let r = Rect::new(b.x, b.y + (b.h - 6) / 2, b.w, 6);
@@ -1391,4 +1759,10 @@ fn align_off(a: Align, free: i32) -> i32 {
         Align::End => free,
         _ => 0,
     }
+}
+
+fn split_lines(text: &str) -> Vec<String> {
+    let mut v: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').replace('\t', "    ")).collect();
+    if v.is_empty() { v.push(String::new()); }
+    v
 }

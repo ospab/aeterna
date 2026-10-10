@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A toolkit window: its own surface, client-side chrome and a widget tree.
+//! Client side of a window: surface, client-side chrome, widget tree, and
+//! the protocol glue (see [`crate::proto`]).
 //!
-//! This is the client half of the future compositor protocol: the window
-//! renders into its own premultiplied surface (later: a shared-memory buffer)
-//! and reports damage in window coordinates.  The compositor only adds the
-//! shadow and places the surface.
-//!
-//! Chrome: a 38-px title bar in the window's own colour (no separate band),
-//! the title centred, and two small monochrome round controls on the left —
-//! close and minimise — that show their glyph only when the pointer is near
-//! them and turn red/grey on hover.  Focus is shown by a brighter hairline
-//! border, a stronger shadow and primary-coloured title text.
+//! Chrome: a 38-px title bar in the window's own colour, the title centred,
+//! and three small monochrome round controls on the left — close, minimise,
+//! zoom — that show their glyph only when the pointer is near and turn
+//! red/grey on hover.  Focus is a brighter hairline border, a stronger shadow
+//! (drawn by the server) and primary-coloured title text.  Double-clicking
+//! the title bar zooms.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -23,106 +21,170 @@ use crate::event::{CursorShape, Event, MouseButton};
 use crate::geom::Rect;
 use crate::icons::Icon;
 use crate::math;
-use crate::surface::Surface;
+use crate::proto::{alloc_id, new_surface, SharedSurface, ToClient, ToServer, WinId};
 use crate::text::TextEngine;
 use crate::theme::Theme;
-use crate::ui::Ui;
+use crate::ui::{Action, Ui};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chrome {
     Close,
     Minimize,
+    Zoom,
 }
 
-/// What the window asks its owner (the compositor) to do.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WindowResponse {
-    pub begin_drag: bool,
-    pub close: bool,
-    pub minimize: bool,
-    pub consumed: bool,
+/// What a window reports to its application after handling a message.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppEvent {
+    Action(Action),
+    /// A key the widgets did not consume (application shortcuts, terminals).
+    Key(Event),
+    /// Close button, Alt+F4 or the dock asked to close.
+    CloseRequested,
+    /// The server gave the window a new size.
+    Resized(i32, i32),
+    Focus(bool),
+    /// A timer set with `Ctx::set_timer` fired.
+    Timer(u32),
+    /// A dialog opened by this app closed (see [`crate::app::DialogResult`]).
+    Dialog(u32, crate::app::DialogResult),
 }
 
-pub struct Window {
+/// What a [`Client`] gets while being driven by the session (runner side).
+pub struct Cx<'a> {
+    pub text: &'a mut TextEngine,
+    pub theme: &'a Theme,
+    pub out: &'a mut VecDeque<ToServer>,
+    pub now: u64,
+}
+
+/// Runner-side interface: something that owns client windows and is driven
+/// by a session loop.  Applications do not implement this; they implement
+/// [`crate::app::Application`] and run inside an [`crate::app::AppHost`].
+pub trait Client {
+    /// Application id (see `AppInfo::id`), "" if none.
+    fn app_id(&self) -> &str { "" }
+    /// The window messages for `id` should go to (None: not ours).
+    fn window_mut(&mut self, id: WinId) -> Option<&mut ClientWindow>;
+    /// Ids of the app's live windows.
+    fn window_ids(&self) -> Vec<WinId>;
+    /// React to what the window reported.
+    fn update(&mut self, id: WinId, events: &[AppEvent], cx: &mut Cx);
+    /// Periodic work (timers, polling the system).
+    fn tick(&mut self, _cx: &mut Cx) {}
+    /// False once every window is destroyed.
+    fn alive(&self) -> bool;
+}
+
+pub struct ClientWindow {
+    pub id: WinId,
     pub title: String,
     pub icon: Icon,
-    /// Position and size on screen.
-    pub rect: Rect,
+    pub w: i32,
+    pub h: i32,
+    pub surface: SharedSurface,
     pub ui: Ui,
-    pub surface: Surface,
     pub focused: bool,
-    pub visible: bool,
+    pub destroyed: bool,
     chrome_hover: Option<Chrome>,
     controls_hover: bool,
     chrome_pressed: Option<Chrome>,
     ui_capture: bool,
     damage: Damage,
     full: bool,
+    last_title_click: u64,
+    now: u64,
+    cursor: CursorShape,
 }
 
 const CTRL_R: f32 = 6.0;
+const CTRL_X: [f32; 3] = [20.0, 40.0, 60.0];
+const CTRLS: [Chrome; 3] = [Chrome::Close, Chrome::Minimize, Chrome::Zoom];
 
-impl Window {
-    pub fn new(title: &str, icon: Icon, rect: Rect, ui: Ui) -> Window {
-        Window {
-            title: title.into(), icon, rect, ui, surface: Surface::new(rect.w, rect.h),
-            focused: false, visible: true, chrome_hover: None, controls_hover: false, chrome_pressed: None,
-            ui_capture: false, damage: Damage::new(), full: true,
+impl ClientWindow {
+    /// Create a window and announce it to the server.
+    pub fn new(out: &mut VecDeque<ToServer>, title: &str, icon: Icon, w: i32, h: i32, min: (i32, i32), resizable: bool, ui: Ui) -> ClientWindow {
+        let id = alloc_id();
+        let surface = new_surface(w, h);
+        out.push_back(ToServer::Create { id, title: title.into(), icon, size: (w, h), min, resizable, surface: surface.clone() });
+        ClientWindow {
+            id, title: title.into(), icon, w, h, surface, ui, focused: false, destroyed: false,
+            chrome_hover: None, controls_hover: false, chrome_pressed: None, ui_capture: false,
+            damage: Damage::new(), full: true, last_title_click: 0, now: 0, cursor: CursorShape::Arrow,
         }
     }
 
-    pub fn local(&self) -> Rect { Rect::from_size(self.rect.w, self.rect.h) }
+    pub fn local(&self) -> Rect { Rect::from_size(self.w, self.h) }
 
-    fn titlebar(&self, theme: &Theme) -> Rect { Rect::new(0, 0, self.rect.w, theme.metrics.titlebar_h) }
+    pub fn set_title(&mut self, title: &str, out: &mut VecDeque<ToServer>, theme: &Theme) {
+        if self.title == title { return; }
+        self.title = title.into();
+        out.push_back(ToServer::SetTitle { id: self.id, title: title.into() });
+        self.damage.add(Rect::new(0, 0, self.w, theme.metrics.titlebar_h));
+    }
 
-    fn control_center(&self, which: Chrome, theme: &Theme) -> (f32, f32) {
-        let cy = theme.metrics.titlebar_h as f32 / 2.0;
-        match which {
-            Chrome::Close => (20.0, cy),
-            Chrome::Minimize => (40.0, cy),
+    pub fn destroy(&mut self, out: &mut VecDeque<ToServer>) {
+        if !self.destroyed {
+            self.destroyed = true;
+            out.push_back(ToServer::Destroy { id: self.id });
         }
     }
+
+    pub fn invalidate_all(&mut self) { self.full = true; }
 
     fn control_at(&self, x: i32, y: i32, theme: &Theme) -> Option<Chrome> {
-        for w in [Chrome::Close, Chrome::Minimize] {
-            let (cx, cy) = self.control_center(w, theme);
+        let cy = theme.metrics.titlebar_h as f32 / 2.0;
+        for (i, &cx) in CTRL_X.iter().enumerate() {
             let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-            if dx * dx + dy * dy <= 10.0 * 10.0 { return Some(w); }
+            if dx * dx + dy * dy <= 9.5 * 9.5 { return Some(CTRLS[i]); }
         }
         None
     }
 
-    fn controls_rect(&self, theme: &Theme) -> Rect { Rect::new(0, 0, 60, theme.metrics.titlebar_h) }
-
-    /// Request a complete repaint (e.g. after a resize or theme change).
-    pub fn invalidate_all(&mut self) { self.full = true; }
+    fn controls_rect(&self, theme: &Theme) -> Rect { Rect::new(0, 0, 76, theme.metrics.titlebar_h) }
 
     fn invalidate_frame(&mut self, theme: &Theme) {
-        let l = self.local();
-        self.damage.add(self.titlebar(theme));
-        self.damage.add(Rect::new(0, 0, 1, l.h));
-        self.damage.add(Rect::new(l.w - 1, 0, 1, l.h));
-        self.damage.add(Rect::new(0, l.h - 1, l.w, 1));
+        let (w, h) = (self.w, self.h);
+        self.damage.add(Rect::new(0, 0, w, theme.metrics.titlebar_h));
+        self.damage.add(Rect::new(0, 0, 1, h));
+        self.damage.add(Rect::new(w - 1, 0, 1, h));
+        self.damage.add(Rect::new(0, h - 1, w, 1));
     }
 
-    pub fn set_focused(&mut self, f: bool, text: &mut TextEngine, theme: &Theme) {
-        if self.focused == f { return; }
-        self.focused = f;
-        self.invalidate_frame(theme);
-        self.ui.handle(if f { &Event::FocusIn } else { &Event::FocusOut }, text, theme);
+    /// Handle one server message. Returns events for the application.
+    pub fn handle(&mut self, msg: &ToClient, cx: &mut Cx) -> Vec<AppEvent> {
+        let mut evs = Vec::new();
+        let (text, theme) = (&mut *cx.text, cx.theme);
+        self.now = cx.now;
+        match *msg {
+            ToClient::Configure { w, h, .. } => {
+                if w != self.w || h != self.h {
+                    self.w = w;
+                    self.h = h;
+                    self.full = true;
+                    evs.push(AppEvent::Resized(w, h));
+                }
+            }
+            ToClient::Focus { focused, .. } => {
+                if focused != self.focused {
+                    self.focused = focused;
+                    self.invalidate_frame(theme);
+                    self.ui.handle(if focused { &Event::FocusIn } else { &Event::FocusOut }, text, theme);
+                    evs.push(AppEvent::Focus(focused));
+                }
+            }
+            ToClient::CloseRequested { .. } => evs.push(AppEvent::CloseRequested),
+            ToClient::Input { ev, .. } => self.input(&ev, text, theme, cx.out, &mut evs),
+        }
+        for a in self.ui.drain_actions() { evs.push(AppEvent::Action(a)); }
+        evs
     }
 
-    pub fn cursor_at(&self, x: i32, y: i32, theme: &Theme) -> CursorShape {
-        if y < theme.metrics.titlebar_h { CursorShape::Arrow } else { self.ui.cursor_at(x, y) }
-    }
-
-    /// Feed an event in window-local coordinates.
-    pub fn handle(&mut self, ev: &Event, text: &mut TextEngine, theme: &Theme) -> WindowResponse {
-        let mut resp = WindowResponse { consumed: true, ..Default::default() };
+    fn input(&mut self, ev: &Event, text: &mut TextEngine, theme: &Theme, out: &mut VecDeque<ToServer>, evs: &mut Vec<AppEvent>) {
         let th = theme.metrics.titlebar_h;
         if self.ui.menu_open() {
             self.ui.handle(ev, text, theme);
-            return resp;
+            return;
         }
         match *ev {
             Event::PointerMove { x, y } => {
@@ -136,6 +198,11 @@ impl Window {
                 }
                 if self.ui_capture || y >= th { self.ui.handle(ev, text, theme); }
                 else { self.ui.handle(&Event::PointerLeave, text, theme); }
+                let shape = if y >= th { self.ui.cursor_at(x, y) } else { CursorShape::Arrow };
+                if shape != self.cursor {
+                    self.cursor = shape;
+                    out.push_back(ToServer::SetCursor { id: self.id, shape });
+                }
             }
             Event::PointerDown { x, y, button } => {
                 if y < th {
@@ -144,7 +211,13 @@ impl Window {
                         let r = self.controls_rect(theme);
                         self.damage.add(r);
                     } else if button == MouseButton::Left {
-                        resp.begin_drag = true;
+                        if self.now.saturating_sub(self.last_title_click) < 400 {
+                            out.push_back(ToServer::ToggleMaximize { id: self.id });
+                            self.last_title_click = 0;
+                        } else {
+                            self.last_title_click = self.now;
+                            out.push_back(ToServer::BeginMove { id: self.id });
+                        }
                     }
                 } else {
                     self.ui_capture = true;
@@ -157,8 +230,9 @@ impl Window {
                     self.damage.add(r);
                     if y < th && self.control_at(x, y, theme) == Some(p) {
                         match p {
-                            Chrome::Close => resp.close = true,
-                            Chrome::Minimize => resp.minimize = true,
+                            Chrome::Close => evs.push(AppEvent::CloseRequested),
+                            Chrome::Minimize => out.push_back(ToServer::Minimize { id: self.id }),
+                            Chrome::Zoom => out.push_back(ToServer::ToggleMaximize { id: self.id }),
                         }
                     }
                 }
@@ -176,19 +250,28 @@ impl Window {
                 }
                 self.ui.handle(ev, text, theme);
             }
-            _ => { resp.consumed = self.ui.handle(ev, text, theme); }
+            Event::KeyDown { .. } => {
+                if !self.ui.handle(ev, text, theme) { evs.push(AppEvent::Key(*ev)); }
+            }
+            _ => { self.ui.handle(ev, text, theme); }
         }
-        resp
     }
 
-    pub fn tick(&mut self, now_ms: u64, theme: &Theme) { self.ui.tick(now_ms, theme); }
+    pub fn tick(&mut self, now_ms: u64, theme: &Theme) {
+        self.now = now_ms;
+        self.ui.tick(now_ms, theme);
+    }
 
-    /// Repaint damaged parts of the surface. Returns damage in window coords.
-    pub fn render(&mut self, text: &mut TextEngine, theme: &Theme) -> Vec<Rect> {
+    /// Repaint damaged parts of the surface and announce them to the server.
+    pub fn render(&mut self, text: &mut TextEngine, theme: &Theme, out: &mut VecDeque<ToServer>) {
+        if self.destroyed { return; }
         let local = self.local();
-        if self.surface.width != local.w || self.surface.height != local.h {
-            self.surface.resize(local.w, local.h);
-            self.full = true;
+        {
+            let mut s = self.surface.borrow_mut();
+            if s.width != local.w || s.height != local.h {
+                s.resize(local.w, local.h);
+                self.full = true;
+            }
         }
         if self.full {
             self.full = false;
@@ -200,22 +283,23 @@ impl Window {
         let ui_rects = self.ui.take_damage(text, theme);
         self.damage.add_all(&ui_rects);
         self.damage.clip(local);
+        if self.damage.is_empty() { return; }
         let rects = self.damage.take();
-        for r in &rects {
-            self.paint_rect(*r, text, theme);
-        }
-        rects
+        for r in &rects { self.paint_rect(*r, text, theme); }
+        out.push_back(ToServer::Damage { id: self.id, rects });
     }
 
     fn paint_rect(&mut self, r: Rect, text: &mut TextEngine, theme: &Theme) {
-        let tb = self.titlebar(theme);
         let local = self.local();
+        let tb = Rect::new(0, 0, local.w, theme.metrics.titlebar_h);
         let rad = theme.radius.window;
+        let surface = self.surface.clone();
+        let mut s = surface.borrow_mut();
         {
-            let mut c = Canvas::new(self.surface.view_mut());
+            let mut c = Canvas::new(s.view_mut());
             c.set_clip(r);
             if tb.intersects(&r) {
-                Self::paint_chrome(&mut c, text, theme, &self.title, tb, self.focused, self.chrome_hover, self.controls_hover, self.chrome_pressed);
+                paint_chrome(&mut c, text, theme, &self.title, tb, self.focused, self.chrome_hover, self.controls_hover, self.chrome_pressed);
             }
             let ur = r.intersect(&self.ui.rect());
             if !ur.is_empty() { self.ui.paint_rect(&mut c, text, theme, ur); }
@@ -223,68 +307,76 @@ impl Window {
             let border = if self.focused { Color::white_a(30) } else { Color::white_a(18) };
             c.stroke_round_rect(local, rad, 1, border);
         }
-        self.mask_corners(r, rad);
+        let stride = s.stride;
+        mask_corners(&mut s.data, stride, local.w, local.h, r, rad);
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_chrome(c: &mut Canvas, text: &mut TextEngine, theme: &Theme, title: &str, tb: Rect, focused: bool,
-                    hover: Option<Chrome>, near: bool, pressed: Option<Chrome>) {
-        let col = &theme.color;
-        c.fill_rect(tb, col.bg1);
-        c.hline(tb.x, tb.right(), tb.bottom() - 1, col.hairline);
-        let st = theme.text.body_strong;
-        let lm = text.metrics(st.font, st.size);
-        let max_w = tb.w - 2 * 72;
-        let tw = text.measure(st.font, st.size, title).min(max_w);
-        let fg = if focused { col.text } else { col.text_disabled };
+#[allow(clippy::too_many_arguments)]
+fn paint_chrome(c: &mut Canvas, text: &mut TextEngine, theme: &Theme, title: &str, tb: Rect, focused: bool,
+                hover: Option<Chrome>, near: bool, pressed: Option<Chrome>) {
+    let col = &theme.color;
+    c.fill_rect(tb, col.bg1);
+    c.hline(tb.x, tb.right(), tb.bottom() - 1, col.hairline);
+    let st = theme.text.body_strong;
+    let lm = text.metrics(st.font, st.size);
+    let max_w = tb.w - 2 * 90;
+    let tw = text.measure(st.font, st.size, title).min(max_w.max(0));
+    let fg = if focused { col.text } else { col.text_disabled };
+    if max_w > 20 {
         text.draw_ellipsis(c, tb.x + (tb.w - tw) / 2, tb.y + (tb.h - lm.height) / 2, max_w, st.font, st.size, fg, title);
-        let cy = tb.h as f32 / 2.0;
-        for (w, cx) in [(Chrome::Close, 20.0f32), (Chrome::Minimize, 40.0)] {
-            let hovered = hover == Some(w);
-            let down = pressed == Some(w);
-            let fill = match (w, hovered, down) {
-                (Chrome::Close, true, false) => col.danger,
-                (Chrome::Close, _, true) => col.danger.mix(Color::BLACK, 50),
-                (Chrome::Minimize, true, false) => Color::white_a(80),
-                (Chrome::Minimize, _, true) => Color::white_a(50),
-                _ if focused => Color::white_a(44),
-                _ => Color::TRANSPARENT,
-            };
-            if fill.a() > 0 { c.fill_circle(cx, cy, CTRL_R, fill); }
-            else { c.stroke_circle(cx, cy, CTRL_R, 1.0, Color::white_a(34)); }
-            if near || hovered {
-                let g = if hovered && w == Chrome::Close { Color::WHITE } else { Color::hex(0x1A1B1E) };
-                match w {
-                    Chrome::Close => {
-                        c.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, 1.3, g);
-                        c.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, 1.3, g);
-                    }
-                    Chrome::Minimize => c.line(cx - 2.8, cy, cx + 2.8, cy, 1.3, g),
+    }
+    let cy = tb.h as f32 / 2.0;
+    for (i, &cx) in CTRL_X.iter().enumerate() {
+        let w = CTRLS[i];
+        let hovered = hover == Some(w);
+        let down = pressed == Some(w);
+        let fill = match (w, hovered, down) {
+            (Chrome::Close, true, false) => col.danger,
+            (Chrome::Close, _, true) => col.danger.mix(Color::BLACK, 50),
+            (_, true, false) => Color::white_a(80),
+            (_, _, true) => Color::white_a(50),
+            _ if focused => Color::white_a(44),
+            _ => Color::TRANSPARENT,
+        };
+        if fill.a() > 0 { c.fill_circle(cx, cy, CTRL_R, fill); }
+        else { c.stroke_circle(cx, cy, CTRL_R, 1.0, Color::white_a(34)); }
+        if near || hovered {
+            let g = if hovered && w == Chrome::Close { Color::WHITE } else { Color::hex(0x1A1B1E) };
+            match w {
+                Chrome::Close => {
+                    c.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, 1.3, g);
+                    c.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, 1.3, g);
+                }
+                Chrome::Minimize => c.line(cx - 2.8, cy, cx + 2.8, cy, 1.3, g),
+                Chrome::Zoom => {
+                    c.line(cx - 2.6, cy + 0.6, cx - 2.6, cy - 2.6, 1.2, g);
+                    c.line(cx - 2.6, cy - 2.6, cx + 0.6, cy - 2.6, 1.2, g);
+                    c.line(cx + 2.6, cy - 0.6, cx + 2.6, cy + 2.6, 1.2, g);
+                    c.line(cx + 2.6, cy + 2.6, cx - 0.6, cy + 2.6, 1.2, g);
                 }
             }
         }
     }
+}
 
-    /// Re-apply the rounded window shape to freshly painted pixels in `r`.
-    fn mask_corners(&mut self, r: Rect, rad: i32) {
-        let (w, h) = (self.surface.width, self.surface.height);
-        let rf = rad as f32;
-        let corners = [
-            (Rect::new(0, 0, rad, rad), rf, rf),
-            (Rect::new(w - rad, 0, rad, rad), w as f32 - rf, rf),
-            (Rect::new(0, h - rad, rad, rad), rf, h as f32 - rf),
-            (Rect::new(w - rad, h - rad, rad, rad), w as f32 - rf, h as f32 - rf),
-        ];
-        let stride = self.surface.stride;
-        for (sq, cx, cy) in corners {
-            let d = sq.intersect(&r);
-            for y in d.y..d.bottom() {
-                for x in d.x..d.right() {
-                    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-                    let cov = math::clamp01(rf - math::sqrt(dx * dx + dy * dy) + 0.5);
-                    let i = y as usize * stride + x as usize;
-                    self.surface.data[i] = blend::scale(self.surface.data[i], (cov * 255.0 + 0.5) as u32);
-                }
+/// Re-apply the rounded window shape to freshly painted pixels in `r`.
+fn mask_corners(data: &mut [u32], stride: usize, w: i32, h: i32, r: Rect, rad: i32) {
+    let rf = rad as f32;
+    let corners = [
+        (Rect::new(0, 0, rad, rad), rf, rf),
+        (Rect::new(w - rad, 0, rad, rad), w as f32 - rf, rf),
+        (Rect::new(0, h - rad, rad, rad), rf, h as f32 - rf),
+        (Rect::new(w - rad, h - rad, rad, rad), w as f32 - rf, h as f32 - rf),
+    ];
+    for (sq, cx, cy) in corners {
+        let d = sq.intersect(&r);
+        for y in d.y..d.bottom() {
+            for x in d.x..d.right() {
+                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                let cov = math::clamp01(rf - math::sqrt(dx * dx + dy * dy) + 0.5);
+                let i = y as usize * stride + x as usize;
+                data[i] = blend::scale(data[i], (cov * 255.0 + 0.5) as u32);
             }
         }
     }

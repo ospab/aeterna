@@ -1,7 +1,7 @@
 # Program SDK workspace for ospab.os: small ring-3 programs built against ../user/liboos.
 # Separate from the kernel crate and from ../user (the OS's own bundled programs).
 [workspace]
-members = ["hello-tmt", "cowsay", "calc"]
+members = ["hello-tmt", "cowsay", "calc", "hello-gui"]
 resolver = "2"
 
 [workspace.package]

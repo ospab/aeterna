@@ -1,0 +1,25 @@
+[package]
+name = "hello-gui"
+description = "Template GUI application for ospab.os (oos-ui application API)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "hello_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hello-gui"
+path = "src/main.rs"
+required-features = ["ring3"]
+
+[features]
+# The ring-3 program needs liboos. The kernel desktop embeds only the library
+# (default-features = false).
+default = ["ring3"]
+ring3 = ["dep:liboos"]
+
+[dependencies]
+oos-ui = { path = "../../gui", default-features = true }
+liboos = { path = "../../user/liboos", optional = true }

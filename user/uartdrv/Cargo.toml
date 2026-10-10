@@ -1,0 +1,9 @@
+[package]
+name = "uartdrv"
+description = "Ring-3 driver proof of concept: COM2 (16550 UART) through IoPortRange and Interrupt handles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

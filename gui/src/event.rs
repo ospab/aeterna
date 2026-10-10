@@ -26,6 +26,11 @@ pub enum Key {
     PageUp,
     PageDown,
     F(u8),
+    /// Modifier keys themselves (also reflected in `Modifiers`).
+    Shift,
+    Ctrl,
+    Alt,
+    Meta,
     Other,
 }
 
@@ -85,4 +90,9 @@ pub enum CursorShape {
     Arrow,
     Text,
     Hand,
+    ResizeH,
+    ResizeV,
+    ResizeNwse,
+    ResizeNesw,
+    Move,
 }

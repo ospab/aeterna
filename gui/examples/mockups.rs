@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use oos_ui::canvas::Canvas;
 use oos_ui::color::Color;
-use oos_ui::demo::{Demo, FILES, SETTINGS};
-use oos_ui::event::{Event, MouseButton};
+use oos_ui::demo::build_session;
+use oos_ui::event::{Event, Key, Modifiers, MouseButton};
 use oos_ui::fonts::default_text_engine;
 use oos_ui::geom::{Insets, Rect};
 use oos_ui::icons::Icon;
@@ -42,42 +42,47 @@ fn save_png(path: &str, s: &Surface) {
 
 fn desktop(out: &str, text: &mut TextEngine, theme: &Theme) {
     let t0 = Instant::now();
-    let mut demo = Demo::new(1280, 800, text, theme);
+    let (mut s, ids) = build_session(1280, 800, text, theme);
     let build = t0.elapsed();
     let t1 = Instant::now();
-    demo.frame(0, text, theme);
+    s.frame(0, text, theme);
     let first = t1.elapsed();
-    // Second full frame (warm glyph cache).
-    demo.desktop.invalidate_all();
-    for w in demo.desktop.windows.iter_mut() { w.invalidate_all(); }
+    s.desktop.invalidate_all();
     let t2 = Instant::now();
-    demo.frame(0, text, theme);
+    s.frame(0, text, theme);
     let full = t2.elapsed();
-    // Cursor moves: incremental frames.
     let t3 = Instant::now();
     let n = 200;
     for i in 0..n {
-        demo.handle(&Event::PointerMove { x: 300 + i, y: 200 + i / 2 }, text, theme);
-        demo.frame(16 * i as u64, text, theme);
+        s.input(&Event::PointerMove { x: 300 + i, y: 200 + i / 2 }, text, theme);
+        s.frame(16 * i as u64, text, theme);
     }
     let mv = t3.elapsed() / n as u32;
-    println!("host: build {:?}, first frame {:?}, full frame {:?}, cursor-move frame {:?}", build, first, full, mv);
+    println!("host: build {:?}, first frame {:?}, recomposite {:?}, cursor-move frame {:?}", build, first, full, mv);
 
-    // Mockup state: hover a file row, pointer over the Files list.
-    let fr = demo.desktop.windows[FILES].rect;
-    let (px, py) = (fr.x + 220, fr.y + 46 + 28 + 4 + 28 * 1 + 14);
-    demo.handle(&Event::PointerMove { x: px, y: py }, text, theme);
-    demo.frame(0, text, theme);
-    save_png(&format!("{out}/desktop.png"), &demo.desktop.back);
+    let fr = s.desktop.window(ids[2]).unwrap().rect;
+    s.input(&Event::PointerMove { x: fr.x + 220, y: fr.y + 46 + 28 + 4 + 28 + 14 }, text, theme);
+    s.frame(0, text, theme);
+    save_png(&format!("{out}/desktop.png"), &s.desktop.back);
 
-    // Variant: launcher open, Settings focused with a toggle flipped.
-    let sr = demo.desktop.windows[SETTINGS].rect;
-    demo.handle(&Event::PointerDown { x: sr.x + 300, y: sr.y + 15, button: MouseButton::Left }, text, theme);
-    demo.handle(&Event::PointerUp { x: sr.x + 300, y: sr.y + 15, button: MouseButton::Left }, text, theme);
-    demo.open_launcher(text, theme);
-    demo.handle(&Event::PointerMove { x: 60, y: 30 + 6 + 28 + 14 }, text, theme);
-    demo.frame(10_000, text, theme);
-    save_png(&format!("{out}/desktop-launcher.png"), &demo.desktop.back);
+    // Launcher open, Settings raised.
+    let sr = s.desktop.window(ids[1]).unwrap().rect;
+    s.input(&Event::PointerDown { x: sr.x + 300, y: sr.y + 15, button: MouseButton::Left }, text, theme);
+    s.frame(5_000, text, theme);
+    s.input(&Event::PointerUp { x: sr.x + 300, y: sr.y + 15, button: MouseButton::Left }, text, theme);
+    s.frame(5_100, text, theme);
+    s.desktop.open_launcher(text, theme);
+    s.input(&Event::PointerMove { x: 60, y: 30 + 6 + 28 + 14 }, text, theme);
+    s.frame(10_000, text, theme);
+    save_png(&format!("{out}/desktop-launcher.png"), &s.desktop.back);
+
+    // Alt+Tab switcher over the dock hover.
+    s.input(&Event::KeyDown { key: Key::Escape, mods: Modifiers::NONE, text: None }, text, theme);
+    let alt = Modifiers { alt: true, ..Modifiers::NONE };
+    s.input(&Event::KeyDown { key: Key::Tab, mods: alt, text: None }, text, theme);
+    s.input(&Event::PointerMove { x: 640 - 26, y: 800 - 40 }, text, theme);
+    s.frame(11_000, text, theme);
+    save_png(&format!("{out}/desktop-switcher.png"), &s.desktop.back);
 }
 
 fn section(ui: &mut Ui, parent: NodeId, title: &str) -> NodeId {

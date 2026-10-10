@@ -85,11 +85,23 @@ fn main() {
     println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/ipcsrv");
     println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/ipcclient");
 
+    // Shared-memory and ring-3 driver tests (user/memtest, user/uartdrv): selftest=mem.
+    let memtest = Path::new(&manifest).join("user/target/x86_64-unknown-oos/release/memtest");
+    let uartdrv = Path::new(&manifest).join("user/target/x86_64-unknown-oos/release/uartdrv");
+    if memtest.exists() && uartdrv.exists() {
+        println!("cargo:rustc-cfg=user_mem");
+        println!("cargo:rustc-env=OOS_USER_MEMTEST={}", memtest.display());
+        println!("cargo:rustc-env=OOS_USER_UARTDRV={}", uartdrv.display());
+    }
+    println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/memtest");
+    println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/uartdrv");
+
     // Declare custom cfg names so rustc doesn't warn about unexpected_cfgs
     println!("cargo::rustc-check-cfg=cfg(doom_wad_present)");
     println!("cargo::rustc-check-cfg=cfg(doom_supported)");
     println!("cargo::rustc-check-cfg=cfg(user_hello)");
     println!("cargo::rustc-check-cfg=cfg(user_ipc)");
+    println!("cargo::rustc-check-cfg=cfg(user_mem)");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=target/doom/libdoom.a");

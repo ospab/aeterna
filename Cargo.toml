@@ -24,6 +24,8 @@ ed25519-dalek = { version = "2", default-features = false }
 
 # oos-ui: software UI toolkit (gui/), used by the guidemo command
 oos-ui = { path = "gui" }
+# hello-gui: template GUI app (apps/hello-gui), launched from the desktop to prove SDK parity
+hello-gui = { path = "apps/hello-gui", default-features = false }
 
 [profile.release]
 panic = "abort"

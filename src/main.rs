@@ -70,13 +70,20 @@ macro_rules! boot_log {
     }};
 }
 
-/// A `[TAG] message` detail line on serial only.
+/// Kernel parameter `debug=1`: detail lines (`serial_line!`) also go to the screen.
+static DEBUG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A `[TAG] message` detail line on serial (and on screen with `debug=1`).
 macro_rules! serial_line {
     ($($arg:tt)+) => {{
         let mut l = LineBuf::new();
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($arg)+));
         serial::write_str(l.as_str());
         serial::write_str("\r\n");
+        if DEBUG.load(core::sync::atomic::Ordering::Relaxed) && framebuffer::is_initialized() {
+            framebuffer::draw_string(l.as_str(), COLOR_DIM, COLOR_BG);
+            framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+        }
     }};
 }
 
@@ -93,6 +100,15 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     ospab_os::arch::x86_64::init();
     boot_banner();
     klog::boot("AETERNA started");
+    if ospab_os::arch::x86_64::boot::cmdline_get("debug") == "1" {
+        DEBUG.store(true, core::sync::atomic::Ordering::Relaxed);
+        serial_line!("[DEBUG] verbose boot log on screen and serial, cmdline: {}",
+            ospab_os::arch::x86_64::boot::kernel_cmdline());
+    }
+    if ospab_os::arch::x86_64::boot::cmdline_get("persist") == "ro" {
+        ospab_os::fs::disk_sync::set_read_only(true);
+        boot_log!(Status::Info, "Persistence", "read-only (persist=ro): nothing is written to disk");
+    }
 
     let mhz = ospab_os::arch::x86_64::tsc::mhz();
     let apic = if ospab_os::arch::x86_64::apic::is_present() { ", APIC timer" } else { "" };
@@ -365,6 +381,13 @@ fn ring3_self_test() {
     // Every wait is bounded (10 s of uptime, task killed on expiry): a broken test fails, never hangs the boot.
     let wait_pid = |pid: u32| wait_pid_timeout(pid, 1000);
 
+    // Opt-in groups: kernel parameter selftest=ipc, selftest=mem, selftest=ipc,mem or selftest=all.
+    let selftest = |group: &str| {
+        ospab_os::arch::x86_64::boot::cmdline_get("selftest")
+            .split(',')
+            .any(|g| g == group || g == "all")
+    };
+
     boot_step("Ring 3 self-test");
     let frames_before = ospab_os::mm::physical::frames_free();
     let objects_before = ospab_os::core::object::live_objects();
@@ -428,7 +451,7 @@ fn ring3_self_test() {
     // Opt-in until the IPC path is proven: a hang here blocks every boot.
     #[cfg(user_ipc)]
     'ipc: {
-        if ospab_os::arch::x86_64::boot::cmdline_get("selftest") != "ipc" {
+        if !selftest("ipc") {
             serial_line!("[RING3] ipc tests: skipped (boot with selftest=ipc to run them)");
             break 'ipc;
         }
@@ -488,6 +511,127 @@ fn ring3_self_test() {
             }
         }
         check("ipc kill while blocked", killed_ok);
+    }
+
+    // Shared memory through handles (ROADMAP 12) and a ring-3 driver (ROADMAP 13).
+    // Opt-in: selftest=mem. The COM2 driver needs a second serial port in QEMU
+    // (-serial file:com1.log -serial file:com2.log); without one it reports "skipped".
+    #[cfg(user_mem)]
+    'mem: {
+        if !selftest("mem") {
+            serial_line!("[RING3] mem/driver tests: skipped (boot with selftest=mem to run them)");
+            break 'mem;
+        }
+        use ospab_os::core::object::{self, rights, resource};
+        use ospab_os::core::scheduler::{self, Capability, EXIT_KILLED};
+        static MEMTEST: &[u8] = include_bytes!(env!("OOS_USER_MEMTEST"));
+        static UARTDRV: &[u8] = include_bytes!(env!("OOS_USER_UARTDRV"));
+        let caps = || alloc::vec![Capability::Serial];
+        let spawn = |name: &str, image: &[u8], args: &[&str], handles: &[(object::ObjId, u32)]| {
+            ospab_os::core::elf::spawn_with_handles(name, image, args, caps(), handles).ok()
+        };
+        let settle = || {
+            for _ in 0..10 {
+                scheduler::sys_yield();
+            }
+        };
+        // Reap whatever earlier groups left behind first, so the baseline is exact.
+        settle();
+        let frames0 = ospab_os::mm::physical::frames_free();
+
+        // (a) Two processes share one region: RW and RO duplicates, live writes both ways.
+        let share = object::kernel_new_channel().and_then(|chan| {
+            let srv = spawn("memsrv", MEMTEST, &["memtest", "server"], &[(chan, rights::READ)])?;
+            // The server's handle keeps the channel alive for the second spawn.
+            let cli = spawn("memcli", MEMTEST, &["memtest", "client"], &[(chan, rights::WRITE)]);
+            Some((srv, cli))
+        });
+        match share {
+            Some((srv, Some(cli))) => {
+                let c = wait_pid_timeout(cli, 1500);
+                let s = wait_pid_timeout(srv, 500);
+                serial_line!("[RING3] mem share: client exit {:?}, server exit {:?}", c, s);
+                check("mem: two processes share a region", c == Some(0) && s == Some(42));
+            }
+            Some((srv, None)) => {
+                scheduler::exit_pid(srv);
+                check("mem: two processes share a region", false);
+            }
+            None => check("mem: two processes share a region", false),
+        }
+
+        // A read-only mapping: the write must end in #PF and the kernel killing the writer.
+        let ro_killed = object::kernel_new_memory(4096).and_then(|region| {
+            let page = object::kernel_memory_page(region, 0)?;
+            unsafe { core::ptr::write_volatile(page, 0x5A) };
+            let pid = spawn("memro", MEMTEST, &["memtest", "rowrite"], &[(region, rights::READ | rights::MAP)])?;
+            Some(wait_pid_timeout(pid, 500))
+        });
+        serial_line!("[RING3] mem read-only writer: exit {:?} (expected killed = {})", ro_killed, EXIT_KILLED);
+        check("mem: write to read-only map killed", ro_killed == Some(Some(EXIT_KILLED)));
+
+        // DMA: contiguous region with PHYS, only with a DMA Resource handle.
+        let dma = object::kernel_new_resource(resource::DMA).and_then(|res| {
+            let pid = spawn("memdma", MEMTEST, &["memtest", "contig"],
+                &[(res, rights::READ | rights::WRITE | rights::DUP)])?;
+            Some(wait_pid_timeout(pid, 500))
+        });
+        check("mem: contiguous DMA region + PHYS", dma == Some(Some(0)));
+
+        // MMIO: the local APIC page mapped read-only and uncached; the driver must read the
+        // same version register the kernel reads.
+        let apic_phys = {
+            let (lo, hi): (u32, u32);
+            unsafe { core::arch::asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+            (((hi as u64) << 32) | lo as u64) & 0x000F_FFFF_FFFF_F000
+        };
+        let hhdm = ospab_os::arch::x86_64::boot::hhdm_offset().unwrap_or(0);
+        let version = unsafe { core::ptr::read_volatile((hhdm + apic_phys + 0x30) as *const u32) };
+        let hex = alloc::format!("{:x}", version);
+        let mmio = object::kernel_new_mmio(apic_phys, 4096).and_then(|m| {
+            let pid = spawn("memmmio", MEMTEST, &["memtest", "mmio", hex.as_str()], &[(m, rights::READ | rights::MAP)])?;
+            Some(wait_pid_timeout(pid, 500))
+        });
+        check("mem: MMIO region (local APIC) mapped uncached", mmio == Some(Some(0)));
+
+        settle();
+        let leaked = frames0 as i64 - ospab_os::mm::physical::frames_free() as i64;
+        serial_line!("[RING3] mem frames: {} not returned after the mem tests", leaked);
+        check("mem: frames freed after unmap/exit", leaked == 0);
+
+        // (b) Ring-3 driver: COM2 through an IoPortRange and an Interrupt (IRQ 3).
+        let io = object::kernel_new_ioports(0x2F8, 8);
+        let irq = object::kernel_new_interrupt(3);
+        match (io, irq) {
+            (Some(io), Some(irq)) => {
+                let code = spawn("uartdrv", UARTDRV, &["uartdrv", "run"],
+                    &[(io, rights::READ | rights::WRITE), (irq, rights::READ | rights::WRITE)])
+                    .and_then(|pid| wait_pid_timeout(pid, 1500));
+                serial_line!("[RING3] uartdrv (COM2, IRQ 3): exit {:?}", code);
+                if code == Some(77) {
+                    serial_line!("[RING3] ring-3 COM2 driver: skipped (no COM2 in this machine)");
+                } else {
+                    check("ring-3 driver: COM2 I/O + IRQ notification", code == Some(0));
+                }
+            }
+            _ => {
+                if let Some(io) = io { object::kernel_release(io) }
+                if let Some(irq) = irq { object::kernel_release(irq) }
+                check("ring-3 driver: COM2 I/O + IRQ notification", false);
+            }
+        }
+        // I/O permission bitmap: a port next to the granted range, and a granted port that
+        // was never enabled, both end in #GP.
+        for mode in ["badport", "noperm"] {
+            let code = object::kernel_new_ioports(0x2F8, 8).and_then(|io| {
+                let pid = spawn("uartbad", UARTDRV, &["uartdrv", mode], &[(io, rights::READ | rights::WRITE)])?;
+                wait_pid_timeout(pid, 500)
+            });
+            serial_line!("[RING3] uartdrv {}: exit {:?}", mode, code);
+            check(if mode == "badport" { "ring-3 driver: port outside range killed" }
+                  else { "ring-3 driver: port without enable killed" },
+                  code == Some(EXIT_KILLED));
+        }
     }
 
     // Dead tasks are reaped lazily by the scheduler; give it a few ticks, then every

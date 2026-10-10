@@ -15,7 +15,7 @@ as console commands; a plain line like `free` is run directly.
 use core::arch::asm;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ospab_os::arch::x86_64::framebuffer;
+use ospab_os::plum::io::console as framebuffer;
 use ospab_os::arch::x86_64::keyboard;
 use ospab_os::klog;
 use ospab_os::{fs, acpi, axon};
@@ -123,6 +123,14 @@ pub fn run() -> ! {
     klog::record(klog::EventSource::Terminal, "Terminal started");
     ospab_os::core::syscall::set_console_stdout(true);
     init_clock();
+
+    // Kernel parameter session=desktop: start the graphical session; logging out returns to the console.
+    if ospab_os::arch::x86_64::boot::cmdline_get("session") == "desktop" {
+        ospab_os::axon::desktop::run_session();
+        framebuffer::clear(BG);
+        framebuffer::set_cursor_pos(0, 0);
+        print_banner();
+    }
 
     loop {
         draw_prompt();

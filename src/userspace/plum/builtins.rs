@@ -784,7 +784,7 @@ fn read(args: &[String]) -> i32 {
         Some(Some(l)) => l,
         Some(None) => return 1, // EOF
         None => {
-            if let Some(p) = &prompt { crate::arch::x86_64::framebuffer::draw_string(p, io::FG, io::BG); }
+            if let Some(p) = &prompt { io::console::draw_string(p, io::FG, io::BG); }
             match io::read_console_line() {
                 Some(l) => l,
                 None => return 130,

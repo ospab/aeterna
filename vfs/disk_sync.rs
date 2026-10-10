@@ -396,6 +396,13 @@ pub fn mark_dirty_at_tick() {
     LAST_DIRTY_TICK.store(t, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Kernel parameter `persist=ro`: the writable layer is read from disk but never written back.
+static READ_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_read_only(on: bool) {
+    READ_ONLY.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns true if the designated syncable RamFS has unflushed changes.
 #[inline]
 pub fn is_dirty() -> bool {
@@ -429,6 +436,15 @@ struct MedToken {
 /// Snapshot the current RamFS to disk.
 /// Returns true if written successfully.
 pub fn sync_filesystem() -> bool {
+    // Kernel parameter persist=ro: never write the saved layer (debug entry).
+    if READ_ONLY.load(core::sync::atomic::Ordering::Relaxed) {
+        static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::arch::x86_64::serial::write_str("[FS] persistence is read-only (persist=ro): not writing to disk\r\n");
+        }
+        LAST_DIRTY_TICK.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
     // Fast-path: nothing has changed since last flush.
     if !super::is_syncable_dirty() {
         return true;

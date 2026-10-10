@@ -1,0 +1,9 @@
+[package]
+name = "memtest"
+description = "Shared-memory self-test: MemoryRegion sharing, rights, DMA and MMIO regions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

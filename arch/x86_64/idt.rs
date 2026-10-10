@@ -660,6 +660,13 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
         return;
     }
 
+    // A line handed to a ring-3 driver (Interrupt object): masked and delivered as a
+    // notification; the driver unmasks it with irq_ack.
+    if crate::core::object::irq_fire(irq as u8) {
+        crate::arch::x86_64::pic::send_eoi(irq as u8);
+        return;
+    }
+
     match irq {
         0 => {
             // Timer interrupt - tick counter

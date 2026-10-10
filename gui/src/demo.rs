@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The reference desktop: Terminal, Settings and Files windows on the shell
-//! layer.  Used by the host PNG mockups (`examples/mockups.rs`) and by the
-//! in-OS `guidemo` command, so both show exactly the same pixels.
+//! The reference desktop for host mockups: static Terminal, Settings and Files
+//! windows driven through the real session loop, compositor and protocol.
+//! (The in-OS desktop runs live applications; see src/userspace/axon/desktop.)
 
-use alloc::format;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+
 use crate::color::Color;
-use crate::desktop::{Desktop, ShellAction};
-use crate::event::{Event, Key};
+use crate::desktop::{DockItem, ShellStatus};
 use crate::geom::{Insets, Rect};
 use crate::icons::Icon;
 use crate::menu::MenuItem;
+use crate::proto::WinId;
+use crate::session::Session;
 use crate::text::TextEngine;
 use crate::theme::Theme;
-use crate::ui::{Action, Align, Axis, BoxStyle, ButtonKind, Column, Length, ListItem, NodeId, Span, TextRole, Ui};
-use crate::window::Window;
+use crate::ui::{Align, Axis, BoxStyle, ButtonKind, Column, Length, ListItem, NodeId, Span, TextRole, Ui};
+use crate::window::{AppEvent, Client, ClientWindow, Cx};
 
 pub const TERMINAL: usize = 0;
 pub const SETTINGS: usize = 1;
@@ -43,17 +45,6 @@ pub struct FilesIds {
     pub search: NodeId,
     pub list: NodeId,
     pub status: NodeId,
-}
-
-pub struct Demo {
-    pub desktop: Desktop,
-    pub settings: SettingsIds,
-    pub files: FilesIds,
-    pub term: NodeId,
-    term_lines: Vec<Vec<Span>>,
-    term_input: String,
-    path: Vec<String>,
-    saved_name: String,
 }
 
 const TERM_BG: Color = Color::hex(0x0E0F11);
@@ -238,170 +229,72 @@ fn build_files(theme: &Theme) -> (Ui, FilesIds) {
     (ui, FilesIds { back, forward, path, search, list, status })
 }
 
-impl Demo {
-    pub fn new(width: i32, height: i32, text: &mut TextEngine, theme: &Theme) -> Demo {
-        let mut d = Desktop::new(width, height);
-        d.launcher_items = vec![
-            MenuItem::new("Terminal").icon(Icon::Terminal).shortcut("Ctrl T"),
-            MenuItem::new("Files").icon(Icon::Folder),
-            MenuItem::new("Settings").icon(Icon::Settings).shortcut("Ctrl ,"),
-            MenuItem::separator(),
-            MenuItem::new("About ospab.os").icon(Icon::Info),
-            MenuItem::separator(),
-            MenuItem::new("Restart…").icon(Icon::Power).disabled(),
-            MenuItem::new("Shut down…").disabled(),
-        ];
-        d.set_clock("Сб 10 окт.  14:32", theme);
-
-        // Positions are relative to a 1280x800 layout and scaled to fit.
-        let sx = |x: i32| x * width / 1280;
-        let sy = |y: i32| y * height / 800;
-        let lines = terminal_lines(theme);
-        let n = lines.len();
-        let (tui, term) = build_terminal(theme, lines.clone());
-        let (sui, settings) = build_settings(theme);
-        let (fui, files) = build_files(theme);
-        let mut tw = Window::new("Terminal — plum", Icon::Terminal, Rect::new(sx(250), sy(330), 720.min(width - 20), 400.min(height - 60)), tui);
-        tw.ui.set_terminal(term, lines.clone(), Some((n - 1, 17)));
-        d.add_window(tw);
-        d.add_window(Window::new("Settings", Icon::Settings, Rect::new(sx(80), sy(64), 700.min(width - 20), 500.min(height - 60)), sui));
-        d.add_window(Window::new("Files", Icon::Folder, Rect::new(sx(610), sy(140), 620.min(width - 20), 440.min(height - 60)), fui));
-        // Stack: Settings at the back, Files, then the focused Terminal.
-        d.order = vec![SETTINGS, FILES, TERMINAL];
-        d.focus_window(TERMINAL, text, theme);
-        d.cursor = crate::geom::Point::new(sx(700), sy(250));
-        Demo {
-            desktop: d, settings, files, term, term_lines: lines, term_input: String::new(),
-            path: vec!["/home/ospab/projects".into()], saved_name: "aeterna".into(),
-        }
-    }
-
-    pub fn open_launcher(&mut self, text: &mut TextEngine, theme: &Theme) {
-        let (x, y) = (20, 10);
-        self.desktop.handle(&Event::PointerMove { x, y }, text, theme);
-        self.desktop.handle(&Event::PointerDown { x, y, button: crate::event::MouseButton::Left }, text, theme);
-    }
-
-    fn term_refresh(&mut self, theme: &Theme) {
-        let mut lines = self.term_lines.clone();
-        let last = lines.len() - 1;
-        lines[last] = prompt(theme, &self.term_input);
-        let col = 17 + self.term_input.chars().count();
-        self.desktop.windows[TERMINAL].ui.set_terminal(self.term, lines, Some((last, col)));
-    }
-
-    /// Route an input event (screen coordinates).
-    pub fn handle(&mut self, ev: &Event, text: &mut TextEngine, theme: &Theme) {
-        if let Event::KeyDown { key, text: ch, .. } = *ev {
-            if self.desktop.focused() == Some(TERMINAL) {
-                match key {
-                    Key::Backspace => { self.term_input.pop(); }
-                    Key::Enter => {
-                        let cmd = core::mem::take(&mut self.term_input);
-                        let last = self.term_lines.len() - 1;
-                        self.term_lines[last] = prompt(theme, &cmd);
-                        if !cmd.trim().is_empty() {
-                            let c = &theme.color;
-                            self.term_lines.push(vec![sp("guidemo: ", c.text_secondary), sp(&format!("“{}” would run in plum — press Esc to return to the console", cmd.trim()), c.text)]);
-                        }
-                        self.term_lines.push(prompt(theme, ""));
-                        if self.term_lines.len() > 200 { self.term_lines.remove(0); }
-                    }
-                    _ => {
-                        if let Some(c) = ch { if !c.is_control() && self.term_input.len() < 60 { self.term_input.push(c); } }
-                    }
-                }
-                self.term_refresh(theme);
-                return;
-            }
-        }
-        self.desktop.handle(ev, text, theme);
-    }
-
-    fn process_actions(&mut self, text: &mut TextEngine, theme: &Theme) {
-        for a in core::mem::take(&mut self.desktop.actions) {
-            let ShellAction::Launch(i) = a;
-            match i {
-                0 => self.desktop.focus_window(TERMINAL, text, theme),
-                1 => self.desktop.focus_window(FILES, text, theme),
-                2 => self.desktop.focus_window(SETTINGS, text, theme),
-                _ => {}
-            }
-        }
-        let s = &self.settings;
-        let acts = self.desktop.windows[SETTINGS].ui.drain_actions();
-        for a in acts {
-            let ui = &mut self.desktop.windows[SETTINGS].ui;
-            match a {
-                Action::Clicked(id) if id == s.apply => {
-                    self.saved_name = String::from(ui.text(s.device));
-                    let msg = format!("Saved · device is now “{}”", self.saved_name);
-                    ui.set_text(s.status, &msg);
-                    ui.set_label_color(s.status, Some(theme.color.success));
-                }
-                Action::Clicked(id) if id == s.revert => {
-                    let name = self.saved_name.clone();
-                    ui.set_text(s.device, &name);
-                    ui.set_checked(s.ostp, true);
-                    ui.set_checked(s.updates, false);
-                    ui.set_checked(s.motion, false);
-                    ui.set_checked(s.seconds, false);
-                    ui.set_text(s.status, "Reverted");
-                    ui.set_label_color(s.status, None);
-                }
-                Action::Toggled(..) | Action::TextChanged(_) => {
-                    ui.set_text(s.status, "Unsaved changes");
-                    ui.set_label_color(s.status, Some(theme.color.warning));
-                }
-                Action::Submitted(id) if id == s.device => {
-                    self.saved_name = String::from(ui.text(s.device));
-                    ui.set_text(s.status, "Saved");
-                    ui.set_label_color(s.status, Some(theme.color.success));
-                }
-                Action::Selected(id, i) if id == s.sidebar => {
-                    const NAMES: [&str; 7] = ["General", "Display", "Network", "Sound", "Keyboard", "Privacy", "About"];
-                    ui.set_text(s.headline, NAMES[i.min(6)]);
-                }
-                _ => {}
-            }
-        }
-        let f = &self.files;
-        let acts = self.desktop.windows[FILES].ui.drain_actions();
-        for a in acts {
-            let ui = &mut self.desktop.windows[FILES].ui;
-            match a {
-                Action::Activated(id, i) if id == f.list => {
-                    let e = &FILES_HOME[i.min(FILES_HOME.len() - 1)];
-                    if e.icon == Icon::Folder {
-                        let p = format!("{}/{}", self.path.last().unwrap(), e.name);
-                        ui.set_text(f.path, &p);
-                        self.path.push(p);
-                    } else {
-                        let msg = format!("{}  ·  {}", e.name, e.size);
-                        ui.set_text(f.status, &msg);
-                    }
-                }
-                Action::Selected(id, i) if id == f.list => {
-                    let e = &FILES_HOME[i.min(FILES_HOME.len() - 1)];
-                    let msg = format!("“{}” selected  ·  16 items  ·  2.1 GB free", e.name);
-                    ui.set_text(f.status, &msg);
-                }
-                Action::Clicked(id) if id == f.back => {
-                    if self.path.len() > 1 { self.path.pop(); }
-                    let p = self.path.last().unwrap().clone();
-                    ui.set_text(f.path, &p);
-                }
-                _ => {}
-            }
-        }
-        let _ = self.desktop.windows[TERMINAL].ui.drain_actions();
-    }
-
-    /// Advance time, apply application logic and composite. Returns the
-    /// screen rectangles to present.
-    pub fn frame(&mut self, now_ms: u64, text: &mut TextEngine, theme: &Theme) -> Vec<Rect> {
-        self.desktop.tick(now_ms, theme);
-        self.process_actions(text, theme);
-        self.desktop.render(text, theme)
-    }
+/// A window with static content (closes on request).
+pub struct UiApp {
+    pub win: ClientWindow,
 }
+
+impl Client for UiApp {
+    fn window_mut(&mut self, id: WinId) -> Option<&mut ClientWindow> { if id == self.win.id { Some(&mut self.win) } else { None } }
+    fn window_ids(&self) -> Vec<WinId> { if self.win.destroyed { Vec::new() } else { vec![self.win.id] } }
+    fn update(&mut self, _id: WinId, events: &[AppEvent], cx: &mut Cx) {
+        for e in events {
+            if *e == AppEvent::CloseRequested { self.win.destroy(cx.out); }
+        }
+    }
+    fn alive(&self) -> bool { !self.win.destroyed }
+}
+
+pub fn dock_items() -> Vec<DockItem> {
+    let d = |n: &str, i: Icon, r: bool| DockItem { name: n.into(), icon: i, running: r };
+    vec![d("Terminal", Icon::Terminal, true), d("Files", Icon::Folder, true), d("Editor", Icon::FileCode, false),
+         d("Settings", Icon::Settings, true), d("DOOM", Icon::Grid, false)]
+}
+
+pub fn launcher_items() -> Vec<MenuItem> {
+    vec![
+        MenuItem::new("Terminal").icon(Icon::Terminal),
+        MenuItem::new("Files").icon(Icon::Folder),
+        MenuItem::new("Text Editor").icon(Icon::FileCode),
+        MenuItem::new("Settings").icon(Icon::Settings),
+        MenuItem::new("DOOM").icon(Icon::Grid),
+        MenuItem::separator(),
+        MenuItem::new("About ospab.os").icon(Icon::Info),
+        MenuItem::new("Log out").icon(Icon::Power),
+    ]
+}
+
+/// Build the mockup session at `width`x`height` (designed for 1280x800).
+pub fn build_session(width: i32, height: i32, text: &mut TextEngine, theme: &Theme) -> (Session, [WinId; 3]) {
+    let mut s = Session::new(width, height);
+    s.desktop.dock = dock_items();
+    s.desktop.launcher_items = launcher_items();
+    s.desktop.set_status(ShellStatus { clock: "Сб 10 окт.  14:32".into(), net: "10.0.2.15".into(), net_up: true, ostp: true, volume: Some(70) }, theme);
+    let lines = terminal_lines(theme);
+    let n = lines.len();
+    let (mut tui, term) = build_terminal(theme, lines.clone());
+    tui.set_terminal(term, lines, Some((n - 1, 17)));
+    let (sui, _) = build_settings(theme);
+    let (fui, _) = build_files(theme);
+    let mut out = VecDeque::new();
+    let sw = ClientWindow::new(&mut out, "Settings", Icon::Settings, 700, 500, (480, 320), true, sui);
+    let fw = ClientWindow::new(&mut out, "Files", Icon::Folder, 620, 440, (360, 240), true, fui);
+    let tw = ClientWindow::new(&mut out, "Terminal — plum", Icon::Terminal, 720, 400, (360, 200), true, tui);
+    let ids = [tw.id, sw.id, fw.id];
+    s.add_app(Box::new(UiApp { win: sw }), VecDeque::new());
+    s.add_app(Box::new(UiApp { win: fw }), VecDeque::new());
+    s.add_app(Box::new(UiApp { win: tw }), out);
+    s.pump(0, text, theme);
+    let sx = |x: i32| x * width / 1280;
+    let sy = |y: i32| y * height / 800;
+    let place = [(ids[0], sx(250), sy(318)), (ids[1], sx(80), sy(58)), (ids[2], sx(610), sy(128))];
+    for (id, x, y) in place {
+        if let Some(w) = s.desktop.windows.iter_mut().find(|w| w.id == id) { w.rect.x = x; w.rect.y = y; }
+    }
+    s.desktop.invalidate_all();
+    s.desktop.cursor = crate::geom::Point::new(sx(700), sy(250));
+    (s, ids)
+}
+
+#[allow(dead_code)]
+fn _unused(_: Rect) {}

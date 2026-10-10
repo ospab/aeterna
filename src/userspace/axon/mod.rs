@@ -28,6 +28,7 @@ use crate::fs;
 use crate::userspace::plum;
 use crate::userspace::plum::io;
 
+pub mod desktop;
 pub mod disk_tools;
 pub mod guidemo;
 pub mod lspci;
@@ -116,6 +117,7 @@ pub fn run(name: &str, args: &[String]) -> bool {
         "nslookup" => net_tools::cmd_nslookup(&joined()),
         "lspci" => lspci::run(&joined()),
         "guidemo" => guidemo::run(&joined()),
+        "desktop" => desktop::run(&joined()),
         "fdisk" => disk_tools::run_fdisk(&joined()),
         "lsblk" => disk_tools::run_lsblk(&joined()),
         "mkfs" => disk_tools::run_mkfs(&joined()),
@@ -135,7 +137,7 @@ pub fn command_list() -> &'static [&'static str] {
         "find", "tee", "wc", "head", "tail", "grep", "egrep", "sort", "uniq", "cut", "tr", "rev",
         "nl", "xxd", "diff", "awk", "basename", "dirname", "seq", "yes", "printf", "xargs",
         "sleep", "ps", "top", "kill", "netstat", "ping", "traceroute", "ip", "curl", "nslookup",
-        "lspci", "fdisk", "lsblk", "mkfs", "mount", "ostp", "clip",
+        "lspci", "desktop", "fdisk", "lsblk", "mkfs", "mount", "ostp", "clip",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }

@@ -105,6 +105,9 @@ pub struct TaskControlBlock {
     pub ipc_wait: u32,
     /// Timer tick at which a Waiting task wakes up on its own; 0 = no deadline.
     pub wake_at: u64,
+    /// I/O permission bitmap (bit set = denied) for the ports this process enabled through
+    /// IoPortRange handles; loaded into the TSS when it is switched in. Empty = no ports.
+    pub io_bitmap: alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +180,7 @@ pub fn init() {
             handles: crate::core::object::HandleTable::new(),
             ipc_wait: 0,
             wake_at: 0,
+            io_bitmap: alloc::vec::Vec::new(),
         });
         CURRENT_SLOT = 0;
         NEXT_PID = 1;
@@ -292,6 +296,7 @@ pub fn spawn_named(
                     handles: crate::core::object::HandleTable::new(),
                     ipc_wait: 0,
                     wake_at: 0,
+                    io_bitmap: alloc::vec::Vec::new(),
                 });
                 return Some(pid);
             }
@@ -369,6 +374,7 @@ pub fn spawn_user_task(
                     handles: crate::core::object::HandleTable::new(),
                     ipc_wait: 0,
                     wake_at: 0,
+                    io_bitmap: alloc::vec::Vec::new(),
                 });
                 return Some(pid);
             }
@@ -786,6 +792,17 @@ pub fn set_ipc_wait(v: u32) {
     }
 }
 
+/// Replace the running task's I/O permission bitmap and load it into the TSS now.
+/// Interrupts must be off (syscall path).
+pub fn set_current_io_bitmap(bm: alloc::vec::Vec<u8>) {
+    unsafe {
+        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
+            t.io_bitmap = bm;
+            crate::arch::x86_64::gdt_simple::load_io_bitmap(t.pid, &t.io_bitmap, true);
+        }
+    }
+}
+
 /// Like `wait_pid`, but gives up after `ticks` (100 Hz) and kills the task, so a broken
 /// test cannot hang the boot. Returns None on timeout.
 pub fn wait_pid_timeout(pid: TaskId, ticks: u64) -> Option<i64> {
@@ -889,6 +906,8 @@ pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
             if next.kstack_top != 0 {
                 crate::arch::x86_64::gdt_simple::set_tss_rsp0(next.kstack_top);
                 crate::core::syscall::set_kernel_stack(next.kstack_top);
+                // Ring-3 task: its own I/O permissions (none for most tasks).
+                crate::arch::x86_64::gdt_simple::load_io_bitmap(next.pid, &next.io_bitmap, false);
             }
 
             if fx_area.is_null() {

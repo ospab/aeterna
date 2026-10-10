@@ -70,6 +70,56 @@ struct Frame {
 }
 
 static mut STACK: Vec<Frame> = Vec::new();
+
+/// Where "screen" output goes instead of the framebuffer console (the
+/// desktop's terminal window installs this while it runs a command).
+/// The text may contain '\n', '\r', '\x08' (backspace) and '\x0c' (clear).
+static mut SCREEN_HOOK: Option<fn(&str, u32)> = None;
+static mut HOOK_COLS: u64 = 80;
+static mut HOOK_ROWS: u64 = 25;
+
+/// Install or remove the screen hook; `cols`/`rows` is the hooked screen size.
+pub fn set_screen_hook(hook: Option<fn(&str, u32)>, cols: u64, rows: u64) {
+    unsafe {
+        SCREEN_HOOK = hook;
+        HOOK_COLS = cols.max(1);
+        HOOK_ROWS = rows.max(1);
+    }
+}
+
+pub fn screen_hooked() -> bool { unsafe { SCREEN_HOOK.is_some() } }
+
+/// Framebuffer-compatible console API that honours the screen hook.
+/// Callers that print straight to the framebuffer import this instead
+/// (`use ...::plum::io::console as framebuffer;`).
+pub mod console {
+    pub use crate::arch::x86_64::framebuffer::*;
+    use crate::arch::x86_64::framebuffer as fb;
+
+    fn hook() -> Option<fn(&str, u32)> { unsafe { super::SCREEN_HOOK } }
+
+    pub fn draw_string(s: &str, fg: u32, bg: u32) {
+        match hook() { Some(h) => h(s, fg), None => fb::draw_string(s, fg, bg) }
+    }
+    pub fn draw_char(c: char, fg: u32, bg: u32) {
+        match hook() {
+            Some(h) => { let mut b = [0u8; 4]; h(c.encode_utf8(&mut b), fg) }
+            None => fb::draw_char(c, fg, bg),
+        }
+    }
+    pub fn clear(color: u32) {
+        match hook() { Some(h) => h("\x0c", 0), None => fb::clear(color) }
+    }
+    pub fn clear_to_eol(bg: u32) {
+        if hook().is_none() { fb::clear_to_eol(bg) }
+    }
+    pub fn screen_cols() -> u64 {
+        if hook().is_some() { unsafe { super::HOOK_COLS } } else { fb::screen_cols() }
+    }
+    pub fn screen_rows() -> u64 {
+        if hook().is_some() { unsafe { super::HOOK_ROWS } } else { fb::screen_rows() }
+    }
+}
 /// Set when a command wrote to stderr (used as a default non-zero status).
 static mut ERR_WRITTEN: bool = false;
 /// Explicit status set by the running command.
@@ -151,6 +201,11 @@ fn screen_write(s: &str, color: u32) {
 }
 
 fn screen_write_raw(s: &str, color: u32) {
+    // Desktop session: the terminal window receives console output.
+    if let Some(h) = unsafe { SCREEN_HOOK } {
+        h(s, color);
+        return;
+    }
     // Expand tabs to the next multiple of 8 columns; the font has no tab glyph.
     if !s.contains('\t') {
         framebuffer::draw_string(s, color, BG);
@@ -363,15 +418,18 @@ pub fn read_console_line() -> Option<String> {
         };
         match ch {
             '\n' | '\r' => {
-                framebuffer::draw_char('\n', FG, BG);
+                console::draw_char('\n', FG, BG);
                 return Some(line);
             }
             '\x03' => {
-                framebuffer::draw_string("^C\n", FG_DIM, BG);
+                console::draw_string("^C\n", FG_DIM, BG);
                 return None;
             }
             '\x08' => {
-                if line.pop().is_some() {
+                let popped = line.pop().is_some();
+                if popped && screen_hooked() {
+                    console::draw_string("\x08", FG, BG);
+                } else if popped {
                     let (x, y) = framebuffer::cursor_pos();
                     if x >= framebuffer::CHAR_WIDTH {
                         let nx = x - framebuffer::CHAR_WIDTH;
@@ -383,7 +441,7 @@ pub fn read_console_line() -> Option<String> {
             }
             c if (c as u32) >= 0x20 && (c as u32) < 0x7F => {
                 line.push(c);
-                framebuffer::draw_char(c, FG, BG);
+                console::draw_char(c, FG, BG);
             }
             _ => {}
         }

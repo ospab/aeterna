@@ -10,7 +10,7 @@
 extern crate alloc;
 use alloc::format;
 
-use crate::arch::x86_64::framebuffer;
+use crate::userspace::plum::io::console as framebuffer;
 
 const FG: u32     = 0x00FFFFFF;
 const FG_OK: u32  = 0x0000FF00;

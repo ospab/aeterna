@@ -1,0 +1,9 @@
+name = "hello-gui"
+version = "0.1.0"
+description = "Template GUI application (oos-ui application API)"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/hello-gui"
+dest = "/usr/bin/hello-gui"

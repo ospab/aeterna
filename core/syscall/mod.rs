@@ -65,32 +65,17 @@ pub enum SyscallNumber {
     Uptime = 51,
     /// Get task list metadata
     GetTasks = 52,
-    /// I/O port read (port, size)
-    IopIn = 60,
-    /// I/O port write (port, size, value)
-    IopOut = 61,
-    /// Wait for an interrupt (irq_num)
-    IrqWait = 62,
     /// Delegate a capability to another process (target_pid, cap_id)
     CapDelegate = 70,
     /// Bind process to a specific Memory Execution Domain (med_id)
     MedAssign = 80,
 
-    /// Register current process as a VFS server for a mount point (path_ptr, path_len)
-    VfsRegister = 100,
-
     /// Detach kernel driver from a device (dev_id: 0=RTL8139)
     DevDetach = 110,
 
-    /// Create a new IPC channel (returns channel_id)
-    SmrCreate = 120,
-    /// Send a descriptor to a channel (channel_id, phys_addr, length)
-    SmrSend = 121,
-    /// Receive a descriptor from a channel (channel_id) -> (phys_addr, length)
-    SmrRecv = 122,
-
-    /// Allocate physically contiguous DMA buffer (size_bytes, alignment)
-    DmaAlloc = 130,
+    /// Kernel objects, IPC, memory regions, interrupts, I/O ports: 200..=253,
+    /// see docs/en/syscall-abi.md (dispatched from DISPATCH_TABLE).
+    HandleClose = 200,
 }
 
 /// Syscall result codes
@@ -179,18 +164,13 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (50, |a| syscall_sysinfo(a.arg1, a.arg2, a.arg3)),
     (51, |_| syscall_uptime()),
     (52, |_| syscall_get_tasks()),
-    (60, |a| syscall_ioport_in(a.arg1, a.arg2)),
-    (61, |a| syscall_ioport_out(a.arg1, a.arg2, a.arg3)),
-    (62, |a| syscall_irq_wait(a.arg1)),
+    // 60/61/62 (raw port I/O, irq_wait), 100 (vfs_register), 120-122 (SMR with raw
+    // physical addresses) and 130 (dma_alloc returning a physical address) are gone:
+    // ring 3 gets hardware and shared memory only through handles (240-253 below).
     (70, |a| syscall_cap_delegate(a.arg1, a.arg2)),
     (80, |a| syscall_med_assign(a.arg1)),
-    (100, |a| syscall_vfs_register(a.arg1, a.arg2)),
     (110, |a| syscall_dev_detach(a.arg1)),
-    (120, |a| syscall_smr_create(a.arg1)),
-    (121, |a| syscall_smr_send(a.arg1, a.arg2, a.arg3)),
-    (122, |a| syscall_smr_recv(a.arg1)),
-    (130, |a| syscall_dma_alloc(a.arg1, a.arg2)),
-    // Kernel objects and handles (docs/SYSCALL-ABI.md)
+    // Kernel objects and handles (docs/en/syscall-abi.md)
     (200, |a| objects::handle_close(a.arg1)),
     (201, |a| objects::handle_dup(a.arg1, a.arg2)),
     (202, |a| objects::handle_info(a.arg1)),
@@ -206,6 +186,16 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (231, |_| objects::thread_self()),
     (232, |a| objects::process_wait(a.arg1, a.arg2, a.arg3)),
     (233, |a| objects::process_kill(a.arg1)),
+    (240, |a| objects::mem_create(a.arg1)),
+    (241, |a| objects::mem_map(a.arg1, a.arg2, a.arg3)),
+    (242, |a| objects::mem_unmap(a.arg1)),
+    (243, |a| objects::mem_create_contig(a.arg1, a.arg2)),
+    (244, |a| objects::mem_phys(a.arg1)),
+    (245, |a| objects::mem_size(a.arg1)),
+    (250, |a| objects::irq_bind(a.arg1, a.arg2, a.arg3)),
+    (251, |a| objects::irq_ack(a.arg1)),
+    (252, |a| objects::ioport_enable(a.arg1)),
+    (253, |a| objects::ioport_disable(a.arg1)),
 ];
 
 /// Dispatch a syscall by looking up the number in the dispatch table
@@ -734,57 +724,6 @@ fn unmap_user_pages(cr3: u64, base: u64, pages: u64) -> u64 {
     freed
 }
 
-fn syscall_ioport_in(port: u64, size: u64) -> i64 {
-    if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) {
-        return SyscallError::PermissionDenied as i64;
-    }
-    
-    unsafe {
-        match size {
-            1 => {
-                let val: u8;
-                core::arch::asm!("in al, dx", out("al") val, in("dx") port as u16);
-                val as i64
-            }
-            2 => {
-                let val: u16;
-                core::arch::asm!("in ax, dx", out("ax") val, in("dx") port as u16);
-                val as i64
-            }
-            4 => {
-                let val: u32;
-                core::arch::asm!("in eax, dx", out("eax") val, in("dx") port as u16);
-                val as i64
-            }
-            _ => SyscallError::InvalidArgument as i64
-        }
-    }
-}
-
-fn syscall_ioport_out(port: u64, size: u64, val: u64) -> i64 {
-    if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) {
-        return SyscallError::PermissionDenied as i64;
-    }
-
-    unsafe {
-        match size {
-            1 => {
-                core::arch::asm!("out dx, al", in("dx") port as u16, in("al") val as u8);
-                0
-            }
-            2 => {
-                core::arch::asm!("out dx, ax", in("dx") port as u16, in("ax") val as u16);
-                0
-            }
-            4 => {
-                core::arch::asm!("out dx, eax", in("dx") port as u16, in("eax") val as u32);
-                0
-            }
-            _ => SyscallError::InvalidArgument as i64
-        }
-    }
-}
-
 // Helper
 fn serial_dec(mut val: u64) {
     if val == 0 {
@@ -824,16 +763,6 @@ fn syscall_cap_delegate(target_pid: u64, cap_id: u64) -> i64 {
     }
 }
 
-fn syscall_irq_wait(_irq_num: u64) -> i64 {
-    if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) {
-        return SyscallError::PermissionDenied as i64;
-    }
-    // In Phase 5, this blocks the caller until the IRQ is received by the kernel.
-    // For this simulation, we yield.
-    crate::core::scheduler::sys_yield();
-    0
-}
-
 fn syscall_med_assign(med_id: u64) -> i64 {
     // Requires CapSystem or CapMemHuge
     if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::System) &&
@@ -846,37 +775,6 @@ fn syscall_med_assign(med_id: u64) -> i64 {
     0
 }
 
-fn syscall_vfs_register(path_ptr: u64, path_len: u64) -> i64 {
-    if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::VfsServer) &&
-       !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::System) {
-        return SyscallError::PermissionDenied as i64;
-    }
-
-    let path = match crate::mm::usercopy::read_user_str(path_ptr, path_len as usize, MAX_PATH) {
-        Ok(s) => s,
-        Err(e) => return SyscallError::from(e) as i64,
-    };
-    let path = path.as_str();
-
-    crate::arch::x86_64::serial::write_str("[VFS] Registering userspace server at ");
-    crate::arch::x86_64::serial::write_str(path);
-    crate::arch::x86_64::serial::write_str("\r\n");
-
-    let current_pid = crate::core::scheduler::current_pid();
-
-    // Allocate an SMR channel for VFS IPC
-    let channel_id = crate::core::ipc::userspace_ipc::create_channel(current_pid);
-    if channel_id == 0 {
-        return SyscallError::OutOfMemory as i64;
-    }
-
-    crate::fs::register_userspace_fs(path, current_pid, channel_id);
-    crate::core::scheduler::set_is_vfs_server(true);
-    
-    // Return channel_id so the server can start polling it
-    channel_id as i64
-}
-
 fn syscall_dev_detach(dev_id: u64) -> i64 {
     if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) {
         return SyscallError::PermissionDenied as i64;
@@ -887,65 +785,4 @@ fn syscall_dev_detach(dev_id: u64) -> i64 {
         crate::drivers::nvme::detach();
     }
     0
-}
-
-fn serial_hex(mut val: u64) {
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut buf = [0u8; 16];
-    let mut i = 0;
-    if val == 0 { crate::arch::x86_64::serial::write_byte(b'0'); return; }
-    while val > 0 {
-        buf[i] = HEX[(val & 0xF) as usize];
-        val >>= 4;
-        i += 1;
-    }
-    for j in (0..i).rev() {
-        crate::arch::x86_64::serial::write_byte(buf[j]);
-    }
-}
-
-// ─── SMR IPC Syscalls ────────────────────────────────────────────────────────
-
-fn syscall_smr_create(_flags: u64) -> i64 {
-    let pid = crate::core::scheduler::current_pid();
-    let id = crate::core::ipc::userspace_ipc::create_channel(pid);
-    if id == 0 {
-        SyscallError::OutOfMemory as i64
-    } else {
-        id as i64
-    }
-}
-
-fn syscall_smr_send(channel_id: u64, phys_addr: u64, length: u64) -> i64 {
-    crate::core::ipc::userspace_ipc::send_to_channel(channel_id as u32, phys_addr, length)
-}
-
-fn syscall_smr_recv(channel_id: u64) -> i64 {
-    let (addr, _len) = crate::core::ipc::userspace_ipc::recv_from_channel(channel_id as u32);
-    addr as i64
-}
-
-// ─── DMA Allocation Syscall ──────────────────────────────────────────────────
-
-fn syscall_dma_alloc(size_bytes: u64, _alignment: u64) -> i64 {
-    if !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::Device) &&
-       !crate::core::scheduler::has_capability(crate::core::scheduler::Capability::System) {
-        return SyscallError::PermissionDenied as i64;
-    }
-
-    let frames = (size_bytes + 4095) / 4096;
-    match crate::mm::physical::alloc_frames(frames) {
-        Some(phys) => {
-            crate::arch::x86_64::serial::write_str("[DMA] Allocated ");
-            serial_dec(frames);
-            crate::arch::x86_64::serial::write_str(" frames at phys 0x");
-            serial_hex(phys);
-            crate::arch::x86_64::serial::write_str("\r\n");
-            let current_pid = crate::core::scheduler::current_pid();
-            crate::core::scheduler::add_memory_usage(current_pid, frames * 4096);
-
-            phys as i64
-        }
-        None => SyscallError::OutOfMemory as i64,
-    }
 }

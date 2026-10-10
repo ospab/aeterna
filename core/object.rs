@@ -15,9 +15,28 @@ Objects (all reference-counted, one reference per handle or in-flight message):
   Notification  32-bit signal word; signal ORs bits in, wait blocks and takes them
   Reply         one-shot right to answer one caller, created by `call`, handed to the
                 receiver by `recv`; if it is dropped unused the caller gets PeerClosed
+  MemoryRegion  a set of physical frames (anonymous, or physically contiguous for DMA)
+                that can be mapped into any process holding a handle with MAP
+  MmioRegion    a device physical range (BAR); mapped uncached, never freed
+  Interrupt     an IRQ line; each interrupt masks the line and signals a Notification,
+                the driver unmasks it again with irq_ack
+  IoPortRange   x86 I/O ports [base, base+count); enabling it sets bits in the
+                process's I/O permission bitmap (loaded into the TSS on switch)
+  Resource      authority to create special objects (DMA: contiguous regions with a
+                known physical address)
 
 Rights: READ (receive / wait / inspect), WRITE (call, send, signal / kill, reply),
-DUP (may be duplicated), TRANSFER (may be moved to another process in a message).
+DUP (may be duplicated), TRANSFER (may be moved to another process in a message),
+MAP (memory may be mapped), EXEC (memory may be mapped executable), PHYS (the
+physical address of a memory object may be read).
+
+Mappings and enabled I/O ranges hold a reference of their own, like a handle: a region
+stays alive (and its frames allocated) until the last handle is closed AND the last
+mapping is unmapped. Process exit drops both.
+
+Interrupt, IoPortRange, MmioRegion and Resource objects are created only by the kernel
+(`kernel_new_*`, the boot-time spawner / future seed) and reach drivers as bootstrap
+handles (`core::elf::spawn_with_handles`).
 
 Blocking never spins: the caller is marked Waiting, put on the object's wait list and the
 CPU halts; the other side wakes it. All entry points run with interrupts disabled (syscall
@@ -43,9 +62,39 @@ pub mod rights {
     pub const WRITE: u32 = 2;
     pub const DUP: u32 = 4;
     pub const TRANSFER: u32 = 8;
+    /// The four generic rights (what `channel_create`, `process_self`, ... hand out).
     pub const ALL: u32 = 15;
+    /// Memory: may be mapped (READ is needed for any mapping, WRITE for a writable one).
+    pub const MAP: u32 = 16;
+    /// Memory: may be mapped executable. Not handed out by any syscall yet.
+    pub const EXEC: u32 = 32;
+    /// Memory: the physical address may be read (`mem_phys`). Only for DMA regions.
+    pub const PHYS: u32 = 64;
+    /// Every defined bit.
+    pub const VALID: u32 = 127;
 }
 use rights::*;
+
+/// Protection requested by `mem_map`.
+pub mod prot {
+    pub const READ: u32 = 1;
+    pub const WRITE: u32 = 2;
+    pub const EXEC: u32 = 4;
+}
+
+/// Kinds of `Resource` objects (bit flags).
+pub mod resource {
+    /// May create physically contiguous regions with a known physical address.
+    pub const DMA: u32 = 1;
+}
+
+/// Largest anonymous region (`mem_create`).
+pub const MEM_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest physically contiguous region (`mem_create_contig`).
+pub const MEM_CONTIG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// IRQ lines a driver may own. The rest belong to kernel drivers (timer, keyboard,
+/// cascade, debug serial COM1, NIC/audio lines 5/7/9-11, mouse, ATA).
+const IRQ_ASSIGNABLE: [u8; 3] = [3, 6, 8];
 
 pub const MSG_DATA_MAX: usize = 128;
 pub const MSG_HANDLES_MAX: usize = 4;
@@ -63,6 +112,11 @@ pub enum ObjType {
     Channel = 3,
     Notification = 4,
     Reply = 5,
+    MemoryRegion = 6,
+    MmioRegion = 7,
+    Interrupt = 8,
+    IoPortRange = 9,
+    Resource = 10,
 }
 
 /// A message as user space sees it (same layout in liboos). 160 bytes.
@@ -137,12 +191,47 @@ struct Reply {
     state: ReplyState,
 }
 
+enum Backing {
+    /// Anonymous memory: one zeroed frame per page, owned by the object.
+    Pages(Vec<u64>),
+    /// Physically contiguous frames starting here, owned by the object.
+    Contig(u64),
+    /// Device memory starting here: mapped uncached, never freed.
+    Device(u64),
+}
+
+struct MemRegion {
+    pages: u64,
+    backing: Backing,
+}
+
+impl MemRegion {
+    fn frame(&self, i: u64) -> u64 {
+        match &self.backing {
+            Backing::Pages(v) => v[i as usize],
+            Backing::Contig(b) | Backing::Device(b) => b + i * crate::mm::physical::FRAME_SIZE,
+        }
+    }
+}
+
+struct Interrupt {
+    line: u8,
+    /// Notification signalled on each interrupt, and the bits ORed into it.
+    target: Option<(ObjId, u32)>,
+    /// Interrupts delivered so far (diagnostics).
+    count: u64,
+}
+
 enum Kind {
     Process(u32),
     Thread(u32),
     Channel(Channel),
     Notification(Notification),
     Reply(Reply),
+    Memory(MemRegion),
+    Interrupt(Interrupt),
+    IoPorts { base: u16, count: u32 },
+    Resource(u32),
 }
 
 struct Object {
@@ -172,6 +261,11 @@ fn obj_type(o: &Object) -> ObjType {
         Kind::Channel(_) => ObjType::Channel,
         Kind::Notification(_) => ObjType::Notification,
         Kind::Reply(_) => ObjType::Reply,
+        Kind::Memory(MemRegion { backing: Backing::Device(_), .. }) => ObjType::MmioRegion,
+        Kind::Memory(_) => ObjType::MemoryRegion,
+        Kind::Interrupt(_) => ObjType::Interrupt,
+        Kind::IoPorts { .. } => ObjType::IoPortRange,
+        Kind::Resource(_) => ObjType::Resource,
     }
 }
 
@@ -212,9 +306,57 @@ fn new_notification_obj() -> Res<ObjId> {
     new_object(Kind::Notification(Notification { bits: 0, waiters: Vec::new() }))
 }
 
+/// Free an object nobody refers to any more, and whatever it owned.
 fn free_object(id: ObjId) {
-    objects()[id as usize] = None;
+    let mut work: Vec<(ObjId, u32)> = Vec::new();
+    take_object(id, &mut work);
+    for (o, r) in work {
+        unref(o, r);
+    }
+}
+
+/// IRQ line -> owning Interrupt object + 1 (0 = not owned by a driver).
+static mut IRQ_OWNER: [u32; 16] = [0; 16];
+
+fn irq_owner() -> &'static mut [u32; 16] {
+    // SAFETY: single CPU; touched with interrupts disabled (object code and the IRQ path).
+    unsafe { &mut *core::ptr::addr_of_mut!(IRQ_OWNER) }
+}
+
+/// Remove object `id` from the table and release what it owns. References it held on
+/// other objects are pushed to `work` for the caller to drop.
+fn take_object(id: ObjId, work: &mut Vec<(ObjId, u32)>) {
+    let old = objects()[id as usize].take();
     unsafe { LIVE_OBJECTS -= 1 };
+    let kind = match old {
+        Some(o) => o.kind,
+        None => return,
+    };
+    match kind {
+        // An unconsumed reply still owns the handles it carries.
+        Kind::Reply(Reply { state: ReplyState::Done(p), .. }) => {
+            for i in 0..p.nh {
+                work.push(p.handles[i]);
+            }
+        }
+        Kind::Memory(m) => match m.backing {
+            Backing::Pages(frames) => {
+                for f in frames {
+                    crate::mm::physical::free_frame(f);
+                }
+            }
+            Backing::Contig(base) => crate::mm::physical::free_frames(base, m.pages),
+            Backing::Device(_) => {}
+        },
+        Kind::Interrupt(i) => {
+            crate::arch::x86_64::pic::disable_irq(i.line);
+            irq_owner()[i.line as usize] = 0;
+            if let Some((n, _)) = i.target {
+                work.push((n, 0));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Count a new handle (or message slot) referring to `id`.
@@ -277,14 +419,7 @@ fn unref(id: ObjId, r: u32) {
             _ => {}
         }
         if refs == 0 && !keep {
-            let old = objects()[id as usize].take();
-            unsafe { LIVE_OBJECTS -= 1 };
-            // An unconsumed reply still owns the handles it carries.
-            if let Some(Object { kind: Kind::Reply(Reply { state: ReplyState::Done(p), .. }), .. }) = old {
-                for i in 0..p.nh {
-                    work.push(p.handles[i]);
-                }
-            }
+            take_object(id, &mut work);
         }
     }
 }
@@ -305,14 +440,27 @@ struct Entry {
     used: bool,
 }
 
+/// A memory object mapped into the process: `pages` pages at `va`. Holds one reference.
+#[derive(Clone, Copy, Debug)]
+struct Mapping {
+    va: u64,
+    pages: u64,
+    obj: ObjId,
+}
+
+/// Everything a process holds through kernel objects: its handles, the memory objects it
+/// has mapped, and the I/O port ranges it has enabled (each of the last two holds a
+/// reference, so they outlive the handle that created them, like mmap).
 #[derive(Clone, Debug, Default)]
 pub struct HandleTable {
     slots: Vec<Entry>,
+    maps: Vec<Mapping>,
+    io: Vec<ObjId>,
 }
 
 impl HandleTable {
     pub const fn new() -> HandleTable {
-        HandleTable { slots: Vec::new() }
+        HandleTable { slots: Vec::new(), maps: Vec::new(), io: Vec::new() }
     }
 
     fn free_slots(&self) -> usize {
@@ -359,13 +507,20 @@ impl HandleTable {
         Ok(e)
     }
 
-    /// Close everything (process exit).
+    /// Close everything (process exit). The address space is already gone, so mappings
+    /// only drop their reference here.
     fn close_all(&mut self) {
         let slots = core::mem::take(&mut self.slots);
         for e in slots {
             if e.used {
                 unref(e.obj, e.rights);
             }
+        }
+        for m in core::mem::take(&mut self.maps) {
+            unref(m.obj, 0);
+        }
+        for o in core::mem::take(&mut self.io) {
+            unref(o, 0);
         }
     }
 }
@@ -400,7 +555,7 @@ pub fn handle_dup(h: Handle, new_rights: u32) -> Res<Handle> {
         return Err(E::PermissionDenied as i64);
     }
     // A duplicate can only lose rights.
-    if new_rights & !e.rights != 0 || new_rights & !ALL != 0 {
+    if new_rights & !e.rights != 0 || new_rights & !VALID != 0 {
         return Err(E::PermissionDenied as i64);
     }
     let nh = cur_table().alloc(e.obj, new_rights)?;
@@ -675,13 +830,19 @@ pub fn ipc_reply(rh: Handle, um: &UserMessage) -> Res<()> {
 
 pub fn notify_signal(h: Handle, bits: u32) -> Res<()> {
     let (id, _) = lookup(h, ObjType::Notification, WRITE)?;
+    signal_obj(id, bits);
+    Ok(())
+}
+
+/// OR `bits` into a notification and wake its waiters. No allocation: also used from
+/// interrupt context.
+fn signal_obj(id: ObjId, bits: u32) {
     if let Kind::Notification(n) = &mut obj(id).kind {
         n.bits |= bits;
         if n.bits != 0 {
             wake_all(&mut n.waiters);
         }
     }
-    Ok(())
 }
 
 /// Wait until any bit is set, then return and clear them all.
@@ -703,6 +864,277 @@ pub fn notify_wait(h: Handle, timeout_ticks: u64) -> Res<u32> {
         }
         scheduler::park(deadline);
     }
+}
+
+// ─── Memory objects ──────────────────────────────────────────────────────────────────
+
+const PAGE: u64 = crate::mm::physical::FRAME_SIZE;
+
+fn pages_for(size: u64, max: u64) -> Res<u64> {
+    if size == 0 || size > max {
+        return Err(E::InvalidArgument as i64);
+    }
+    Ok((size + PAGE - 1) / PAGE)
+}
+
+/// A new anonymous region of `pages` zeroed frames (not yet referenced).
+fn new_anon_region(pages: u64) -> Res<ObjId> {
+    let mut frames = Vec::new();
+    if frames.try_reserve_exact(pages as usize).is_err() {
+        return Err(E::OutOfMemory as i64);
+    }
+    // Create the object first, then fill it: on failure free_object returns every frame.
+    let id = new_object(Kind::Memory(MemRegion { pages: 0, backing: Backing::Pages(frames) }))?;
+    for _ in 0..pages {
+        let f = match crate::mm::physical::alloc_frame() {
+            Some(f) => f,
+            None => {
+                free_object(id);
+                return Err(E::OutOfMemory as i64);
+            }
+        };
+        if let Kind::Memory(MemRegion { pages: n, backing: Backing::Pages(v) }) = &mut obj(id).kind {
+            v.push(f); // capacity reserved above
+            *n += 1;
+        }
+    }
+    Ok(id)
+}
+
+/// mem_create(size): a shareable anonymous region, rounded up to whole pages.
+pub fn mem_create(size: u64) -> Res<Handle> {
+    let pages = pages_for(size, MEM_MAX_BYTES)?;
+    let id = new_anon_region(pages)?;
+    install_current(id, READ | WRITE | MAP | DUP | TRANSFER)
+}
+
+/// mem_create_contig(resource, size): physically contiguous region for DMA. Needs a
+/// Resource handle of kind DMA with WRITE; the new handle also carries PHYS.
+pub fn mem_create_contig(res: Handle, size: u64) -> Res<Handle> {
+    let (rid, _) = lookup(res, ObjType::Resource, WRITE)?;
+    if !matches!(obj(rid).kind, Kind::Resource(k) if k & resource::DMA != 0) {
+        return Err(E::PermissionDenied as i64);
+    }
+    let pages = pages_for(size, MEM_CONTIG_MAX_BYTES)?;
+    let base = crate::mm::physical::alloc_frames(pages).ok_or(E::OutOfMemory as i64)?;
+    let id = match new_object(Kind::Memory(MemRegion { pages, backing: Backing::Contig(base) })) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::mm::physical::free_frames(base, pages);
+            return Err(e);
+        }
+    };
+    install_current(id, READ | WRITE | MAP | DUP | TRANSFER | PHYS)
+}
+
+/// A MemoryRegion or MmioRegion handle with the rights `need`.
+fn lookup_mem(h: Handle, need: u32) -> Res<(ObjId, u32)> {
+    let e = cur_table().get(h)?;
+    if !matches!(obj(e.obj).kind, Kind::Memory(_)) {
+        return Err(E::WrongType as i64);
+    }
+    if e.rights & need != need {
+        return Err(E::PermissionDenied as i64);
+    }
+    Ok((e.obj, e.rights))
+}
+
+fn mem_of(id: ObjId) -> &'static MemRegion {
+    match &obj(id).kind {
+        Kind::Memory(m) => m,
+        _ => unreachable!(),
+    }
+}
+
+/// mem_size(h): size in bytes (any rights).
+pub fn mem_size(h: Handle) -> Res<u64> {
+    let (id, _) = lookup_mem(h, 0)?;
+    Ok(mem_of(id).pages * PAGE)
+}
+
+/// mem_phys(h): physical address of a contiguous or device region. Needs PHYS.
+pub fn mem_phys(h: Handle) -> Res<u64> {
+    let (id, _) = lookup_mem(h, PHYS)?;
+    match mem_of(id).backing {
+        Backing::Contig(b) | Backing::Device(b) => Ok(b),
+        Backing::Pages(_) => Err(E::NotSupported as i64),
+    }
+}
+
+/// mem_map(h, hint, prot): map the whole object into the caller's address space.
+/// Needs MAP + READ, plus WRITE for prot WRITE and EXEC for prot EXEC. Writable and
+/// executable at once is refused (W^X); without EXEC the pages are no-execute. Device
+/// regions are mapped uncached. `hint` is reserved (pass 0): the kernel picks the address.
+pub fn mem_map(h: Handle, _hint: u64, p: u32) -> Res<u64> {
+    use crate::mm::r#virtual as vmm;
+    if p & !(prot::READ | prot::WRITE | prot::EXEC) != 0
+        || p & prot::READ == 0
+        || p & (prot::WRITE | prot::EXEC) == (prot::WRITE | prot::EXEC)
+    {
+        return Err(E::InvalidArgument as i64);
+    }
+    let mut need = MAP | READ;
+    if p & prot::WRITE != 0 {
+        need |= WRITE;
+    }
+    if p & prot::EXEC != 0 {
+        need |= EXEC;
+    }
+    let (id, _) = lookup_mem(h, need)?;
+    let cr3 = scheduler::current_user_cr3().ok_or(E::NotSupported as i64)?;
+    let m = mem_of(id);
+    let pages = m.pages;
+    let device = matches!(m.backing, Backing::Device(_));
+    let va = scheduler::reserve_user_range(pages).ok_or(E::OutOfMemory as i64)?;
+    cur_table().maps.try_reserve(1).map_err(|_| E::OutOfMemory as i64)?;
+
+    // Not FLAG_OWNED: the frames belong to the object, not to the address space.
+    let mut flags = vmm::FLAG_USER;
+    if p & prot::WRITE != 0 {
+        flags |= vmm::FLAG_WRITABLE;
+    }
+    if p & prot::EXEC == 0 {
+        flags |= vmm::nx_flag();
+    }
+    if device {
+        flags |= vmm::FLAG_PCD | vmm::FLAG_PWT;
+    }
+    for i in 0..pages {
+        if !vmm::map_page(cr3, va + i * PAGE, m.frame(i), flags) {
+            for k in 0..i {
+                vmm::unmap_page_entry(cr3, va + k * PAGE);
+                vmm::invlpg(va + k * PAGE);
+            }
+            return Err(E::OutOfMemory as i64);
+        }
+    }
+    cur_table().maps.push(Mapping { va, pages, obj: id });
+    ref_add(id, 0);
+    if !device {
+        scheduler::add_memory_usage(scheduler::current_pid(), pages * PAGE);
+    }
+    Ok(va)
+}
+
+/// mem_unmap(addr): remove a mapping made by mem_map; `addr` is the address it returned.
+pub fn mem_unmap(addr: u64) -> Res<()> {
+    use crate::mm::r#virtual as vmm;
+    let t = cur_table();
+    let i = t.maps.iter().position(|m| m.va == addr).ok_or(E::InvalidArgument as i64)?;
+    let m = t.maps.remove(i);
+    if let Some(cr3) = scheduler::current_user_cr3() {
+        for k in 0..m.pages {
+            let va = m.va + k * PAGE;
+            if vmm::unmap_page_entry(cr3, va).is_some() {
+                vmm::invlpg(va);
+            }
+        }
+    }
+    if !matches!(mem_of(m.obj).backing, Backing::Device(_)) {
+        scheduler::sub_memory_usage(scheduler::current_pid(), m.pages * PAGE);
+    }
+    unref(m.obj, 0);
+    Ok(())
+}
+
+// ─── Interrupts ──────────────────────────────────────────────────────────────────────
+
+/// irq_bind(irq, notification, bits): deliver this line's interrupts as `bits` on the
+/// notification. Needs READ on the Interrupt and WRITE on the Notification. Replaces an
+/// earlier binding. The line stays masked until irq_ack.
+pub fn irq_bind(irq: Handle, notif: Handle, bits: u32) -> Res<()> {
+    let (iid, _) = lookup(irq, ObjType::Interrupt, READ)?;
+    let (nid, _) = lookup(notif, ObjType::Notification, WRITE)?;
+    if bits == 0 {
+        return Err(E::InvalidArgument as i64);
+    }
+    ref_add(nid, 0);
+    let old = match &mut obj(iid).kind {
+        Kind::Interrupt(i) => i.target.replace((nid, bits)),
+        _ => unreachable!(),
+    };
+    if let Some((o, _)) = old {
+        unref(o, 0);
+    }
+    Ok(())
+}
+
+/// irq_ack(irq): the driver has handled the device; unmask the line. Needs WRITE.
+pub fn irq_ack(irq: Handle) -> Res<()> {
+    let (iid, _) = lookup(irq, ObjType::Interrupt, WRITE)?;
+    if let Kind::Interrupt(i) = &obj(iid).kind {
+        crate::arch::x86_64::pic::enable_irq(i.line);
+    }
+    Ok(())
+}
+
+/// Called from the IRQ dispatcher (interrupts disabled) before any kernel driver.
+/// If a driver owns the line: mask it, signal the bound notification, return true
+/// (the caller sends EOI). No allocation here.
+pub fn irq_fire(line: u8) -> bool {
+    let owner = match irq_owner().get(line as usize) {
+        Some(&o) if o != 0 => o - 1,
+        _ => return false,
+    };
+    crate::arch::x86_64::pic::disable_irq(line);
+    let target = match &mut obj(owner).kind {
+        Kind::Interrupt(i) => {
+            i.count += 1;
+            i.target
+        }
+        _ => None,
+    };
+    if let Some((n, bits)) = target {
+        signal_obj(n, bits);
+    }
+    true
+}
+
+// ─── I/O ports ───────────────────────────────────────────────────────────────────────
+
+/// I/O permission bitmap (hardware layout: bit set = access denied) covering every
+/// range the process enabled. Empty when it has none.
+fn io_bitmap(t: &HandleTable) -> Vec<u8> {
+    let mut end = 0u32;
+    for &o in &t.io {
+        if let Kind::IoPorts { base, count } = obj(o).kind {
+            end = end.max(base as u32 + count);
+        }
+    }
+    let mut bm = alloc::vec![0xFFu8; ((end + 7) / 8) as usize];
+    for &o in &t.io {
+        if let Kind::IoPorts { base, count } = obj(o).kind {
+            for p in base as u32..base as u32 + count {
+                bm[(p / 8) as usize] &= !(1 << (p % 8));
+            }
+        }
+    }
+    bm
+}
+
+/// ioport_enable(h): allow the caller's IN/OUT on the range. Needs READ and WRITE (the
+/// hardware bitmap cannot split them). Lasts until ioport_disable or exit.
+pub fn ioport_enable(h: Handle) -> Res<()> {
+    let (id, _) = lookup(h, ObjType::IoPortRange, READ | WRITE)?;
+    let t = cur_table();
+    if !t.io.contains(&id) {
+        t.io.try_reserve(1).map_err(|_| E::OutOfMemory as i64)?;
+        t.io.push(id);
+        ref_add(id, 0);
+    }
+    scheduler::set_current_io_bitmap(io_bitmap(t));
+    Ok(())
+}
+
+/// ioport_disable(h): withdraw the access ioport_enable granted.
+pub fn ioport_disable(h: Handle) -> Res<()> {
+    let (id, _) = lookup(h, ObjType::IoPortRange, 0)?;
+    let t = cur_table();
+    let i = t.io.iter().position(|&o| o == id).ok_or(E::InvalidArgument as i64)?;
+    t.io.remove(i);
+    scheduler::set_current_io_bitmap(io_bitmap(t));
+    unref(id, 0);
+    Ok(())
 }
 
 // ─── Process / thread ────────────────────────────────────────────────────────────────
@@ -793,6 +1225,83 @@ pub fn kernel_new_channel() -> Option<ObjId> {
 
 pub fn kernel_new_notification() -> Option<ObjId> {
     scheduler::without_interrupts(|| new_notification_obj().ok())
+}
+
+/// An anonymous memory region of `size` bytes (rounded up to pages).
+pub fn kernel_new_memory(size: u64) -> Option<ObjId> {
+    scheduler::without_interrupts(|| new_anon_region(pages_for(size, MEM_MAX_BYTES).ok()?).ok())
+}
+
+/// HHDM address of page `page` of a memory region (kernel-side access for tests and
+/// servers set up by the kernel). None for device regions or out-of-range pages.
+pub fn kernel_memory_page(id: ObjId, page: u64) -> Option<*mut u8> {
+    scheduler::without_interrupts(|| {
+        if !exists(id) {
+            return None;
+        }
+        match &obj(id).kind {
+            Kind::Memory(m) if page < m.pages && !matches!(m.backing, Backing::Device(_)) => {
+                Some(crate::mm::r#virtual::phys_to_virt(m.frame(page)) as *mut u8)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A device memory range (MMIO, e.g. a PCI BAR) at physical `phys`, `size` bytes. Both
+/// must be page aligned. The range must not be RAM the frame allocator manages.
+pub fn kernel_new_mmio(phys: u64, size: u64) -> Option<ObjId> {
+    if phys % PAGE != 0 || size == 0 || size % PAGE != 0 {
+        return None;
+    }
+    let pages = size / PAGE;
+    let in_ram = crate::mm::physical::get_usable_regions()
+        .iter()
+        .any(|r| phys < r.base + r.length && r.base < phys + size);
+    if in_ram {
+        return None;
+    }
+    scheduler::without_interrupts(|| {
+        new_object(Kind::Memory(MemRegion { pages, backing: Backing::Device(phys) })).ok()
+    })
+}
+
+/// An Interrupt object for legacy IRQ line `line`. Only lines no kernel driver uses can
+/// be handed out, and each line to one object at a time. The line starts masked.
+pub fn kernel_new_interrupt(line: u8) -> Option<ObjId> {
+    if !IRQ_ASSIGNABLE.contains(&line) || crate::acpi::is_sci_irq(line) {
+        return None;
+    }
+    scheduler::without_interrupts(|| {
+        if irq_owner()[line as usize] != 0 {
+            return None;
+        }
+        let id = new_object(Kind::Interrupt(Interrupt { line, target: None, count: 0 })).ok()?;
+        crate::arch::x86_64::pic::disable_irq(line);
+        irq_owner()[line as usize] = id + 1;
+        Some(id)
+    })
+}
+
+/// Interrupts delivered so far through the Interrupt object `id` (diagnostics).
+pub fn kernel_interrupt_count(id: ObjId) -> Option<u64> {
+    scheduler::without_interrupts(|| match objects().get(id as usize) {
+        Some(Some(Object { kind: Kind::Interrupt(i), .. })) => Some(i.count),
+        _ => None,
+    })
+}
+
+/// An I/O port range [base, base + count).
+pub fn kernel_new_ioports(base: u16, count: u32) -> Option<ObjId> {
+    if count == 0 || base as u32 + count > 0x1_0000 {
+        return None;
+    }
+    scheduler::without_interrupts(|| new_object(Kind::IoPorts { base, count }).ok())
+}
+
+/// A Resource object of the given kinds (`resource::DMA`, ...).
+pub fn kernel_new_resource(kinds: u32) -> Option<ObjId> {
+    scheduler::without_interrupts(|| new_object(Kind::Resource(kinds)).ok())
 }
 
 /// A Process object for `pid`.

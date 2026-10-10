@@ -30,6 +30,16 @@ pub mod nr {
     pub const THREAD_SELF: u64 = 231;
     pub const PROCESS_WAIT: u64 = 232;
     pub const PROCESS_KILL: u64 = 233;
+    pub const MEM_CREATE: u64 = 240;
+    pub const MEM_MAP: u64 = 241;
+    pub const MEM_UNMAP: u64 = 242;
+    pub const MEM_CREATE_CONTIG: u64 = 243;
+    pub const MEM_PHYS: u64 = 244;
+    pub const MEM_SIZE: u64 = 245;
+    pub const IRQ_BIND: u64 = 250;
+    pub const IRQ_ACK: u64 = 251;
+    pub const IOPORT_ENABLE: u64 = 252;
+    pub const IOPORT_DISABLE: u64 = 253;
 }
 
 /// Kernel error codes (negated in RAX).

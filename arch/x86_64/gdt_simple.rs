@@ -110,12 +110,45 @@ pub const USER_CS: u16 = 0x20 | 3;
 /// TSS segment selector (GDT index 5)
 pub const TSS_SELECTOR: u16 = 0x28;
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+/// Bytes in the I/O permission bitmap: one bit per port, 65536 ports.
+pub const IOPB_BYTES: usize = 8192;
+/// `iopb_offset` when the bitmap is in use: it follows the 104-byte TSS directly.
+const IOPB_ON: u16 = core::mem::size_of::<TaskStateSegment>() as u16;
+/// `iopb_offset` beyond the TSS limit: no bitmap, every IN/OUT from ring 3 faults (#GP).
+const IOPB_OFF: u16 = 0xFFFF;
+
+/// The TSS followed by its I/O permission bitmap. The CPU checks the bit for each port a
+/// ring-3 IN/OUT touches (IOPL stays 0, so the bitmap is the only way in); a set bit
+/// means "denied". The extra final byte must be 0xFF (the CPU may read one byte past the
+/// bitmap). One bitmap for the CPU: the scheduler copies the next task's bitmap in on
+/// every switch to a ring-3 task, or turns it off (`IOPB_OFF`) for tasks without ports.
+#[repr(C, packed)]
+struct TssBlock {
+    tss: TaskStateSegment,
+    iopb: [u8; IOPB_BYTES + 1],
+}
+
+static mut TSS: TssBlock = TssBlock {
+    tss: TaskStateSegment {
+        _reserved1: 0,
+        rsp: [0; 3],
+        _reserved2: 0,
+        ist: [0; 7],
+        _reserved3: 0,
+        _reserved4: 0,
+        iopb_offset: IOPB_OFF,
+    },
+    iopb: [0xFF; IOPB_BYTES + 1],
+};
+/// Task whose bitmap is in `TSS.iopb` (pids are never reused), and how many leading
+/// bytes it set (everything after them is 0xFF).
+static mut IOPB_PID: u32 = 0;
+static mut IOPB_LEN: usize = 0;
 static mut RING0_STACK: [u8; 16384] = [0; 16384];
 
 unsafe fn install_tss_descriptor() {
     let tss_base = core::ptr::addr_of!(TSS) as u64;
-    let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;
+    let tss_limit = (core::mem::size_of::<TssBlock>() - 1) as u64;
 
     let low: u64 =
         (tss_limit & 0xFFFF)
@@ -132,7 +165,30 @@ unsafe fn install_tss_descriptor() {
 
 pub fn set_tss_rsp0(rsp0: u64) {
     unsafe {
-        TSS.rsp[0] = rsp0;
+        TSS.tss.rsp[0] = rsp0;
+    }
+}
+
+/// Make `bm` (hardware layout, bit set = denied; empty = no ports at all) the I/O
+/// permission bitmap for ring 3. Copies only when another task's bitmap is loaded or
+/// `force` is set. Called with interrupts disabled.
+pub fn load_io_bitmap(pid: u32, bm: &[u8], force: bool) {
+    unsafe {
+        let t = &mut *core::ptr::addr_of_mut!(TSS);
+        if bm.is_empty() {
+            t.tss.iopb_offset = IOPB_OFF;
+            return;
+        }
+        if force || IOPB_PID != pid {
+            let n = bm.len().min(IOPB_BYTES);
+            t.iopb[..n].copy_from_slice(&bm[..n]);
+            if IOPB_LEN > n {
+                t.iopb[n..IOPB_LEN].fill(0xFF);
+            }
+            IOPB_LEN = n;
+            IOPB_PID = pid;
+        }
+        t.tss.iopb_offset = IOPB_ON;
     }
 }
 
@@ -159,7 +215,7 @@ pub fn init() {
 
         // Default ring0 stack for CPL3 -> CPL0 transitions
         let rsp0 = (core::ptr::addr_of!(RING0_STACK) as u64) + RING0_STACK.len() as u64;
-        TSS.rsp[0] = rsp0;
+        TSS.tss.rsp[0] = rsp0;
 
         let gdt_ptr = GdtPointer {
             limit: (core::mem::size_of::<[GdtEntry; GDT_ENTRIES]>() - 1) as u16,
