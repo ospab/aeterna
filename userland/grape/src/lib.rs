@@ -175,16 +175,28 @@ pub fn edit(path: &str) {
     framebuffer::clear(BG);
     loop {
         refresh_screen(&state);
-        let key = wait_key();
-        let was_armed = state.quit_armed;
-        process_key(&mut state, key);
-        if was_armed && key != '' {
-            state.quit_armed = false;
+        let mut key = wait_key();
+        // Keys already queued (a clipboard paste, fast typing) are applied before the next
+        // redraw, so a paste appears at once instead of character by character.
+        let mut queued = 0;
+        loop {
+            let was_armed = state.quit_armed;
+            process_key(&mut state, key);
+            if was_armed && key != '' {
+                state.quit_armed = false;
+            }
+            // keep the view consistent after any edit (prevents the cursor
+            // row/column arithmetic below from underflowing)
+            clamp_cx(&mut state);
+            clamp_scroll(&mut state);
+            if state.quit || queued >= 8192 {
+                break;
+            }
+            match keyboard::try_read_key() {
+                Some(k) => { key = k; queued += 1; }
+                None => break,
+            }
         }
-        // keep the view consistent after any edit (prevents the cursor
-        // row/column arithmetic below from underflowing)
-        clamp_cx(&mut state);
-        clamp_scroll(&mut state);
         if state.quit {
             break;
         }

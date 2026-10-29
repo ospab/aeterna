@@ -120,11 +120,19 @@ static PASTE: crate::core::sync::IrqSpinLock<Paste> = crate::core::sync::IrqSpin
 /// Queue text to be read as if typed. Line breaks become spaces and trailing
 /// whitespace is dropped, so a pasted link never runs a command by itself.
 pub fn inject_text(text: &str) {
+    // Line breaks become Enter, as in other terminals; the trailing one is dropped so the
+    // last pasted line stays in the editor instead of running at once.
     let text = text.trim_end();
     let mut p = PASTE.lock();
-    for &b in text.as_bytes() {
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
         if p.len >= PASTE_CAP { break; }
-        let b = match b { b'\r' | b'\n' | b'\t' => b' ', b => b };
+        let b = match b {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => continue,
+            b'\r' | b'\n' => b'\n',
+            b'\t' => b' ',
+            b => b,
+        };
         let at = (p.head + p.len) % PASTE_CAP;
         p.buf[at] = b;
         p.len += 1;
