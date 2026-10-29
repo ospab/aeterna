@@ -153,3 +153,46 @@ later `seed`) and given to a driver as bootstrap handles (`core::elf::spawn_with
 
 Tests: boot with the kernel parameter `selftest=mem` (`user/memtest`, `user/uartdrv`). The COM2
 driver (`uartdrv`) needs a second serial port in QEMU: `-serial file:com1.log -serial file:com2.log`.
+
+## Screen, keyboard, clock (games and emulators)
+
+Implementation: `core/syscall/screen.rs`; wrappers in `user/liboos/src/screen.rs`. The program
+needs the Framebuf capability (the shell gives it to every program it starts).
+
+| No. | Call | Arguments → result |
+|---|---|---|
+| 21 | sleep_ms | ms → 0; the task really sleeps (the shell and other tasks run), at least `ms`, woken by the 100 Hz tick, so up to 10 ms late |
+| 260 | screen_acquire | info* → 0 |
+| 261 | screen_release | → 0 |
+| 262 | screen_flush | → 0; the caller must own the screen |
+| 263 | kbd_mode | raw (0 or 1) → 0 |
+| 264 | kbd_event | → event, 0 if the queue is empty |
+| 270 | clock_ns | → monotonic nanoseconds since boot |
+
+**screen_acquire.** Maps the boot framebuffer into the caller (read/write, no-execute, uncached,
+as an MmioRegion mapping) and writes 32 bytes to `info*`: `addr: u64`, `width: u32`,
+`height: u32`, `pitch: u32` (bytes per line), `bpp: u32`, `red_shift`, `green_shift`,
+`blue_shift` (one byte each), one pad byte. `addr` already includes the offset inside the first
+page. From now on the kernel console keeps its text in the shadow buffer but draws no pixels
+(`arch/x86_64/framebuffer.rs`, `screen_held`). Only one process can own the screen: a second
+caller gets -5 (Busy). -2 without the Framebuf capability, -7 without a framebuffer.
+`screen_release` gives it back and the console repaints from its shadow; the mapping then stays
+until the process exits but must not be used. When the owner exits or is killed the kernel
+releases the screen itself (scheduler teardown, `screen::process_gone`).
+
+**screen_flush.** On VMware SVGA II a framebuffer write is not shown until an update command is
+sent; this call sends one for the whole screen. Call it once per frame. It does nothing on
+plain framebuffers.
+
+**kbd_mode / kbd_event.** In raw mode the program gets PC set-1 scancodes as events instead of
+the console line discipline (`core/stdin.rs`). Event value: bits 0..7 the scancode (1..0x7F),
+bit 8 set if the key had the 0xE0 prefix, bit 9 set for a release. 0 means no event. Only one
+process can be in raw mode (another caller gets -5). The kernel leaves raw mode and flushes the
+queue when the owner exits. **Ctrl+C still works**: the keyboard interrupt sets the interrupt
+flag before the scancode is queued. A program that owns the screen or the raw keyboard is ended
+by the kernel itself at its next `kbd_event`, `screen_flush` or `sleep_ms` call (exit code 130),
+because a program that never blocks would starve the shell, which normally does the killing. The
+screen and the keyboard are then released. Text pasted with Ctrl+V and serial input
+are not delivered in raw mode.
+
+**clock_ns.** Monotonic, from the TSC when it is calibrated (otherwise the 100 Hz tick).

@@ -22,6 +22,7 @@ pub mod sys;
 pub mod ipc;
 pub mod mem;
 pub mod hw;
+pub mod screen;
 mod heap;
 mod rt;
 

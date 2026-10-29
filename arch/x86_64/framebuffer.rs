@@ -29,6 +29,38 @@ pub struct Framebuffer {
 
 static mut FRAMEBUFFER: Option<Framebuffer> = None;
 
+/// Pid of the ring-3 program that owns the screen (0 = nobody). While it is set, the console
+/// keeps its text shadow up to date but draws no pixels; `release_screen` repaints.
+static SCREEN_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline(always)]
+fn screen_held() -> bool {
+    SCREEN_OWNER.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Pid that owns the screen, or 0.
+pub fn screen_owner() -> u32 {
+    SCREEN_OWNER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Give the screen to `pid`. Fails (false) if another process holds it.
+pub fn acquire_screen(pid: u32) -> bool {
+    SCREEN_OWNER
+        .compare_exchange(0, pid, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Take the screen back from `pid` (no-op if it is not the owner) and repaint the console.
+pub fn release_screen(pid: u32) -> bool {
+    let ok = SCREEN_OWNER
+        .compare_exchange(pid, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed)
+        .is_ok();
+    if ok {
+        repaint();
+    }
+    ok
+}
+
 /// True when the framebuffer layout is already 0x00RRGGBB (no conversion).
 static mut NATIVE_RGB: bool = true;
 
@@ -166,6 +198,7 @@ fn to_native(rgb: u32) -> u32 {
 /// Plot single pixel at (x, y) with colour 0x00RRGGBB.
 #[inline(always)]
 pub fn put_pixel(x: u64, y: u64, color: u32) {
+    if screen_held() { return; }
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
             if x < fb.width && y < fb.height {
@@ -182,7 +215,7 @@ pub fn clear(color: u32) {
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
             let pixels_per_row = fb.pitch / 4;
-            for y in 0..fb.height {
+            for y in 0..(if screen_held() { 0 } else { fb.height }) {
                 let row_base = fb.address.add((y * pixels_per_row) as usize);
                 for x in 0..fb.width {
                     ptr::write_volatile(row_base.add(x as usize), native);
@@ -199,6 +232,7 @@ pub fn clear(color: u32) {
 
 /// Draw filled rectangle
 pub fn fill_rect(x: u64, y: u64, w: u64, h: u64, color: u32) {
+    if screen_held() { return; }
     let native = to_native(color);
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
@@ -218,6 +252,7 @@ pub fn fill_rect(x: u64, y: u64, w: u64, h: u64, color: u32) {
 /// Draw single character at pixel position. The glyph is the 8x16 bitmap
 /// scaled by the current integer font scale (cell = `cell_w()` x `cell_h()`).
 pub fn draw_char_at(x: u64, y: u64, c: char, fg_color: u32, bg_color: u32) {
+    if screen_held() { return; }
     let bitmap = match font::get_char_bitmap(c) {
         Some(b) => b,
         None => return,
@@ -383,6 +418,11 @@ fn scroll_up() {
             let chh = cell_h();
 
             // One overlapping move of everything below the first text row.
+            if screen_held() {
+                shadow_scroll();
+                SCROLLS = SCROLLS.wrapping_add(1);
+                return;
+            }
             let src = fb.address.add((chh * pixels_per_row) as usize);
             let count = ((fb.height - chh) * pixels_per_row) as usize;
             ptr::copy(src, fb.address, count);

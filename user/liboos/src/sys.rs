@@ -11,6 +11,7 @@ pub mod nr {
     pub const CLOSE: u64 = 4;
     pub const SEEK: u64 = 5;
     pub const YIELD: u64 = 20;
+    pub const SLEEP: u64 = 21;
     pub const GETPID: u64 = 22;
     pub const WAITPID: u64 = 32;
     pub const MMAP: u64 = 40;
@@ -41,6 +42,12 @@ pub mod nr {
     pub const IRQ_ACK: u64 = 251;
     pub const IOPORT_ENABLE: u64 = 252;
     pub const IOPORT_DISABLE: u64 = 253;
+    pub const SCREEN_ACQUIRE: u64 = 260;
+    pub const SCREEN_RELEASE: u64 = 261;
+    pub const SCREEN_FLUSH: u64 = 262;
+    pub const KBD_MODE: u64 = 263;
+    pub const KBD_EVENT: u64 = 264;
+    pub const CLOCK_NS: u64 = 270;
 }
 
 /// Kernel error codes (negated in RAX).

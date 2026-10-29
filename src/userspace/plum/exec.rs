@@ -610,7 +610,7 @@ fn run_elf(name: &str, image: &[u8], args: &[String]) -> i32 {
     argv.push(name);
     for a in args { argv.push(a.as_str()); }
     let prog = name.rsplit('/').next().unwrap_or(name);
-    let caps = alloc::vec![Capability::Serial, Capability::FsRead, Capability::FsWrite];
+    let caps = alloc::vec![Capability::Serial, Capability::FsRead, Capability::FsWrite, Capability::Framebuf];
     let pid = match crate::core::elf::spawn(prog, image, &argv, caps) {
         Ok(pid) => pid,
         Err(e) => {

@@ -1,0 +1,9 @@
+[package]
+name = "gfxtest"
+description = "Screen, raw keyboard and clock test: a rotating wireframe square"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../../user/liboos" }

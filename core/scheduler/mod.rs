@@ -572,6 +572,7 @@ fn teardown(t: TaskControlBlock) {
     }
     // Close its handles (frees its kernel objects) and wake waiters. The rest of the block
     // (open files, FPU image, ...) is dropped on return.
+    crate::core::syscall::screen::process_gone(pid);
     crate::core::object::task_reaped(pid, handles, ipc_wait);
 }
 

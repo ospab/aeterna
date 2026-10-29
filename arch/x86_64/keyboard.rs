@@ -346,3 +346,58 @@ fn shift_symbol(c: char) -> char {
         _ => c,
     }
 }
+
+// ─── Raw key events for ring-3 programs (syscalls 263/264) ──────────────────
+//
+// A program that switches to raw mode gets the set-1 scancodes as press/release events
+// instead of the console line discipline. Ctrl+C still sets the interrupt flag at IRQ time
+// (`irq_scancode`), so the shell kills the program as usual. Only one raw owner at a time;
+// the kernel drops the mode when the owner exits.
+
+static RAW_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RAW_EXT: AtomicBool = AtomicBool::new(false);
+
+/// Pid in raw keyboard mode, or 0.
+pub fn raw_owner() -> u32 {
+    RAW_OWNER.load(Ordering::Relaxed)
+}
+
+/// Enter raw mode as `pid`. False if another process holds it.
+pub fn raw_acquire(pid: u32) -> bool {
+    if RAW_OWNER.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return RAW_OWNER.load(Ordering::Relaxed) == pid;
+    }
+    RAW_EXT.store(false, Ordering::Relaxed);
+    while crate::arch::x86_64::idt::kb_irq_read().is_some() {}
+    true
+}
+
+/// Leave raw mode if `pid` owns it; the queue is flushed so stale keys do not reach the shell.
+pub fn raw_release(pid: u32) -> bool {
+    if RAW_OWNER.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        RAW_EXT.store(false, Ordering::Relaxed);
+        while crate::arch::x86_64::idt::kb_irq_read().is_some() {}
+        true
+    } else {
+        false
+    }
+}
+
+/// Next raw event: scancode (bits 0..7, never 0), bit 8 = E0-extended, bit 9 = release.
+/// 0 when the queue is empty.
+pub fn raw_event() -> i64 {
+    crate::xhci::poll(true);
+    while let Some(sc) = crate::arch::x86_64::idt::kb_irq_read() {
+        if sc == 0xE0 {
+            RAW_EXT.store(true, Ordering::Relaxed);
+            continue;
+        }
+        let ext = RAW_EXT.swap(false, Ordering::Relaxed);
+        let code = (sc & 0x7F) as i64;
+        if code == 0 {
+            continue;
+        }
+        return code | ((ext as i64) << 8) | (((sc & 0x80 != 0) as i64) << 9);
+    }
+    0
+}

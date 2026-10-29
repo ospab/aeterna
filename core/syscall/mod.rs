@@ -17,6 +17,7 @@ instruction to jump to our handler entry point.
 extern crate alloc;
 
 pub mod objects;
+pub mod screen;
 
 /// Syscall numbers for AETERNA microkernel
 /// Follows microkernel philosophy: minimal set, everything else via IPC
@@ -155,6 +156,7 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (4,  |a| syscall_close(a.arg1)),
     (5,  |a| syscall_seek(a.arg1, a.arg2, a.arg3)),
     (20, |_| syscall_yield()),
+    (21, |a| screen::sleep_ms(a.arg1)),
     (22, |_| syscall_getpid()),
     (23, |a| syscall_spawn(a.arg1, a.arg2, a.arg3)),
     (24, |a| syscall_preempt_control(a.arg1)),
@@ -172,6 +174,13 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (70, |a| syscall_cap_delegate(a.arg1, a.arg2)),
     (80, |a| syscall_med_assign(a.arg1)),
     (110, |a| syscall_dev_detach(a.arg1)),
+    // Screen, raw keyboard, clock (docs/en/syscall-abi.md)
+    (260, |a| screen::screen_acquire(a.arg1)),
+    (261, |_| screen::screen_release()),
+    (262, |_| screen::screen_flush()),
+    (263, |a| screen::kbd_mode(a.arg1)),
+    (264, |_| screen::kbd_event()),
+    (270, |_| screen::clock_ns()),
     // Kernel objects and handles (docs/en/syscall-abi.md)
     (200, |a| objects::handle_close(a.arg1)),
     (201, |a| objects::handle_dup(a.arg1, a.arg2)),
