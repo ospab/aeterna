@@ -5,6 +5,8 @@
 #   .\apps\build.ps1                                  packages -> apps\dist\*.tmt
 #   .\apps\build.ps1 -Repo D:\ospab-projects\tmt-repo  also build + sign + verify the repo
 #   .\apps\build.ps1 -Repo ... -Upload user@server     and upload it to tmt.ospab.org
+#   .\apps\build.ps1 -Only beeb,drift ...              only these packages (cargo package and
+#                                                     apps\pkg\<name>.toml share the name)
 #
 # The signing key is %USERPROFILE%\.ospab\tmt.key (tmt keygen); -Key overrides it.
 # Needs: nightly cargo with rust-src (same as the kernel) and stable cargo for tmt;
@@ -14,7 +16,8 @@ param(
     [string]$Repo,
     [string]$Key,
     [string]$Upload,
-    [string]$RemoteDir = '/var/www/tmt.ospab.org/x86_64'
+    [string]$RemoteDir = '/var/www/tmt.ospab.org/x86_64',
+    [string[]]$Only
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,7 +48,9 @@ try {
 
     # 2. Programs for x86_64-unknown-oos (apps\.cargo\config.toml selects target and linker script).
     Push-Location $Apps
-    try { Run 'Building programs' { cargo +nightly build --release } } finally { Pop-Location }
+    $pkgArgs = @()
+    foreach ($n in $Only) { $pkgArgs += @('-p', $n) }
+    try { Run 'Building programs' { cargo +nightly build --release @pkgArgs } } finally { Pop-Location }
 
     # 3. Packages (manifests use paths relative to apps\).
     $dist = Join-Path $Apps 'dist'
@@ -53,7 +58,9 @@ try {
     New-Item -ItemType Directory $dist | Out-Null
     Push-Location $Apps
     try {
-        foreach ($m in Get-ChildItem (Join-Path $Apps 'pkg\*.toml')) {
+        $manifests = Get-ChildItem (Join-Path $Apps 'pkg\*.toml')
+        if ($Only) { $manifests = $manifests | Where-Object { $Only -contains $_.BaseName } }
+        foreach ($m in $manifests) {
             Run "Packing $($m.Name)" { & $Tmt pack $m.FullName -o $dist }
         }
     } finally { Pop-Location }
@@ -73,7 +80,9 @@ try {
     #    an index whose packages are not there yet.
     if ($Upload) {
         $src = Join-Path $Repo 'x86_64'
+        # With -Only, upload just the packages built now; the index still lists the whole repo.
         $pkgs = (Get-ChildItem (Join-Path $src '*.tmt')).FullName
+        if ($Only) { $pkgs = $pkgs | Where-Object { $Only -contains ((Split-Path $_ -Leaf) -replace '-[0-9][^-]*\.tmt$', '') } }
         Run 'Uploading packages' { scp @pkgs "${Upload}:$RemoteDir/" }
         Run 'Uploading index' { scp (Join-Path $src 'index') "${Upload}:$RemoteDir/" }
         Run 'Uploading signature' { scp (Join-Path $src 'index.sig') "${Upload}:$RemoteDir/" }
