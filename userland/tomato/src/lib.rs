@@ -265,6 +265,10 @@ fn parse_index(idx: &[u8]) -> Option<Vec<RepoPkg>> {
             desc: String::from(f[6]),
         });
     }
+    // An index may list several versions of a package; keep only the newest, so every lookup
+    // by name (which takes the first match) gets it.
+    v.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| ver_cmp(&b.version, &a.version)));
+    v.dedup_by(|later, first| later.name == first.name);
     Some(v)
 }
 

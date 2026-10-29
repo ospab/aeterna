@@ -468,10 +468,22 @@ fn cmd_repo(args: &[String]) -> Res<()> {
             fs::create_dir_all(&arch_dir).map_err(|e| format!("{}: {}", arch_dir.display(), e))?;
             for f in &args[2..] {
                 let data = fs::read(f).map_err(|e| format!("{}: {}", f, e))?;
-                read_tmt(&data).map_err(|e| format!("{}: {}", f, e))?;
+                let info = read_tmt(&data).map_err(|e| format!("{}: {}", f, e))?;
                 let name = Path::new(f).file_name().ok_or("bad file name")?;
                 fs::write(arch_dir.join(name), &data).map_err(|e| e.to_string())?;
                 println!("added {}", name.to_string_lossy());
+                // Other versions of the same package are removed, so the repository holds one.
+                for e in fs::read_dir(&arch_dir).map_err(|e| e.to_string())? {
+                    let p = e.map_err(|e| e.to_string())?.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("tmt") || p.file_name() == Some(name) {
+                        continue;
+                    }
+                    let Ok(old) = fs::read(&p) else { continue };
+                    if read_tmt(&old).map(|o| o.name == info.name).unwrap_or(false) {
+                        fs::remove_file(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+                        println!("removed {}", p.file_name().unwrap().to_string_lossy());
+                    }
+                }
             }
             Ok(())
         }
@@ -499,6 +511,28 @@ fn cmd_repo(args: &[String]) -> Res<()> {
     }
 }
 
+/// Numeric-aware version comparison, the same rule as tomato: 1.10 > 1.9, 1.0.1 > 1.0.
+fn ver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut x = a.split(|c: char| c == '.' || c == '-');
+    let mut y = b.split(|c: char| c == '.' || c == '-');
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(p), Some(q)) => {
+                let o = match (p.parse::<u64>(), q.parse::<u64>()) {
+                    (Ok(m), Ok(n)) => m.cmp(&n),
+                    _ => p.cmp(q),
+                };
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+        }
+    }
+}
+
 /// Index format (UTF-8 text, signed byte-for-byte):
 ///   line 1:  `tmt-index 1`
 ///   then one line per package, TAB separated:
@@ -517,6 +551,7 @@ fn repo_index(arch_dir: &Path) -> Res<()> {
         let desc = meta_field(&info.meta, "description").replace(['\t', '\n', '\r'], " ");
         entries.push((
             info.name.clone(),
+            info.version.clone(),
             format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 info.name,
@@ -529,9 +564,12 @@ fn repo_index(arch_dir: &Path) -> Res<()> {
             ),
         ));
     }
-    entries.sort();
+    // Older versions of a package may stay in the directory; only the newest one is indexed,
+    // because clients take the first entry with a matching name.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| ver_cmp(&b.1, &a.1)));
+    entries.dedup_by(|later, first| later.0 == first.0);
     let mut out = String::from("tmt-index 1\n");
-    for (_, l) in &entries {
+    for (_, _, l) in &entries {
         out.push_str(l);
     }
     fs::write(arch_dir.join("index"), out.as_bytes()).map_err(|e| e.to_string())?;

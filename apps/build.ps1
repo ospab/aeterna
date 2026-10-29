@@ -38,7 +38,8 @@ Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 try {
     # 1. Host packer. Pass the host triple so the kernel's .cargo/config.toml
     #    (bare-metal target + build-std) from the repository root does not apply.
-    if (-not (Test-Path $Tmt)) {
+    $tmtSrc = Join-Path $TmtDir 'src\main.rs'
+    if (-not (Test-Path $Tmt) -or (Get-Item $tmtSrc).LastWriteTime -gt (Get-Item $Tmt).LastWriteTime) {
         $hostTriple = ((rustc -vV) -match '^host:' -replace '^host:\s*', '').Trim()
         Push-Location $TmtDir
         try { Run 'Building tmt' { cargo build --release --target $hostTriple } } finally { Pop-Location }
