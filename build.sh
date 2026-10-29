@@ -1,39 +1,26 @@
 #!/usr/bin/env bash
-# Build script for ospab.os v2 (AETERNA) — kernel + Limine + hybrid ISO (BIOS + UEFI)
+# Build script for ospab.os v2 (AETERNA): kernel, ospab-boot (BIOS + UEFI), ISO and disk image.
 #
 # Usage:
-#   ./build.sh           — build kernel + ISO (Limine; our UEFI loader as an extra menu entry)
-#   ./build.sh kernel    — build kernel only (no ISO)
-#   ./build.sh image     — build kernel + our UEFI loader (boot/uefi) + GPT/FAT32 disk image
-#                          isos/ospab-os-v2-N.img; no WSL, xorriso or Limine needed
+#   ./build.sh           - kernel + both loaders + hybrid ISO (BIOS + UEFI, bootable from CD and USB)
+#                          isos/ospab-os-v2-N.iso; needs xorriso and mtools (use WSL on Windows)
+#   ./build.sh kernel    - build the kernel only
+#   ./build.sh image     - kernel + both loaders + GPT disk image isos/ospab-os-v2-N.img
+#                          (BIOS boot partition + FAT32 ESP; no WSL or xorriso needed)
 #
 # Env:
-#   TARGET               — rust target (e.g. x86_64-unknown-none; empty = host)
-#   LIMINE_BIN_DIR       — dir with BOOTX64.EFI, limine-bios.sys, limine-bios-cd.bin
-#   LIMINE_CONF_SRC     — path to limine.conf (default: ./limine.conf)
+#   TARGET               - rust target of the kernel (e.g. x86_64-unknown-none; empty = custom json)
+#   ISO_ROOT             - staging directory for the ISO (default: a temp dir)
+#   ISO_PATH             - output ISO path (default: isos/ospab-os-v2-N.iso)
 #
-# Requires: cargo, xorriso, mtools (mcopy, mmd, mkfs.vfat), dd
-# Optional: limine CLI (enroll-config, bios-install), isohybrid
+# Requires: cargo (nightly, rust-src), dd; for the ISO also xorriso, mtools (mcopy, mmd), mkfs.vfat
+# Documentation: docs/en/building.md
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 ISOS_DIR="$PROJECT_ROOT/isos"
-# Limine: put BOOTX64.EFI, limine-bios.sys, limine-bios-cd.bin in tools/limine/bin
-# Or set LIMINE_BIN_DIR to your limine-10.8.2/bin (e.g. ../limine-10.8.2/bin)
-if [ -z "$LIMINE_BIN_DIR" ]; then
-    if [ -d "$PROJECT_ROOT/tools/limine/bin" ]; then
-        LIMINE_BIN_DIR="$PROJECT_ROOT/tools/limine/bin"
-    elif [ -d "$PROJECT_ROOT/../limine-10.8.2/bin" ]; then
-        LIMINE_BIN_DIR="$PROJECT_ROOT/../limine-10.8.2/bin"
-    else
-        LIMINE_BIN_DIR="$PROJECT_ROOT/tools/limine/bin"
-    fi
-fi
-LIMINE_CONF_SRC="${LIMINE_CONF_SRC:-$PROJECT_ROOT/limine.conf}"
 TARGET="${TARGET:-}"
-ISO_ROOT="${ISO_ROOT:-/tmp/ospab_os_v2_iso_root}"
-ESP_IMG="$ISO_ROOT/efiboot.img"
 BUILD_ISO=true
 BUILD_IMAGE=false
 [ "$1" = "kernel" ] && BUILD_ISO=false
@@ -64,7 +51,7 @@ if [ -z "${OSPAB_BUILD:-}" ]; then
 fi
 export OSPAB_BUILD
 
-echo "=== Building ospab.os v2 (AETERNA) — ISO #$NEXT_NUM ==="
+echo "=== Building ospab.os v2 (AETERNA) - build #$NEXT_NUM ==="
 cd "$PROJECT_ROOT"
 
 # --- Build DOOM C engine (if not already built) ---
@@ -118,20 +105,22 @@ fi
 
 [ "$BUILD_ISO" = false ] && [ "$BUILD_IMAGE" = false ] && exit 0
 
-# --- Build our UEFI loader (boot/uefi, target x86_64-unknown-uefi via build-std) ---
-# Like user/, it has its own .cargo/config.toml, so RUSTFLAGS must not leak in.
+# --- Loaders: both have their own .cargo/config.toml, so RUSTFLAGS must not leak in ---
+echo "--- Building UEFI loader (boot/uefi) ---"
+( cd "$PROJECT_ROOT/boot/uefi" && env -u RUSTFLAGS cargo +nightly build --release ) || {
+    echo "ERROR: UEFI loader failed to build" >&2
+    exit 1
+}
 LOADER_EFI="$PROJECT_ROOT/boot/uefi/target/x86_64-unknown-uefi/release/ospab_boot.efi"
-echo "--- Building UEFI loader ---"
-if ! ( cd "$PROJECT_ROOT/boot/uefi" && env -u RUSTFLAGS cargo +nightly build --release ); then
-    if [ "$BUILD_IMAGE" = true ]; then
-        echo "ERROR: UEFI loader failed to build" >&2
-        exit 1
-    fi
-    echo "WARN: UEFI loader failed to build; the ISO will not have the ospab loader entry"
-    LOADER_EFI=
-fi
 
-# --- GPT + FAT32 disk image with our loader (no Limine) ---
+echo "--- Building BIOS loader (boot/bios) ---"
+BIOS_IMG="$PROJECT_ROOT/boot/bios/target/bios.img"
+bash "$PROJECT_ROOT/scripts/bios-image.sh" "$BIOS_IMG" || {
+    echo "ERROR: BIOS loader failed to build" >&2
+    exit 1
+}
+
+# --- GPT disk image: BIOS boot partition + FAT32 ESP, no extra tools ---
 if [ "$BUILD_IMAGE" = true ]; then
     # Host tool, built with plain rustc so it ignores the kernel's .cargo/config.toml
     MKIMAGE="$PROJECT_ROOT/target/mkimage"
@@ -143,119 +132,35 @@ if [ "$BUILD_IMAGE" = true ]; then
     fi
     IMG_PATH="$ISOS_DIR/ospab-os-v2-${NEXT_NUM}.img"
     echo "--- Creating disk image ---"
-    "$MKIMAGE" "$IMG_PATH"         "EFI/BOOT/BOOTX64.EFI=$LOADER_EFI"         "EFI/OSPAB/OSPABLDR.EFI=$LOADER_EFI"         "boot/KERNEL=$KERNEL_BIN"         "boot/ospab.cfg=$PROJECT_ROOT/boot/ospab.cfg"
+    "$MKIMAGE" "$IMG_PATH" --bios "$BIOS_IMG" \
+        "EFI/BOOT/BOOTX64.EFI=$LOADER_EFI" \
+        "EFI/OSPAB/OSPABLDR.EFI=$LOADER_EFI" \
+        "boot/KERNEL=$KERNEL_BIN" \
+        "boot/bios.img=$BIOS_IMG" \
+        "boot/ospab.cfg=$PROJECT_ROOT/boot/ospab.cfg"
     echo ""
-    echo "DONE. Image: $IMG_PATH"
-    echo "Run (UEFI only): qemu-system-x86_64 -drive file=\"$IMG_PATH\",format=raw -m 512M -serial stdio \\"
-    echo "                   -drive if=pflash,format=raw,readonly=on,file=<edk2-x86_64-code.fd>"
-    echo "VMware: convert with qemu-img convert -O vmdk, firmware = UEFI"
+    echo "DONE. Image: $IMG_PATH (BIOS and UEFI)"
+    echo "Run (BIOS):  qemu-system-x86_64 -drive file=\"$IMG_PATH\",format=raw -m 512M -serial stdio"
+    echo "Run (UEFI):  add -drive if=pflash,format=raw,readonly=on,file=<edk2-x86_64-code.fd>"
+    echo "VMware: convert with qemu-img convert -O vmdk; firmware BIOS or UEFI"
     exit 0
 fi
 
-# --- Ensure Limine binaries (build from limine-10.8.2 if missing) ---
-LIMINE_NEEDED=
-[ ! -f "$LIMINE_BIN_DIR/BOOTX64.EFI" ] && LIMINE_NEEDED=1
-[ ! -f "$LIMINE_BIN_DIR/limine-bios.sys" ] && LIMINE_NEEDED=1
-[ ! -f "$LIMINE_BIN_DIR/limine-bios-cd.bin" ] && LIMINE_NEEDED=1
-[ ! -f "$LIMINE_BIN_DIR/limine-uefi-cd.bin" ] && LIMINE_NEEDED=1
-
-if [ -n "$LIMINE_NEEDED" ]; then
-    LIMINE_SRC="${LIMINE_SRC:-$PROJECT_ROOT/limine-10.8.2}"
-    if [ -f "$LIMINE_SRC/configure" ]; then
-        echo "--- Building Limine from $LIMINE_SRC ---"
-        mkdir -p "$PROJECT_ROOT/tools/limine/bin"
-        ( cd "$LIMINE_SRC" && ./configure --enable-bios --enable-bios-cd --enable-uefi-x86-64 --enable-uefi-cd && make -j"$(nproc 2>/dev/null || echo 2)" )
-        LIMINE_BUILT_BIN="$LIMINE_SRC/bin"
-        if [ -d "$LIMINE_BUILT_BIN" ] && [ -f "$LIMINE_BUILT_BIN/BOOTX64.EFI" ]; then
-            cp -f "$LIMINE_BUILT_BIN/BOOTX64.EFI" "$LIMINE_BUILT_BIN/limine-bios.sys" \
-                  "$LIMINE_BUILT_BIN/limine-bios-cd.bin" "$PROJECT_ROOT/tools/limine/bin/"
-            [ -f "$LIMINE_BUILT_BIN/limine-uefi-cd.bin" ] && \
-                cp -f "$LIMINE_BUILT_BIN/limine-uefi-cd.bin" "$PROJECT_ROOT/tools/limine/bin/"
-            [ -x "$LIMINE_BUILT_BIN/limine" ] && cp -f "$LIMINE_BUILT_BIN/limine" "$PROJECT_ROOT/tools/limine/bin/"
-            LIMINE_BIN_DIR="$PROJECT_ROOT/tools/limine/bin"
-            echo "--- Limine binaries copied to $LIMINE_BIN_DIR ---"
-        fi
-    fi
-fi
-
-if [ ! -f "$LIMINE_BIN_DIR/BOOTX64.EFI" ] || [ ! -f "$LIMINE_BIN_DIR/limine-bios.sys" ] || \
-   [ ! -f "$LIMINE_BIN_DIR/limine-bios-cd.bin" ] || [ ! -f "$LIMINE_BIN_DIR/limine-uefi-cd.bin" ]; then
-    echo "ERROR: Limine binaries not found in $LIMINE_BIN_DIR" >&2
-    echo "  Required: BOOTX64.EFI, limine-bios.sys, limine-bios-cd.bin, limine-uefi-cd.bin" >&2
-    echo "  Put limine-10.8.2 source in project root and run ./build.sh again, or copy from release." >&2
-    exit 1
-fi
-
-# --- Prepare ISO root ---
-echo "--- Preparing ISO root ---"
-rm -rf "$ISO_ROOT"
-mkdir -p "$ISO_ROOT/boot/limine"
-mkdir -p "$ISO_ROOT/EFI/BOOT"
-
-# Kernel: copy as expected by limine.conf (AETERNA Live = /boot/ospab-live.elf) and legacy name
-cp "$KERNEL_BIN" "$ISO_ROOT/boot/ospab-live.elf"
-cp "$KERNEL_BIN" "$ISO_ROOT/boot/KERNEL"
-
-# Limine config — place at ALL standard search locations so both BIOS and UEFI
-# variants of Limine can find it regardless of boot medium/partition.
-if [ -f "$LIMINE_CONF_SRC" ]; then
-    cp "$LIMINE_CONF_SRC" "$ISO_ROOT/limine.conf"
-    cp "$LIMINE_CONF_SRC" "$ISO_ROOT/boot/limine/limine.conf"
-else
-    echo "WARN: $LIMINE_CONF_SRC not found; using minimal limine.conf"
-    cat > "$ISO_ROOT/limine.conf" << 'EOF'
-timeout: 5
-
-/AETERNA
-    protocol: limine
-    kernel_path: boot():/boot/KERNEL
-EOF
-    cp "$ISO_ROOT/limine.conf" "$ISO_ROOT/boot/limine/limine.conf"
-fi
-
-# Limine BIOS stages
-cp "$LIMINE_BIN_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"
-cp "$LIMINE_BIN_DIR/limine-bios.sys"    "$ISO_ROOT/boot/limine/"
-# UEFI — boot loader + CD image
-cp "$LIMINE_BIN_DIR/BOOTX64.EFI"        "$ISO_ROOT/EFI/BOOT/"
-cp "$LIMINE_BIN_DIR/limine-uefi-cd.bin"  "$ISO_ROOT/boot/limine/"
-# Our UEFI loader, chainloaded from the Limine menu (test entry in limine.conf).
-# It reads ISO9660 itself and boots /boot/KERNEL with /boot/ospab.cfg.
-if [ -n "$LOADER_EFI" ] && [ -f "$LOADER_EFI" ]; then
-    mkdir -p "$ISO_ROOT/EFI/OSPAB"
-    cp "$LOADER_EFI" "$ISO_ROOT/EFI/OSPAB/OSPABLDR.EFI"
-    cp "$PROJECT_ROOT/boot/ospab.cfg" "$ISO_ROOT/boot/ospab.cfg"
-fi
-
-# --- Build hybrid ISO with xorriso (BIOS + UEFI) ---
-# Uses official Limine method: limine-uefi-cd.bin as El Torito EFI boot image,
-# -efi-boot-part creates a proper GPT EFI System Partition from it.
-echo "--- Creating hybrid ISO (xorriso) ---"
-xorriso -as mkisofs \
-    -R -r -J \
-    -b boot/limine/limine-bios-cd.bin \
-    -no-emul-boot \
-    -boot-load-size 4 \
-    -boot-info-table \
-    -hfsplus \
-    -apm-block-size 2048 \
-    --efi-boot boot/limine/limine-uefi-cd.bin \
-    -efi-boot-part \
-    --efi-boot-image \
-    --protective-msdos-label \
-    "$ISO_ROOT" -o "$ISO_PATH"
-
-# --- Post-process with Limine CLI (enroll config hash, install BIOS boot) ---
-echo "--- Post-processing ---"
-LIMINE_CLI="$LIMINE_BIN_DIR/limine"
-if [ -x "$LIMINE_CLI" ]; then
-    "$LIMINE_CLI" bios-install "$ISO_PATH" 2>/dev/null || true
-else
-    echo "Note: limine CLI not found; skip bios-install"
-fi
+# --- Hybrid ISO: El Torito BIOS + UEFI, MBR/GPT for USB sticks ---
+export PATH="$PATH:/usr/sbin:/sbin"
+for tool in xorriso mcopy mkfs.vfat; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "ERROR: $tool not found. The ISO needs xorriso, mtools and mkfs.vfat: run ./build.sh in WSL/Linux," >&2
+        echo "       or use ./build.sh image (disk image, no extra tools)." >&2
+        exit 1
+    }
+done
+echo "--- Creating hybrid ISO ---"
+KERNEL="$KERNEL_BIN" LOADER="$LOADER_EFI" BIOS="$BIOS_IMG" CFG="$PROJECT_ROOT/boot/ospab.cfg" \
+    bash "$PROJECT_ROOT/scripts/mkiso.sh" "$ISO_PATH"
 
 echo ""
 echo "DONE. ISO: $ISO_PATH"
-echo "Run with UEFI:  qemu-system-x86_64 -cdrom \"$ISO_PATH\" -m 256M -serial stdio -bios /usr/share/OVMF/OVMF_CODE.fd"
-echo "Run with BIOS:  qemu-system-x86_64 -cdrom \"$ISO_PATH\" -m 256M -serial stdio"
-echo "Write to USB:   sudo dd if=\"$ISO_PATH\" of=/dev/sdX bs=4M status=progress && sync"
+echo "Run (BIOS):  qemu-system-x86_64 -cdrom \"$ISO_PATH\" -m 512M -serial stdio"
+echo "Run (UEFI):  add -drive if=pflash,format=raw,readonly=on,file=<edk2-x86_64-code.fd>"
+echo "Write to USB: sudo dd if=\"$ISO_PATH\" of=/dev/sdX bs=4M status=progress && sync"

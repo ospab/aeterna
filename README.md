@@ -29,7 +29,7 @@ the [OSTP](https://github.com/ospab/ostp) transport.
 
 | Area | State |
 |---|---|
-| Boot | Own UEFI loader **ospab-boot** (menu, FAT and ISO9660 readers); Limine for the hybrid BIOS/UEFI ISO |
+| Boot | Own loader **ospab-boot** for BIOS and UEFI (menu, memory test, FAT and ISO9660 readers); hybrid ISO that boots from CD and USB on both |
 | Install | Full-screen installer: erase a disk, or **install alongside** Windows and Linux on the existing ESP |
 | CPU | GDT/TSS, IDT, APIC timer, preemptive scheduler, per-task kernel stacks, XSAVE (AVX state) |
 | Memory | Bitmap frame allocator, 4-level paging, per-process address spaces, NX, SMEP/SMAP |

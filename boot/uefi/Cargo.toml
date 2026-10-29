@@ -4,7 +4,7 @@ version = "0.1.0"
 license = "AGPL-3.0-only"
 authors = ["ospab "]
 edition = "2021"
-description = "ospab.os UEFI loader (replaces Limine on UEFI machines)"
+description = "ospab-boot UEFI front-end (the BIOS front-end is boot/bios)"
 
 # Standalone: not a member of the kernel package.
 [workspace]

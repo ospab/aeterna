@@ -1,4 +1,6 @@
-/* Linker script for ospab.os v2 (AETERNA) - Limine boot protocol */
+/* Linker script for ospab.os v2 (AETERNA)
+   Loaded by ospab-boot (boot/bios, boot/uefi): the loader reads the PT_LOAD segments below and
+   maps them at KERNEL_VIRT; KERNEL_PHYS is only the physical address the segments claim. */
 
 ENTRY(_start)
 
@@ -19,13 +21,6 @@ SECTIONS
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRT + KERNEL_PHYS)
     {
         *(.text .text.*)
-    } :text
-
-    .limine_requests ALIGN(8) : AT(ADDR(.limine_requests) - KERNEL_VIRT + KERNEL_PHYS)
-    {
-        KEEP(*(.limine_requests_start))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end))
     } :text
 
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRT + KERNEL_PHYS)

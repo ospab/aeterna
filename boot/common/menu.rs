@@ -196,7 +196,7 @@ fn draw(t: &mut dyn Term, pal: &Palette, cfg: &Config, vis: &[usize], sel: usize
     if matches!(e.typ, EntryType::Ospab | EntryType::Memtest) {
         t.put(rows - 4, 2, &alloc::format!("cmdline: {}", e.cmdline), pal.dim);
     }
-    t.put(rows - 3, 2, "Up/Down select   Enter boot   1-9 boot that entry   e edit command line   Esc stop timer", pal.dim);
+    t.put(rows - 3, 2, "Up/Down select  Enter boot  1-9 jump  e edit command line  Esc stop timer", pal.dim);
     if !note.is_empty() {
         t.put(rows - 2, 2, note, pal.error);
     } else if let Some(s) = countdown {

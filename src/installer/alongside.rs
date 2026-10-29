@@ -9,7 +9,9 @@
  *     (primary entry sector + primary header + backup entry sector + backup header);
  *   - reuses the existing EFI System Partition (FAT32): adds \EFI\ospab\ with
  *     OSPABLDR.EFI, ospab.cfg and KERNEL; every other ESP file stays as it is;
- *   - never writes UEFI NVRAM (the final screen explains how to boot it).
+ *   - never writes UEFI NVRAM (the final screen explains how to boot it);
+ *   - never writes MBR boot code, so it is refused when the live system runs on BIOS
+ *     (the BIOS loader would have to replace the boot code of the existing systems).
  *
  * Safety:
  *   - the whole change is computed in memory first (`Plan`) and shown as a dry-run
@@ -746,6 +748,12 @@ fn error_box(row: u64, title: &str, msg: &str) {
 
 /// Returns Nav::Next when the whole alongside install ran (successfully or not).
 pub fn run(d: &VDisk, cfg: &Config, img: &Images) -> Nav {
+    // Refused on BIOS (the welcome page says why): this mode never touches MBR boot code.
+    if ospab_os::arch::x86_64::boot::is_bios() {
+        slog("[ALONGSIDE] refused: BIOS boot
+");
+        return Nav::Back;
+    }
     set_alongside(true);
     let r = run_inner(d, cfg, img);
     set_alongside(false);

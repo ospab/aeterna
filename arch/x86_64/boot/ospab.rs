@@ -1,15 +1,15 @@
 /*
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-ospab boot protocol provider: our own loaders (UEFI today, BIOS later).
+ospab boot protocol: the loaders of boot/uefi and boot/bios.
 
 The loader hands over a `BootInfo` with physical addresses only (see ospab_proto.rs).
-`early_init` copies it into kernel statics in the same shapes the Limine provider
-returns, so the rest of the kernel does not care which loader started it.
+`early_init` copies it into kernel statics (types.rs) so the rest of the kernel does not
+care whether the BIOS or the UEFI loader started it.
 */
 use core::ptr;
 
-use super::limine::{Framebuffer, LimineFile, MemmapEntry, MemmapIterator, ModuleIterator};
+use super::types::{BootFile, Framebuffer, MemmapEntry, MemmapIterator, ModuleIterator};
 use super::ospab_proto::*;
 
 const MAX_MEMMAP: usize = 512;
@@ -50,25 +50,10 @@ static mut MEMMAP: [MemmapEntry; MAX_MEMMAP] =
 static mut MEMMAP_PTRS: [*mut MemmapEntry; MAX_MEMMAP] = [ptr::null_mut(); MAX_MEMMAP];
 static mut MEMMAP_COUNT: usize = 0;
 
-static mut MODULES: [LimineFile; MAX_MODULES] = [const {
-    LimineFile {
-        revision: 0,
-        address: ptr::null_mut(),
-        size: 0,
-        path: ptr::null(),
-        cmdline: ptr::null(),
-        media_type: 0,
-        unused: 0,
-        tftp_ip: 0,
-        tftp_port: 0,
-        partition_index: 0,
-        mbr_disk_id: 0,
-        gpt_disk_uuid: [0; 16],
-        gpt_part_uuid: [0; 16],
-        part_uuid: [0; 16],
-    }
+static mut MODULES: [BootFile; MAX_MODULES] = [const {
+    BootFile { address: ptr::null_mut(), size: 0, path: ptr::null(), cmdline: ptr::null() }
 }; MAX_MODULES];
-static mut MODULE_PTRS: [*mut LimineFile; MAX_MODULES] = [ptr::null_mut(); MAX_MODULES];
+static mut MODULE_PTRS: [*mut BootFile; MAX_MODULES] = [ptr::null_mut(); MAX_MODULES];
 static mut MODULE_COUNT: usize = 0;
 
 /// Called first thing from the kernel entry point with the entry registers
@@ -79,7 +64,7 @@ static mut MODULE_COUNT: usize = 0;
 /// Must be called once, on the boot CPU, before anything reads boot data.
 pub unsafe fn early_init(info_phys: u64, magic: u64, hhdm: u64) -> bool {
     if magic != OSPAB_BOOT_MAGIC || info_phys == 0 || hhdm == 0 {
-        return false; // Limine zeroes every register except RSP
+        return false; // not started by an ospab loader
     }
     let info = &*((info_phys + hhdm) as *const BootInfo);
     if info.magic != OSPAB_BOOT_MAGIC || info.version != OSPAB_BOOT_VERSION {
@@ -179,7 +164,7 @@ unsafe fn c_str(phys: u64, hhdm: u64) -> &'static str {
     core::str::from_utf8(core::slice::from_raw_parts(p, len)).unwrap_or("")
 }
 
-// ─── Accessors (same shapes as the Limine provider) ─────────────────────────
+// ─── Accessors ──────────────────────────────────────────────────────────────────────────────────────
 
 pub fn active() -> bool { unsafe { ACTIVE } }
 pub fn hhdm_offset() -> Option<u64> { unsafe { Some(HHDM) } }
@@ -208,14 +193,14 @@ pub fn memory_map() -> Option<MemmapIterator> {
 pub fn modules() -> Option<ModuleIterator> {
     unsafe {
         if MODULE_COUNT == 0 { return None; }
-        Some(ModuleIterator::from_raw(ptr::addr_of_mut!(MODULE_PTRS) as *mut *mut LimineFile,
+        Some(ModuleIterator::from_raw(ptr::addr_of_mut!(MODULE_PTRS) as *mut *mut BootFile,
                                       MODULE_COUNT))
     }
 }
 
 pub fn module_count() -> usize { unsafe { MODULE_COUNT } }
 
-pub fn get_module(index: usize) -> Option<&'static LimineFile> {
+pub fn get_module(index: usize) -> Option<&'static BootFile> {
     unsafe {
         if index >= MODULE_COUNT { None } else { Some(&*ptr::addr_of!(MODULES[index])) }
     }

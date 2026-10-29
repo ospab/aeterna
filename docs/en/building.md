@@ -7,15 +7,17 @@
 - Stable Rust for the host tools (`tools/tmt`), selected automatically by its
   `rust-toolchain.toml`.
 - For the ISO: `xorriso`, `mtools` and `mkfs.vfat`. On Windows these come from WSL; the kernel,
-  user programs, loader and disk image build natively in Git Bash.
+  user programs, both loaders and the disk image build natively in Git Bash.
+- No assembler is needed: the BIOS loader's real-mode code is `global_asm!` in Rust (see
+  [Boot](boot.md)). Only `dd` is used to place the BIOS stage 2 in `bios.img`.
 - For the DOOM build: a C compiler in WSL/Linux (`target/doom/libdoom.a` is reused once built).
 
 ## Build targets
 
 ```bash
 ./build.sh kernel   # kernel only: a fast compile check (build number "dev")
-./build.sh          # kernel + loader + hybrid BIOS/UEFI ISO: isos/ospab-os-v2-N.iso
-./build.sh image    # kernel + loader + GPT/FAT32 disk image: isos/ospab-os-v2-N.img (no WSL)
+./build.sh          # kernel + both loaders + hybrid BIOS+UEFI ISO: isos/ospab-os-v2-N.iso
+./build.sh image    # kernel + both loaders + GPT disk image (BIOS boot partition + FAT32 ESP): isos/ospab-os-v2-N.img (no WSL)
 ```
 
 On Windows run the ISO build through WSL:
@@ -26,8 +28,10 @@ wsl.exe -d Debian -e bash -lc 'cd /mnt/d/ospab-projects/ospab.os-v2 && ./build.s
 
 What `build.sh` does, in order: builds the ring-3 programs in `user/` (without `RUSTFLAGS`, which
 would override their linker script), builds the kernel for `x86_64-ospab.json`, builds the
-ospab-boot loader in `boot/uefi`, then assembles the ISO with Limine and our loader as an extra
-menu entry, or the disk image with `tools/mkimage.rs`.
+ospab-boot UEFI loader in `boot/uefi` and the BIOS loader in `boot/bios` (`scripts/bios-image.sh`),
+then assembles the hybrid ISO with `scripts/mkiso.sh` (xorriso: El Torito BIOS and UEFI, MBR and GPT
+for USB sticks), or the disk image with `tools/mkimage.rs`. The ISO boots on BIOS and UEFI machines,
+from a CD and from a USB stick (`dd if=ospab-os-v2-N.iso of=/dev/sdX bs=4M`).
 
 ## Build number
 
@@ -46,13 +50,14 @@ Environment overrides:
 | `ISO_PATH` | write the ISO to this path instead of the numbered name (the build number becomes `dev`) |
 | `ISO_ROOT` | staging directory for the ISO tree; give parallel builds different ones |
 | `OSPAB_BUILD` | force the build number |
-| `LIMINE_BIN_DIR`, `LIMINE_CONF_SRC` | Limine binaries and config |
 
 ## Other parts
 
 | Part | Command |
 |---|---|
-| ospab-boot loader | `cd boot/uefi && cargo build --release` |
+| ospab-boot UEFI loader | `cd boot/uefi && cargo build --release` |
+| ospab-boot BIOS loader | `scripts/bios-image.sh` (writes `boot/bios/target/bios.img`) |
+| ISO from built parts | `scripts/mkiso.sh [OUT.iso]` (in WSL/Linux; env `KERNEL`, `LOADER`, `BIOS`, `CFG`, `ISO_ROOT`) |
 | Packaged programs and repository | `bash apps/build.sh [repo DIR]` or `.\apps\build.ps1 [-Repo DIR]` |
 | tmt host tool | `bash tools/tmt/build.sh` |
 | GUI mockups (host) | see `gui/` |

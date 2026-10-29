@@ -4,7 +4,9 @@ Run `install` in the live system, or pick **ospab.os Installer** in the boot men
 is a full-screen wizard: Welcome → Disk → Options → Confirm → Install → Done. Esc goes back; Esc or
 `q` quits on any page before anything is written.
 
-The installed system boots through UEFI only, so the machine (or VM) must use UEFI firmware.
+A disk made by **Mode 1** boots on both BIOS and UEFI machines. **Mode 2** (alongside) needs UEFI:
+it is refused when the live system runs on BIOS, because it would have to replace the boot code in the
+MBR of the other systems. Both modes work from a live system started on UEFI.
 
 ## Mode 1: erase a disk
 
@@ -12,11 +14,13 @@ The whole disk is repartitioned:
 
 | Partition | Contents |
 |---|---|
+| MBR (sector 0) | protective MBR with the BIOS boot code (stage 1 of ospab-boot) |
+| BIOS boot partition (LBA 34..2047, 1 MiB) | stage 2 of ospab-boot, for BIOS machines |
 | EFI System Partition (FAT32) | `\EFI\BOOT\BOOTX64.EFI` (ospab-boot), `\boot\KERNEL`, `\boot\ospab.cfg` |
 | AETERNA | the saved writable filesystem layer (persistence) |
 
 You choose the disk, the ESP size, a host name and a locale, then confirm by typing `yes`. The
-installer copies the files, verifies them by reading them back (9 checks) and offers **Reboot
+installer copies the files, verifies them by reading them back (10 checks, including the BIOS boot code) and offers **Reboot
 now**.
 
 ## Mode 2: install alongside other systems
@@ -37,6 +41,9 @@ It refuses, with an explanation and without writing anything, if the disk uses M
 backup GPT is damaged, if there is no free space or no ESP, if the ESP is not FAT32, or if
 `\EFI\ospab` already exists. It does not shrink partitions: free space first with Windows Disk
 Management or a Linux partition tool.
+
+On BIOS the welcome page shows "Not available on BIOS" and does not continue. The layout of both modes
+and the BIOS boot flow are described in [Boot](boot.md).
 
 ### Booting the system installed alongside
 

@@ -1,0 +1,12 @@
+# Overrides the kernel's ../../.cargo/config.toml.
+# Output: target/x86_64-unknown-none/release/ospab_bios is the raw boot image
+# (stage1 at offset 0, stage2 at offset 0x800), see link.ld.
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=small"]

@@ -635,6 +635,14 @@ fn ring3_self_test() {
         }
     }
 
+    // Synchronization layer: lock behavior, then concurrent spawn/reap with per-task fds.
+    if selftest("sched") {
+        check("sync", ospab_os::core::selftest::sync_basic());
+        check("sched stress", ospab_os::core::selftest::sched_stress());
+    } else {
+        serial_line!("[RING3] sched tests: skipped (boot with selftest=sched to run them)");
+    }
+
     // Dead tasks are reaped lazily by the scheduler; give it a few ticks, then every
     // frame the tests used (kernel stacks, page tables, stacks, mmap) must be back.
     for _ in 0..10 {

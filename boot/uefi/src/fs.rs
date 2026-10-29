@@ -6,12 +6,12 @@ Reading files from the boot medium.
 Two kinds of volume:
 - FAT (or anything the firmware exposes as SimpleFileSystem): a GPT disk image,
   an installed ESP.
-- ISO9660 read directly over BlockIo: when Limine chainloads us from the hybrid
-  ISO, the firmware only exposes the El Torito FAT image as a file system, while
-  the kernel lives in the ISO9660 tree. Primary volume descriptor → root
+- ISO9660 read directly over BlockIo: from a CD or a hybrid ISO the firmware may expose
+  only the El Torito FAT image as a file system, while the kernel is also in the
+  ISO9660 tree. Primary volume descriptor → root
   directory → path lookup; names compare case-insensitively with ";1" dropped.
 
-Paths are written with '/' (like limine.conf) and start at the volume root.
+Paths are written with '/' (like ospab.cfg) and start at the volume root.
 */
 use alloc::vec;
 use alloc::vec::Vec;

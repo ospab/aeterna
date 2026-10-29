@@ -118,11 +118,14 @@ pub fn run() -> ! {
 
     framebuffer::clear(BG);
     framebuffer::set_cursor_pos(0, 0);
+    framebuffer::shadow_enable();
     print_banner();
 
     klog::record(klog::EventSource::Terminal, "Terminal started");
     ospab_os::core::syscall::set_console_stdout(true);
     init_clock();
+    // Saved resolution, autofit and font scale (/etc/display.conf).
+    ospab_os::drivers::gpu::display::apply_saved();
 
     // Kernel parameter session=desktop: start the graphical session; logging out returns to the console.
     if ospab_os::arch::x86_64::boot::cmdline_get("session") == "desktop" {
@@ -218,6 +221,20 @@ fn draw_prompt() {
     }
 }
 
+/// The screen mode changed under the line editor: the console was redrawn, so
+/// move the remembered prompt position onto the new grid and show the cursor.
+fn on_display_changed() {
+    unsafe {
+        let (x, y) = framebuffer::remap_pos(PROMPT_END_X, PROMPT_END_Y);
+        PROMPT_END_X = x;
+        PROMPT_END_Y = y;
+        PROMPT_SCROLLS = framebuffer::scroll_count();
+        let (cx, cy) = input_screen_pos(INPUT_CURSOR);
+        framebuffer::set_cursor_pos(cx, cy);
+        draw_input_cursor();
+    }
+}
+
 /// If the screen scrolled since the prompt was drawn, move the remembered
 /// prompt position up by the same number of text rows.
 fn track_scroll() {
@@ -225,7 +242,7 @@ fn track_scroll() {
         let now = framebuffer::scroll_count();
         let delta = now.wrapping_sub(PROMPT_SCROLLS);
         if delta > 0 {
-            PROMPT_END_Y = PROMPT_END_Y.saturating_sub(delta * framebuffer::CHAR_HEIGHT);
+            PROMPT_END_Y = PROMPT_END_Y.saturating_sub(delta * framebuffer::cell_h());
             PROMPT_SCROLLS = now;
         }
     }
@@ -309,8 +326,8 @@ fn replace_input_line(new_text: &str) {
 /// Screen pixel position for a given input buffer index.
 fn input_screen_pos(idx: usize) -> (u64, u64) {
     unsafe {
-        let cw = framebuffer::CHAR_WIDTH;
-        let ch = framebuffer::CHAR_HEIGHT;
+        let cw = framebuffer::cell_w();
+        let ch = framebuffer::cell_h();
         let cols = framebuffer::screen_cols().max(1);
         let prompt_col = PROMPT_END_X / cw;
         let total_col = prompt_col + idx as u64;
@@ -507,6 +524,10 @@ fn read_line() -> &'static str {
                     }
                     // Keep an OSTP session alive while the console waits for input.
                     ospab_os::net::ostp::idle_poll();
+                    // VMware autofit: the host asked for another resolution.
+                    if ospab_os::drivers::gpu::display::poll() {
+                        on_display_changed();
+                    }
                     continue;
                 }
             };

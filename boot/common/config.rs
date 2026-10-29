@@ -131,6 +131,19 @@ fn new_config() -> Config {
     }
 }
 
+impl Config {
+    /// Drop entries the front-end cannot run (BIOS: firmware, efi-chainload); keeps `default` valid.
+    #[allow(dead_code)]
+    pub fn retain_entries(&mut self, keep: impl Fn(&Entry) -> bool) {
+        let def = self.entries.get(self.default).map(|e| e.id.clone());
+        self.entries.retain(|e| keep(e));
+        self.default = def
+            .and_then(|id| self.entries.iter().position(|e| e.id == id))
+            .or_else(|| self.entries.iter().position(|e| !e.hidden))
+            .unwrap_or(0);
+    }
+}
+
 fn blank_entry(id: &str, line: usize) -> Entry {
     Entry {
         id: id.to_string(),

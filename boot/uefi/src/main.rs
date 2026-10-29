@@ -20,11 +20,19 @@ mod efi;
 mod fs;
 mod memtest_ui;
 mod ops;
-mod paging;
+mod plat;
 mod term;
 #[allow(dead_code)]
 #[path = "../../../arch/x86_64/boot/ospab_proto.rs"]
 mod proto;
+#[path = "../../common/mem.rs"]
+mod mem;
+#[path = "../../common/paging.rs"]
+mod paging;
+#[path = "../../common/elf.rs"]
+mod elf;
+#[path = "../../common/handoff.rs"]
+mod handoff;
 #[path = "../../common/config.rs"]
 mod config;
 #[path = "../../common/memtest.rs"]
@@ -41,6 +49,9 @@ use config::{Config, EntryType, Resolution};
 use console::{alloc_pages, bs, st, PAGE};
 use efi::*;
 use fs::{Loaded, Volume};
+use elf::load_elf;
+use handoff::enter_kernel;
+use mem::StrArena;
 use paging::{PageTables, NX, W};
 use proto::*;
 
@@ -48,7 +59,7 @@ const LOADER_NAME: &str = "ospab-boot 0.2 (UEFI)";
 const CONFIG_PATH: &str = "/boot/ospab.cfg";
 const DEFAULT_KERNEL: &str = "/boot/KERNEL";
 const LOADER_ON_MEDIA: &str = "/EFI/OSPAB/OSPABLDR.EFI";
-/// Same offset Limine uses without KASLR, so kernel logs stay comparable.
+/// Start of the direct map (shared with the BIOS loader, see ospab_proto.rs).
 const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 const KERNEL_STACK: u64 = 128 * 1024;
 const MAX_REGIONS: usize = 512;
@@ -185,69 +196,6 @@ fn setup_framebuffer(res: Resolution) -> FramebufferInfo {
     fb
 }
 
-// ─── Kernel ELF ─────────────────────────────────────────────────────────────
-
-struct KernelImage {
-    entry: u64,
-    phys_base: u64,
-    virt_base: u64,
-}
-
-fn rd16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
-fn rd32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
-fn rd64(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) }
-
-/// Copy the PT_LOAD segments into one physically contiguous block and map them
-/// at their linked addresses.
-fn load_elf(file: &[u8], pt: &mut PageTables) -> Result<KernelImage, &'static str> {
-    if file.len() < 64 || &file[0..4] != b"\x7fELF" || file[4] != 2 || file[5] != 1 {
-        return Err("not an ELF64 little-endian file");
-    }
-    if rd16(file, 18) != 0x3E {
-        return Err("not an x86_64 ELF");
-    }
-    let entry = rd64(file, 24);
-    let phoff = rd64(file, 32) as usize;
-    let phentsize = rd16(file, 54) as usize;
-    let phnum = rd16(file, 56) as usize;
-    if phoff + phnum * phentsize > file.len() {
-        return Err("truncated program headers");
-    }
-    let phdrs = || (0..phnum).map(|i| &file[phoff + i * phentsize..]).filter(|p| rd32(p, 0) == 1);
-
-    let mut lo = u64::MAX;
-    let mut hi = 0u64;
-    for p in phdrs() {
-        let (vaddr, memsz) = (rd64(p, 16), rd64(p, 40));
-        lo = lo.min(vaddr & !(PAGE - 1));
-        hi = hi.max((vaddr + memsz + PAGE - 1) & !(PAGE - 1));
-    }
-    if lo >= hi || lo < 0xFFFF_8000_0000_0000 {
-        return Err("no higher-half PT_LOAD segments");
-    }
-    let phys = alloc_pages(((hi - lo) / PAGE) as usize, OSPAB_KERNEL_MEMORY);
-
-    for p in phdrs() {
-        let flags = rd32(p, 4);
-        let (off, vaddr, filesz, memsz) = (rd64(p, 8) as usize, rd64(p, 16), rd64(p, 32) as usize, rd64(p, 40));
-        if off + filesz > file.len() || filesz as u64 > memsz {
-            return Err("segment outside the file");
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(file.as_ptr().add(off), (phys + (vaddr - lo)) as *mut u8, filesz);
-        }
-        let mut pte = 0;
-        if flags & 2 != 0 { pte |= W; }
-        if flags & 1 == 0 { pte |= NX; }
-        let mut va = vaddr & !(PAGE - 1);
-        while va < vaddr + memsz {
-            pt.map_4k(va, phys + (va - lo), pte);
-            va += PAGE;
-        }
-    }
-    Ok(KernelImage { entry, phys_base: phys, virt_base: lo })
-}
-
 // ─── Memory map ─────────────────────────────────────────────────────────────
 
 struct RawMap {
@@ -353,62 +301,6 @@ fn convert_map(map: &RawMap, fb: &FramebufferInfo, out: &mut [MemoryRegion]) -> 
     m
 }
 
-// ─── Hand-off ───────────────────────────────────────────────────────────────
-
-core::arch::global_asm!(
-    ".global ospab_handoff",
-    "ospab_handoff:",
-    "cli",
-    "mov cr3, rcx",
-    "mov rsp, r8",
-    "push 0",
-    "mov rax, r9",
-    "xor ebx, ebx",
-    "xor ecx, ecx",
-    "xor ebp, ebp",
-    "xor r8d, r8d",
-    "xor r9d, r9d",
-    "xor r10d, r10d",
-    "xor r11d, r11d",
-    "xor r12d, r12d",
-    "xor r13d, r13d",
-    "xor r14d, r14d",
-    "xor r15d, r15d",
-    "jmp rax",
-);
-
-extern "sysv64" {
-    /// RDI = BootInfo phys, RSI = magic, RDX = HHDM, RCX = PML4, R8 = stack top, R9 = entry.
-    fn ospab_handoff(info: u64, magic: u64, hhdm: u64, cr3: u64, stack: u64, entry: u64) -> !;
-}
-
-/// Copies strings into reclaimable pages and returns their physical addresses.
-struct StrArena {
-    base: u64,
-    used: u64,
-    cap: u64,
-}
-
-impl StrArena {
-    fn new() -> Self {
-        StrArena { base: alloc_pages(2, OSPAB_RECLAIM_MEMORY), used: 0, cap: 2 * PAGE }
-    }
-
-    fn push(&mut self, s: &str) -> u64 {
-        let len = s.len() as u64 + 1;
-        if self.used + len > self.cap {
-            panic!("string arena full");
-        }
-        let at = self.base + self.used;
-        unsafe {
-            ptr::copy_nonoverlapping(s.as_ptr(), at as *mut u8, s.len());
-            *((at + s.len() as u64) as *mut u8) = 0;
-        }
-        self.used += len;
-        at
-    }
-}
-
 fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("cli; hlt") };
@@ -506,7 +398,7 @@ fn boot_kernel(image: Handle, vol: &mut Volume, cfg: &Config, entry: &config::En
         let end = (fb.phys_addr + fb.pitch * fb.height).next_multiple_of(MIB2);
         pt.map_2m_range(HHDM_OFFSET + start, start, end - start, W | NX);
     }
-    pt.identity(ospab_handoff as *const () as u64, 2 * PAGE);
+    pt.identity(handoff::ospab_handoff as *const () as u64, 2 * PAGE);
 
     let cr4: u64;
     unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4) };
@@ -548,11 +440,7 @@ fn boot_kernel(image: Handle, vol: &mut Volume, cfg: &Config, entry: &config::En
     }
 
     unsafe {
-        // NX bits are used in the tables, so EFER.NXE must be on before CR3 switches.
-        let (lo, hi): (u32, u32);
-        core::arch::asm!("rdmsr", in("ecx") 0xC000_0080u32, out("eax") lo, out("edx") hi);
-        core::arch::asm!("wrmsr", in("ecx") 0xC000_0080u32, in("eax") lo | (1 << 11), in("edx") hi);
-        ospab_handoff(
+        enter_kernel(
             info_phys,
             OSPAB_BOOT_MAGIC,
             HHDM_OFFSET,

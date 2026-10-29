@@ -1,13 +1,16 @@
 /*
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-mkimage — build a GPT disk image with one FAT32 EFI System Partition.
+mkimage — build a GPT disk image with one FAT32 EFI System Partition and, with --bios, a BIOS boot
+partition (LBA 34..2047) plus stage 1 in the MBR, so the image boots on BIOS and UEFI.
 
 No dependencies and no cargo project on purpose: build it with plain rustc on the
 host (Windows or Linux), so it does not inherit the kernel's .cargo/config.toml:
 
     rustc -O --edition 2021 tools/mkimage.rs -o target/mkimage(.exe)
-    mkimage out.img [--size-mib N] DEST=SRC [DEST=SRC ...]
+    mkimage out.img [--size-mib N] [--bios bios.img] DEST=SRC [DEST=SRC ...]
+
+bios.img comes from scripts/bios-image.sh (stage 1 at offset 0, stage 2 at 0x800).
 
 DEST is a path inside the ESP ("EFI/BOOT/BOOTX64.EFI"); every component must be a
 valid 8.3 name. All-lowercase names keep their case (NT case bits), so firmware
@@ -24,6 +27,10 @@ const GPT_ENTRY_SIZE: usize = 128;
 const GPT_ENTRY_SECTORS: u64 = (GPT_ENTRIES * GPT_ENTRY_SIZE / SECTOR) as u64;
 const RESERVED_SECTORS: u32 = 32;
 const ESP_TYPE: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+const BIOS_BOOT_TYPE: &str = "21686148-6449-6E6F-744E-656564454649";
+/// BIOS boot partition: the gap between the GPT and the ESP (LBA 34..2047, 503 KiB).
+const BIOS_PART_START: u64 = 2 + GPT_ENTRY_SECTORS;
+const BIOS_PART_END: u64 = PART_START - 1;
 
 enum Node {
     Dir(BTreeMap<String, Node>),
@@ -317,7 +324,7 @@ fn build_fat32(part: &mut [u8], root: &Node, serial: u32) {
 
 // ─── GPT ────────────────────────────────────────────────────────────────────
 
-fn write_gpt(img: &mut [u8], part_end: u64) {
+fn write_gpt(img: &mut [u8], part_end: u64, bios_part: bool) {
     let sectors = (img.len() / SECTOR) as u64;
 
     // Protective MBR.
@@ -338,6 +345,15 @@ fn write_gpt(img: &mut [u8], part_end: u64) {
     put64(&mut entries, 40, part_end);
     for (i, c) in "EFI System Partition".encode_utf16().enumerate() {
         put16(&mut entries, 56 + i * 2, c);
+    }
+    if bios_part {
+        entries[128..144].copy_from_slice(&guid_bytes(BIOS_BOOT_TYPE));
+        entries[144..160].copy_from_slice(&random_guid(4));
+        put64(&mut entries, 128 + 32, BIOS_PART_START);
+        put64(&mut entries, 128 + 40, BIOS_PART_END);
+        for (i, c) in "BIOS boot".encode_utf16().enumerate() {
+            put16(&mut entries, 128 + 56 + i * 2, c);
+        }
     }
     let entries_crc = crc32(&entries);
     let disk_guid = random_guid(2);
@@ -371,15 +387,22 @@ fn write_gpt(img: &mut [u8], part_end: u64) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0].starts_with('-') {
-        die("usage: mkimage OUT.img [--size-mib N] DEST=SRC ...");
+        die("usage: mkimage OUT.img [--size-mib N] [--bios BIOS.IMG] DEST=SRC ...");
     }
     let out = &args[0];
     let mut size_mib: Option<u64> = None;
+    let mut bios: Option<Vec<u8>> = None;
     let mut root = Node::Dir(BTreeMap::new());
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--size-mib" {
             size_mib = Some(args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or_else(|| die("bad --size-mib")));
+            i += 2;
+            continue;
+        }
+        if args[i] == "--bios" {
+            let p = args.get(i + 1).unwrap_or_else(|| die("--bios needs a file"));
+            bios = Some(std::fs::read(p).unwrap_or_else(|e| die(&format!("{}: {}", p, e))));
             i += 2;
             continue;
         }
@@ -411,8 +434,23 @@ fn main() {
     let p0 = PART_START as usize * SECTOR;
     let p1 = (part_end as usize + 1) * SECTOR;
     build_fat32(&mut img[p0..p1], &root, serial);
-    write_gpt(&mut img, part_end);
+    if let Some(b) = &bios {
+        // stage1 into the MBR (the partition table area is written by write_gpt), stage2 into the
+        // BIOS boot partition; stage1 learns where stage2 is at offset 0x40.
+        if b.len() < 0x800 + 512 || b[510] != 0x55 || b[511] != 0xAA {
+            die("--bios: not a bios.img (scripts/bios-image.sh)");
+        }
+        let stage2 = &b[0x800..];
+        if stage2.len() as u64 > (BIOS_PART_END - BIOS_PART_START + 1) * SECTOR as u64 {
+            die("--bios: stage2 does not fit into the BIOS boot partition");
+        }
+        img[0..446].copy_from_slice(&b[0..446]);
+        put64(&mut img, 0x40, BIOS_PART_START);
+        let at = BIOS_PART_START as usize * SECTOR;
+        img[at..at + stage2.len()].copy_from_slice(stage2);
+    }
+    write_gpt(&mut img, part_end, bios.is_some());
 
     std::fs::write(out, &img).unwrap_or_else(|e| die(&format!("{}: {}", out, e)));
-    println!("mkimage: {} ({} MiB, GPT + FAT32 ESP)", out, size_mib);
+    println!("mkimage: {} ({} MiB, GPT + FAT32 ESP{})", out, size_mib, if bios.is_some() { " + BIOS boot partition" } else { "" });
 }

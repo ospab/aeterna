@@ -16,9 +16,10 @@
  *   6 Done      verification results, boot instructions, reboot / shell
  *
  * On-disk result of "Erase entire disk":
- *   Sector  0       Protective MBR (0xEE)
+ *   Sector  0       Protective MBR (0xEE) with the BIOS boot code (stage 1 of ospab-boot)
  *   Sector  1       GPT header (EFI PART)
  *   Sectors 2-33    GPT partition entries (128 x 128 B)
+ *   LBA 34-2047     BIOS boot partition: stage 2 of ospab-boot (module "bios", /boot/bios.img)
  *   ESP (FAT32):
  *     /EFI/BOOT/BOOTX64.EFI  - the ospab UEFI loader (boot/uefi, module "efi")
  *     /boot/KERNEL           - AETERNA kernel ELF
@@ -434,6 +435,32 @@ fn get_loader_binary() -> (&'static [u8], usize) {
     (&[], 0)
 }
 
+/// The ospab BIOS loader (boot/bios), delivered as module "bios" (`/boot/bios.img` on the live
+/// medium): stage 1 at offset 0, stage 2 at offset 0x800. Empty when the medium has none.
+fn get_bios_binary() -> &'static [u8] {
+    use ospab_os::arch::x86_64::boot;
+    if let Some(mut mods) = boot::modules() {
+        while let Some(m) = mods.next() {
+            let path = unsafe {
+                if m.path.is_null() { continue; }
+                let mut len = 0;
+                while *m.path.add(len) != 0 { len += 1; }
+                core::slice::from_raw_parts(m.path as *const u8, len)
+            };
+            let want = b"bios.img";
+            if path.len() >= want.len() && path[path.len() - want.len()..].eq_ignore_ascii_case(want) {
+                let data = unsafe { core::slice::from_raw_parts(m.address, m.size as usize) };
+                if data.len() > 0x800 + 512 && data[510] == 0x55 && data[511] == 0xAA {
+                    slog("[INSTALLER] BIOS loader module found\r\n");
+                    return data;
+                }
+            }
+        }
+    }
+    slog("[INSTALLER] No BIOS loader module\r\n");
+    &[]
+}
+
 fn get_kernel_binary() -> (&'static [u8], usize) {
     use ospab_os::arch::x86_64::boot;
     if let Some(mut mods) = boot::modules() {
@@ -475,6 +502,11 @@ fn slog_hex32(v: u32) {
 // ── GPT ───────────────────────────────────────────────────────────────────────
 const ESP_GUID:  [u8; 16] = [0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B];
 const LINUX_GUID:[u8; 16] = [0xAF,0x3D,0xC6,0x0F,0x83,0x84,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4];
+/// GPT type of a BIOS boot partition ("Hah!IdontNeedEFI"): raw space for stage 2 of ospab-boot.
+const BIOS_BOOT_GUID: [u8; 16] = [0x48,0x61,0x68,0x21,0x49,0x64,0x6F,0x6E,0x74,0x4E,0x65,0x65,0x64,0x45,0x46,0x49];
+/// BIOS boot partition: the gap between the GPT entries (LBA 34) and the ESP (LBA 2048), about 1 MiB.
+const BIOS_PART_START: u64 = 34;
+const BIOS_PART_END: u64 = 2047;
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -511,7 +543,7 @@ impl Config {
     fn hostname(&self) -> &str { core::str::from_utf8(&self.host[..self.host_len]).unwrap_or("aeterna") }
 }
 
-struct Images { efi: &'static [u8], kernel: &'static [u8] }
+struct Images { efi: &'static [u8], kernel: &'static [u8], bios: &'static [u8] }
 
 enum Nav { Next, Back, Quit }
 
@@ -530,7 +562,8 @@ pub fn run() {
     let disks = scan_disks();
     let (efi, _) = get_loader_binary();
     let (kernel, _) = get_kernel_binary();
-    let img = Images { efi, kernel };
+    let bios = get_bios_binary();
+    let img = Images { efi, kernel, bios };
 
     let mut cfg = Config {
         alongside: false,
@@ -601,7 +634,7 @@ fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
     t(2, R_BODY, "How do you want to install?", FG);
     let modes: [(&str, &str); 2] = [
         ("Erase entire disk and install", "new GPT, ESP and AETERNA partition; ALL data on the disk is lost"),
-        ("Install alongside other systems", "keeps Windows/Linux: one new partition + \\EFI\\ospab on the ESP"),
+        ("Install alongside other systems", "keeps Windows/Linux: one new partition + \\EFI\\ospab on the ESP (UEFI only)"),
     ];
     let sel0 = cfg.alongside as usize;
     let _ = sel0;
@@ -615,10 +648,26 @@ fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
         &if disks.is_empty() { String::from("no disks detected") }
          else if usable == 0 { String::from("all disks are smaller than 100 MiB") }
          else { format!("{} found", disks.len()) });
+    check_line(R_BODY + 10, !img.bios.is_empty(), "ospab BIOS loader",
+        &if img.bios.is_empty() { String::from("not found \u{2014} the disk will boot on UEFI only") }
+         else { fmt_bytes(img.bios.len() as u64) });
 
+    // Alongside mode needs UEFI: on BIOS it would replace the MBR boot code of another system.
+    let bios_boot = ospab_os::arch::x86_64::boot::is_bios();
+    let draw_foot = |along: bool| {
+        for r in R_BODY + 11..R_BODY + 16 { clear_panel_row(r); }
+        if ready && along && bios_boot {
+            draw_box(R_BODY + 11, 5, FG_ERR, ERR_BG, "Not available on BIOS");
+            Pen::at(3, R_BODY + 12).on(ERR_BG).put("This computer started in BIOS mode. Installing alongside other systems would", FG);
+            Pen::at(3, R_BODY + 13).on(ERR_BG).put("replace the boot code in the MBR of the disk, which can make Windows or Linux", FG);
+            Pen::at(3, R_BODY + 14).on(ERR_BG).put("unbootable. Start the live ISO in UEFI mode, or choose \"Erase entire disk\".", FG);
+        } else if ready {
+            t(2, R_BODY + 12, "Nothing is written to disk until you confirm on a later page.", FG_DIM);
+            t(2, R_BODY + 13, "Press Enter to begin, or Esc to leave the installer.", FG);
+        }
+    };
     if ready {
-        t(2, R_BODY + 12, "Nothing is written to disk until you confirm on a later page.", FG_DIM);
-        t(2, R_BODY + 13, "Press Enter to begin, or Esc to leave the installer.", FG);
+        draw_foot(cfg.alongside);
     } else {
         draw_box(R_BODY + 11, 4, FG_ERR, ERR_BG, "Cannot install");
         Pen::at(3, R_BODY + 12).on(ERR_BG).put("The checks above must all pass. Start the installer from the", FG);
@@ -626,6 +675,7 @@ fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
     }
 
     loop {
+        if ready { draw_foot(cfg.alongside); }
         for (i, (name, desc)) in modes.iter().enumerate() {
             let selb = (i == 1) == cfg.alongside;
             let bg = if selb { SEL_BG } else { BG };
@@ -639,7 +689,10 @@ fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
             keyboard::KEY_UP | keyboard::KEY_DOWN | '\t' => cfg.alongside = !cfg.alongside,
             '1' => cfg.alongside = false,
             '2' => cfg.alongside = true,
-            '\n' if ready => return Nav::Next,
+            '\n' if ready => {
+                if cfg.alongside && bios_boot { continue; } // refused, see the box above
+                return Nav::Next;
+            }
             ESC | CTRL_C | 'q' | 'Q' => return Nav::Quit,
             _ => {}
         }
@@ -830,10 +883,16 @@ fn page_confirm(disks: &[VDisk], cfg: &Config, img: &Images) -> Nav {
     kv(R_BODY,     "Target disk", &format!("/dev/{}   {}   {}", d.name(), fmt_size(d.size_mb), truncate(model, 30)), FG_TITLE);
     kv(R_BODY + 1, "Partition 1", &format!("EFI System (FAT32)   {:<9}  LBA {}\u{2013}{}", fmt_size(cfg.esp_mb), l.esp_start, l.esp_end), FG);
     kv(R_BODY + 2, "Partition 2", &format!("AETERNA root         {:<9}  LBA {}\u{2013}{}", fmt_size(l.root_mb), l.root_start, l.root_end), FG);
-    kv(R_BODY + 3, "Bootloader",  &format!("ospab-boot \u{2192} /EFI/BOOT/BOOTX64.EFI  ({})", fmt_bytes(img.efi.len() as u64)), FG);
+    kv(R_BODY + 3, "UEFI loader", &format!("ospab-boot \u{2192} /EFI/BOOT/BOOTX64.EFI  ({})", fmt_bytes(img.efi.len() as u64)), FG);
     kv(R_BODY + 4, "Kernel",      &format!("AETERNA {} \u{2192} /boot/KERNEL  ({})", crate::version::VERSION_STR, fmt_bytes(img.kernel.len() as u64)), FG);
     kv(R_BODY + 5, "Hostname",    cfg.hostname(), FG);
     kv(R_BODY + 6, "Locale",      LOCALES[cfg.locale], FG);
+    if img.bios.is_empty() {
+        kv(R_BODY + 7, "BIOS loader", "not installed (no BIOS loader on this medium)", FG_WARN);
+    } else {
+        kv(R_BODY + 7, "BIOS loader", &format!("MBR boot code + BIOS boot partition, LBA {}\u{2013}{}  ({})",
+            BIOS_PART_START, BIOS_PART_END, fmt_bytes(img.bios.len() as u64 - 0x800)), FG);
+    }
 
     let br = R_BODY + 8;
     draw_box(br, 4, FG_ERR, ERR_BG, "WARNING");
@@ -1031,6 +1090,13 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let efi_w = ((efi_size + 511) / 512) as u64 + 2 * efi_nc as u64;
     let ker_w = ((kernel_size + 511) / 512) as u64 + 2 * ker_nc as u64;
     let conf_content = build_ospab_cfg(false);
+    let bios_ok = !img.bios.is_empty();
+    let stage2: &[u8] = if bios_ok { &img.bios[0x800..] } else { &[] };
+    let bios_sectors = ((stage2.len() + 511) / 512) as u64;
+    if bios_sectors > BIOS_PART_END - BIOS_PART_START + 1 {
+        install_failed(0, "the BIOS loader does not fit into the BIOS boot partition");
+        return;
+    }
 
     // Expected sector writes, mirrors the write sequence below
     let total_writes: u64 = 1 + 64 + 2                       // MBR, entries + backup, headers
@@ -1038,6 +1104,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         + 4 * spc as u64 + 4 + 8                             // dir clusters, dirs, dir chains
         + efi_w + ker_w
         + 2 + ((conf_content.len() as u64 + 511) / 512).max(1)
+        + bios_sectors                                       // BIOS loader, stage 2
         + 1;                                                 // identity
     P_DONE.store(0, Ordering::Relaxed);
     P_LAST.store(u64::MAX, Ordering::Relaxed);
@@ -1054,6 +1121,12 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     slog("[INSTALLER] Step 1: Protective MBR\r\n");
     {
         let mut mbr = [0u8; 512];
+        if bios_ok {
+            // Stage 1 of the BIOS loader: boot code up to the partition table; it learns where
+            // stage 2 is (the BIOS boot partition, LBA 34) from the field at offset 0x40.
+            mbr[..446].copy_from_slice(&img.bios[..446]);
+            w64(&mut mbr, 0x40, BIOS_PART_START);
+        }
         mbr[446]=0; mbr[447]=0; mbr[448]=2; mbr[449]=0; mbr[450]=0xEE;
         mbr[451]=0xFF; mbr[452]=0xFF; mbr[453]=0xFF;
         w32(&mut mbr, 454, 1);
@@ -1062,6 +1135,17 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         if !disk_write(disk.index, 0, 1, &mbr) { die!(0, "cannot write the MBR (sector 0)"); }
     }
     slog("[INSTALLER] MBR OK\r\n");
+
+    if bios_ok {
+        slog("[INSTALLER] BIOS loader: stage 2 at LBA 34, "); slog_dec(bios_sectors); slog(" sectors\r\n");
+        for i in 0..bios_sectors {
+            let mut sec = [0u8; 512];
+            let from = i as usize * 512;
+            let n = (stage2.len() - from).min(512);
+            sec[..n].copy_from_slice(&stage2[from..from + n]);
+            if !disk_write(disk.index, BIOS_PART_START + i, 1, &sec) { die!(0, "cannot write the BIOS loader (BIOS boot partition)"); }
+        }
+    }
 
     slog("[INSTALLER] Step 2: GPT partition entries\r\n");
     let disk_guid = make_uuid(disk.index as u64 * 3, 0xFF);
@@ -1079,6 +1163,12 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         e[0..16].copy_from_slice(&LINUX_GUID); e[16..32].copy_from_slice(&root_guid);
         w64(e,32,root_start); w64(e,40,root_end); w64(e,48,0);
         for (i,c) in "AETERNA".chars().enumerate() { if 56+i*2+1<128 { w16(e,56+i*2,c as u16); } }
+    }
+    if bios_ok {
+        let e = &mut entries[256..384];
+        e[0..16].copy_from_slice(&BIOS_BOOT_GUID); e[16..32].copy_from_slice(&make_uuid(disk.index as u64 * 3, 2));
+        w64(e,32,BIOS_PART_START); w64(e,40,BIOS_PART_END); w64(e,48,0);
+        for (i,c) in "BIOS boot".chars().enumerate() { w16(e,56+i*2,c as u16); }
     }
     let entries_crc = crc32(&entries);
     let bak_entries_lba = disk.sectors - 33;
@@ -1116,7 +1206,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     slog("[INSTALLER] Flushing write-cache after GPT...\r\n");
     disk_flush(disk.index);
     let backup_ok = WRITE_ERRS.load(Ordering::Relaxed) == errs_before_backup;
-    if backup_ok { step_end(0, St::Ok, "2 partitions"); }
+    if backup_ok { step_end(0, St::Ok, if bios_ok { "BIOS boot, ESP, root" } else { "2 partitions" }); }
     else { step_end(0, St::Warn, "backup GPT not written"); }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1342,6 +1432,19 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         let ok = disk_read(disk.index,0,1,&mut buf) && buf[450]==0xEE;
         checks.push(Check { label: "Protective MBR", ok });
     }
+    if bios_ok {
+        let mut mbr = [0u8; 512];
+        let mut ok = disk_read(disk.index, 0, 1, &mut mbr)
+            && mbr[..0x40] == img.bios[..0x40] && mbr[0x48..446] == img.bios[0x48..446]
+            && u64::from_le_bytes(mbr[0x40..0x48].try_into().unwrap()) == BIOS_PART_START;
+        for i in 0..bios_sectors {
+            let mut sec = [0u8; 512];
+            let from = i as usize * 512;
+            let n = (stage2.len() - from).min(512);
+            ok = ok && disk_read(disk.index, BIOS_PART_START + i, 1, &mut sec) && sec[..n] == stage2[from..from + n];
+        }
+        checks.push(Check { label: "BIOS boot code", ok });
+    }
     // ── GPT: signature + header CRC32 + entries CRC32 ────────────────────────
     {
         let mut buf = [0u8; 512];
@@ -1485,9 +1588,14 @@ fn page_done(disk: &VDisk, cfg: &Config, root_mb: u64, checks: &[Check], all_ok:
     t(2, sr, "Next steps", FG_TITLE);
     Pen::at(4, sr + 1).put("1  ", ACCENT).put("Remove the installation media: ", FG).put("eject / disconnect the ISO", FG_TITLE);
     Pen::at(4, sr + 2).put("   ", ACCENT).put("(in VMware/VirtualBox: disconnect the virtual CD/DVD drive).", FG_DIM);
-    Pen::at(4, sr + 3).put("2  ", ACCENT).put("Press Enter to reboot. Firmware boots \\EFI\\BOOT\\BOOTX64.EFI", FG);
-    Pen::at(4, sr + 4).put("   ", ACCENT).put("from the disk; if not, pick the disk in the boot menu.", FG_DIM);
-    Pen::at(4, sr + 5).put("3  ", ACCENT).put("The disk boots in UEFI mode only \u{2014} enable EFI firmware in the VM.", FG);
+    let bios_inst = checks.iter().any(|c| c.label == "BIOS boot code");
+    Pen::at(4, sr + 3).put("2  ", ACCENT).put("Press Enter to reboot. UEFI firmware boots \\EFI\\BOOT\\BOOTX64.EFI,", FG);
+    Pen::at(4, sr + 4).put("   ", ACCENT).put("BIOS firmware boots the MBR; if not, pick the disk in the boot menu.", FG_DIM);
+    if bios_inst {
+        Pen::at(4, sr + 5).put("3  ", ACCENT).put("The disk boots on BIOS and on UEFI machines.", FG);
+    } else {
+        Pen::at(4, sr + 5).put("3  ", ACCENT).put("The disk boots in UEFI mode only \u{2014} enable EFI firmware in the VM.", FG);
+    }
 
     drain_keys();
     loop {

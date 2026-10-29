@@ -1,0 +1,26 @@
+[package]
+name = "ospab_bios"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+authors = ["ospab "]
+edition = "2021"
+description = "ospab-boot BIOS front-end: stage1 sector + stage2 (real mode thunk, 64-bit Rust)"
+
+# Standalone: not a member of the kernel package.
+[workspace]
+
+[[bin]]
+name = "ospab_bios"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

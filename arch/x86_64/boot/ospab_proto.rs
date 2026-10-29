@@ -21,8 +21,9 @@ Machine state at the kernel entry point (ELF `e_entry`):
 - RDI = physical address of `BootInfo`, RSI = `OSPAB_BOOT_MAGIC`,
   RDX = HHDM offset (the same value as `BootInfo::hhdm_offset`).
   Other general purpose registers carry nothing (the UEFI loader leaves the entry
-  address in RAX and zeroes the rest). Limine zeroes RDI/RSI/RDX, which is how
-  the kernel tells the two protocols apart.
+  address in RAX and zeroes the rest). The kernel accepts only this protocol.
+- SSE is usable: CR0.EM = 0, CR0.MP = 1, CR4.OSFXSR = 1, CR4.OSXMMEXCPT = 1 (UEFI firmware leaves the
+  CPU this way; the BIOS loader sets it).
 - RSP = top of a stack of at least 64 KiB, reachable through the HHDM, with a zero
   return address pushed (RSP + 8 is 16-byte aligned).
 - GDT/IDT/segment registers: anything usable for 64-bit code; the kernel loads its

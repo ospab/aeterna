@@ -7,8 +7,7 @@ permissions, plus an identity map of the hand-off trampoline (the kernel drops
 the lower half on entry). Tables live in OSPAB_RECLAIM_MEMORY pages, which the
 firmware identity-maps, so they are written through their physical address.
 */
-use crate::console::{alloc_pages, PAGE};
-use crate::efi::OSPAB_RECLAIM_MEMORY;
+use crate::mem::{PageKind, PAGE};
 
 pub const P: u64 = 1 << 0;
 pub const W: u64 = 1 << 1;
@@ -21,7 +20,7 @@ pub struct PageTables {
 }
 
 fn new_table() -> u64 {
-    alloc_pages(1, OSPAB_RECLAIM_MEMORY)
+    crate::plat::alloc_pages(1, PageKind::Reclaim)
 }
 
 unsafe fn entry(table: u64, index: u64) -> *mut u64 {

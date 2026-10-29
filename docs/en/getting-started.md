@@ -12,7 +12,7 @@ Create a new virtual machine with these settings:
 | Setting | Value | Why |
 |---|---|---|
 | Guest operating system | **Other**, version **Other 64-bit** | "Other" (32-bit) starts 32-bit UEFI firmware, which cannot load a 64-bit loader |
-| Firmware | **UEFI**, Secure Boot **off** | the installed system boots through UEFI; our loader is not signed |
+| Firmware | **BIOS** or **UEFI** (Secure Boot **off**) | ospab-boot has a BIOS and a UEFI front-end; it is not signed, so Secure Boot must stay off |
 | USB controller | **USB 3.x** | USB keyboards and mice need the xHCI driver; USB 2 (EHCI/UHCI) is not supported yet |
 | Hard disk | NVMe, SATA or IDE, 2 GB or more | all three are supported |
 | Network adapter | NAT | e1000, vlance and vmxnet3 all work |
@@ -20,17 +20,23 @@ Create a new virtual machine with these settings:
 | Guest isolation | copy and paste **enabled** | lets Ctrl+V paste the Windows clipboard |
 | SCSI controller | none, or LSI Logic | the BusLogic controller is refused for 64-bit guests |
 
-Attach the ISO to the CD/DVD drive and power on. Limine shows a menu for 5 seconds:
+Attach the ISO to the CD/DVD drive and power on. ospab-boot shows a menu for 5 seconds, in either firmware mode:
 
 - **ospab.os Live**: the full system running from the CD.
+- **ospab.os Desktop**: the desktop session.
 - **ospab.os Installer**: starts the installer directly.
-- **ospab.os Live (ospab loader, test)**: the same system started through our own loader.
+- **ospab.os (debug)**, **Memory test**, **Reboot**, **Power off**; **Firmware settings** on UEFI only.
+
+The installer's "Erase entire disk" mode makes a disk that boots on both BIOS and UEFI. "Install
+alongside other systems" needs UEFI and is refused when the live system runs on BIOS.
 
 ## QEMU
 
 ```
 qemu-system-x86_64 -cdrom isos/ospab-os-v2-N.iso -m 512M -serial stdio
 ```
+
+This starts the BIOS path (SeaBIOS). For a USB stick instead of a CD: `-drive file=isos/ospab-os-v2-N.iso,format=raw,if=none,id=u -device qemu-xhci -device usb-storage,drive=u`.
 
 Useful additions: `-cpu max` (AVX, SMEP/SMAP, RDRAND), `-device intel-hda -device hda-duplex`
 for sound, `-device qemu-xhci -device usb-kbd` for a USB keyboard, and a UEFI firmware such as
