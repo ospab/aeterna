@@ -39,13 +39,13 @@ const TERMINAL_COMMANDS: &[&str] = &[
 const SHELL_COMMANDS: &[&str] = &[
     "ls", "cd", "pwd", "cat", "mkdir", "touch", "rm", "echo", "write", "save",
     "export", "set", "unset", "env", "alias", "unalias", "source", "bash", "sh",
-    "type", "which", "test", "read", "exit", "plum", "ip",
+    "type", "which", "test", "read", "exit", "plum", "ip", "drift",
 ];
 
 /// Commands that draw full-screen UIs, wait for keys or run until stopped:
 /// the pager is not used for them.
 const NO_PAGER: &[&str] = &[
-    "grape", "doom", "top", "ping", "install", "tomato", "yes", "clear",
+    "grape", "doom", "drift", "top", "ping", "install", "tomato", "yes", "clear",
     "bench", "reboot", "shutdown", "poweroff", "halt", "traceroute", "seed",
     "curl", "soundtest", "ntpdate", "netdiag", "verify_audio", "verify_net", "read",
     "testmode",

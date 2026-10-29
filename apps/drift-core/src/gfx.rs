@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ospab
+//! 2D drawing on a 32-bit 0x00RRGGBB pixel buffer: blending, shapes, smooth text.
+use crate::math::*;
+use alloc::vec;
+use alloc::vec::Vec;
+
+pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+#[inline]
+pub fn chan(c: u32) -> (u32, u32, u32) {
+    ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+}
+#[inline]
+pub fn pack(r: u32, g: u32, b: u32) -> u32 {
+    (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
+}
+/// dst*(1-a) + src*a with a in 0..=255.
+#[inline]
+pub fn mix(dst: u32, src: u32, a: u32) -> u32 {
+    let (dr, dg, db) = chan(dst);
+    let (sr, sg, sb) = chan(src);
+    let ia = 255 - a;
+    (((dr * ia + sr * a) / 255) << 16) | (((dg * ia + sg * a) / 255) << 8) | ((db * ia + sb * a) / 255)
+}
+/// Saturating per-channel add of src*k/255 to dst.
+#[inline]
+pub fn add_px(dst: u32, src: u32, k: u32) -> u32 {
+    let (dr, dg, db) = chan(dst);
+    let (sr, sg, sb) = chan(src);
+    pack(dr + (sr * k) / 255, dg + (sg * k) / 255, db + (sb * k) / 255)
+}
+pub fn scale_col(c: u32, k: f32) -> u32 {
+    let (r, g, b) = chan(c);
+    pack((r as f32 * k) as u32, (g as f32 * k) as u32, (b as f32 * k) as u32)
+}
+
+pub struct Canvas {
+    pub w: usize,
+    pub h: usize,
+    pub px: Vec<u32>,
+}
+
+impl Canvas {
+    pub fn new(w: usize, h: usize) -> Canvas {
+        Canvas { w, h, px: vec![0; w * h] }
+    }
+    pub fn resize(&mut self, w: usize, h: usize) {
+        self.w = w;
+        self.h = h;
+        self.px.clear();
+        self.px.resize(w * h, 0);
+    }
+    pub fn clear(&mut self, c: u32) {
+        for p in self.px.iter_mut() {
+            *p = c;
+        }
+    }
+    #[inline]
+    pub fn put(&mut self, x: i32, y: i32, c: u32, a: u32) {
+        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 || a == 0 {
+            return;
+        }
+        let i = y as usize * self.w + x as usize;
+        self.px[i] = if a >= 255 { c } else { mix(self.px[i], c, a) };
+    }
+    #[inline]
+    pub fn put_add(&mut self, x: i32, y: i32, c: u32, k: u32) {
+        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 || k == 0 {
+            return;
+        }
+        let i = y as usize * self.w + x as usize;
+        self.px[i] = add_px(self.px[i], c, k);
+    }
+    pub fn rect(&mut self, x: i32, y: i32, w: i32, h: i32, c: u32, a: u32) {
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.w as i32);
+        let y1 = (y + h).min(self.h as i32);
+        if x1 <= x0 || y1 <= y0 || a == 0 {
+            return;
+        }
+        for yy in y0..y1 {
+            let row = yy as usize * self.w;
+            if a >= 255 {
+                for p in &mut self.px[row + x0 as usize..row + x1 as usize] {
+                    *p = c;
+                }
+            } else {
+                for p in &mut self.px[row + x0 as usize..row + x1 as usize] {
+                    *p = mix(*p, c, a);
+                }
+            }
+        }
+    }
+    pub fn rect_outline(&mut self, x: i32, y: i32, w: i32, h: i32, t: i32, c: u32, a: u32) {
+        self.rect(x, y, w, t, c, a);
+        self.rect(x, y + h - t, w, t, c, a);
+        self.rect(x, y + t, t, h - 2 * t, c, a);
+        self.rect(x + w - t, y + t, t, h - 2 * t, c, a);
+    }
+    /// Vertical gradient fill between two colours.
+    pub fn vgrad(&mut self, x: i32, y: i32, w: i32, h: i32, top: u32, bot: u32, a: u32) {
+        for i in 0..h {
+            let k = (i * 255 / h.max(1)) as u32;
+            self.rect(x, y + i, w, 1, mix(top, bot, k), a);
+        }
+    }
+    /// Anti-aliased line (Xiaolin Wu), 1 pixel wide.
+    pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, c: u32, alpha: u32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (x0, y0, x1, y1);
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return;
+        }
+        // clip to a generous box
+        let lim = 20000.0;
+        if abs(x0) > lim || abs(y0) > lim || abs(x1) > lim || abs(y1) > lim {
+            return;
+        }
+        let steep = abs(y1 - y0) > abs(x1 - x0);
+        if steep {
+            core::mem::swap(&mut x0, &mut y0);
+            core::mem::swap(&mut x1, &mut y1);
+        }
+        if x0 > x1 {
+            core::mem::swap(&mut x0, &mut x1);
+            core::mem::swap(&mut y0, &mut y1);
+        }
+        let dx = x1 - x0;
+        let grad = if dx < 1e-6 { 1.0 } else { (y1 - y0) / dx };
+        let (w, h) = (self.w as f32, self.h as f32);
+        let mut x = floor(x0 + 0.5);
+        let xend = floor(x1 + 0.5);
+        let mut y = y0 + grad * (x - x0);
+        while x <= xend {
+            let in_x = if steep { x >= 0.0 && x < h } else { x >= 0.0 && x < w };
+            let yi = floor(y);
+            if in_x {
+                let f = y - yi;
+                let a0 = ((1.0 - f) * alpha as f32) as u32;
+                let a1 = (f * alpha as f32) as u32;
+                if steep {
+                    self.put(yi as i32, x as i32, c, a0);
+                    self.put(yi as i32 + 1, x as i32, c, a1);
+                } else {
+                    self.put(x as i32, yi as i32, c, a0);
+                    self.put(x as i32, yi as i32 + 1, c, a1);
+                }
+            }
+            x += 1.0;
+            y += grad;
+        }
+    }
+    /// Ring of radius r (centre of the stroke) and thickness t, anti-aliased.
+    pub fn ring(&mut self, cx: f32, cy: f32, r: f32, t: f32, c: u32, alpha: u32) {
+        let ext = r + t + 1.0;
+        let (x0, x1) = (floor(cx - ext).max(0.0) as i32, (cx + ext) as i32 + 1);
+        let (y0, y1) = (floor(cy - ext).max(0.0) as i32, (cy + ext) as i32 + 1);
+        for y in y0..y1.min(self.h as i32) {
+            for x in x0..x1.min(self.w as i32) {
+                let d = sqrt((x as f32 + 0.5 - cx) * (x as f32 + 0.5 - cx) + (y as f32 + 0.5 - cy) * (y as f32 + 0.5 - cy));
+                let cov = clamp(t * 0.5 + 0.5 - abs(d - r), 0.0, 1.0);
+                if cov > 0.0 {
+                    self.put(x, y, c, (cov * alpha as f32) as u32);
+                }
+            }
+        }
+    }
+    pub fn disc(&mut self, cx: f32, cy: f32, r: f32, c: u32, alpha: u32) {
+        let (x0, x1) = (floor(cx - r - 1.0).max(0.0) as i32, (cx + r + 2.0) as i32);
+        let (y0, y1) = (floor(cy - r - 1.0).max(0.0) as i32, (cy + r + 2.0) as i32);
+        for y in y0..y1.min(self.h as i32) {
+            for x in x0..x1.min(self.w as i32) {
+                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                let d = sqrt(dx * dx + dy * dy);
+                let cov = clamp(r + 0.5 - d, 0.0, 1.0);
+                if cov > 0.0 {
+                    self.put(x, y, c, (cov * alpha as f32) as u32);
+                }
+            }
+        }
+    }
+    /// Ellipse outline (as a polyline).
+    pub fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, c: u32, alpha: u32) {
+        let n = 48;
+        let mut px = cx + rx;
+        let mut py = cy;
+        for i in 1..=n {
+            let a = TAU * i as f32 / n as f32;
+            let (x, y) = (cx + rx * cos(a), cy + ry * sin(a));
+            self.line(px, py, x, y, c, alpha);
+            px = x;
+            py = y;
+        }
+    }
+    /// Smooth text. `size` is the glyph cell height in pixels (the 8x8 font is scaled).
+    /// Returns the advance width. Text is monospaced with advance == size.
+    pub fn text(&mut self, x: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) -> i32 {
+        let mut cx = x;
+        for ch in s.bytes() {
+            self.glyph(cx, y, size, ch, c, alpha);
+            cx += size;
+        }
+        cx - x
+    }
+    pub fn text_c(&mut self, cx: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) {
+        let w = s.len() as i32 * size;
+        self.text(cx - w / 2, y, size, s, c, alpha);
+    }
+    pub fn text_r(&mut self, rx: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) {
+        let w = s.len() as i32 * size;
+        self.text(rx - w, y, size, s, c, alpha);
+    }
+    fn glyph(&mut self, x: i32, y: i32, size: i32, ch: u8, c: u32, alpha: u32) {
+        if x + size < 0 || y + size < 0 || x >= self.w as i32 || y >= self.h as i32 || ch == b' ' {
+            return;
+        }
+        let g = glyph_bits(ch);
+        let s = size as f32 / 8.0;
+        let inv = 1.0 / s;
+        let tex = |tx: i32, ty: i32| -> f32 {
+            if !(0..8).contains(&tx) || !(0..8).contains(&ty) {
+                0.0
+            } else {
+                ((g[ty as usize] >> tx) & 1) as f32
+            }
+        };
+        for oy in 0..size {
+            let py = y + oy;
+            if py < 0 || py >= self.h as i32 {
+                continue;
+            }
+            let v = (oy as f32 + 0.5) * inv - 0.5;
+            let fy = floor(v);
+            let ty = fy as i32;
+            let wy = v - fy;
+            for ox in 0..size {
+                let px = x + ox;
+                if px < 0 || px >= self.w as i32 {
+                    continue;
+                }
+                let u = (ox as f32 + 0.5) * inv - 0.5;
+                let fx = floor(u);
+                let tx = fx as i32;
+                let wx = u - fx;
+                let v00 = tex(tx, ty);
+                let v10 = tex(tx + 1, ty);
+                let v01 = tex(tx, ty + 1);
+                let v11 = tex(tx + 1, ty + 1);
+                let val = lerp(lerp(v00, v10, wx), lerp(v01, v11, wx), wy);
+                let cov = if size >= 12 { smoothstep(0.3, 0.7, val) } else { val };
+                if cov > 0.02 {
+                    self.put(px, py, c, (cov * alpha as f32) as u32);
+                }
+            }
+        }
+    }
+}
+
+static COPYRIGHT: [u8; 8] = [0x3C, 0x42, 0x99, 0x85, 0x85, 0x99, 0x42, 0x3C];
+
+pub fn glyph_bits(ch: u8) -> &'static [u8; 8] {
+    if ch == 0x7f {
+        return &COPYRIGHT;
+    }
+    let i = if (32..127).contains(&ch) { ch - 32 } else { b'?' - 32 };
+    &FONT[i as usize]
+}
+
+/// 8x8 bitmap font, ASCII 32..126, bit 0 is the leftmost pixel.
+static FONT: [[u8; 8]; 95] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00],
+    [0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00],
+    [0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00],
+    [0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00],
+    [0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00],
+    [0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00],
+    [0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00],
+    [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],
+    [0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00],
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06],
+    [0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00],
+    [0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00],
+    [0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00],
+    [0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00],
+    [0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00],
+    [0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00],
+    [0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00],
+    [0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00],
+    [0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00],
+    [0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00],
+    [0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00],
+    [0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00],
+    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00],
+    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06],
+    [0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00],
+    [0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00],
+    [0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00],
+    [0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00],
+    [0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00],
+    [0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00],
+    [0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00],
+    [0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00],
+    [0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00],
+    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00],
+    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00],
+    [0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00],
+    [0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00],
+    [0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00],
+    [0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00],
+    [0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00],
+    [0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00],
+    [0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00],
+    [0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00],
+    [0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00],
+    [0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00],
+    [0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00],
+    [0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00],
+    [0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00],
+    [0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00],
+    [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00],
+    [0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00],
+    [0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00],
+    [0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00],
+    [0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00],
+    [0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00],
+    [0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00],
+    [0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00],
+    [0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00],
+    [0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF],
+    [0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00],
+    [0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00],
+    [0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00],
+    [0x38, 0x30, 0x30, 0x3E, 0x33, 0x33, 0x6E, 0x00],
+    [0x00, 0x00, 0x1E, 0x33, 0x3F, 0x03, 0x1E, 0x00],
+    [0x1C, 0x36, 0x06, 0x0F, 0x06, 0x06, 0x0F, 0x00],
+    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F],
+    [0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00],
+    [0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00],
+    [0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E],
+    [0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00],
+    [0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00],
+    [0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00],
+    [0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00],
+    [0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00],
+    [0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F],
+    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78],
+    [0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00],
+    [0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00],
+    [0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00],
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00],
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00],
+    [0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00],
+    [0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00],
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F],
+    [0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00],
+    [0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00],
+    [0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00],
+    [0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00],
+    [0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+];

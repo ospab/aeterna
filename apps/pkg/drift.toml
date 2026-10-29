@@ -1,0 +1,11 @@
+# drift: space trading and combat game. Copyright (c) 2026 ospab. SPDX-License-Identifier: AGPL-3.0-only
+# Needs a user heap of about 32 MiB (user/liboos/src/heap.rs) and the framebuffer capability.
+name = "drift"
+version = "0.1.0"
+description = "drift - space trading and combat game with a story campaign (c) 2026 ospab, AGPL-3.0-only"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/drift"
+dest = "/usr/bin/drift"

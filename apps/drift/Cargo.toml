@@ -1,0 +1,14 @@
+[package]
+name = "drift"
+description = "drift: space trading and combat game for ospab.os (ring 3 front end)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "drift"
+path = "src/main.rs"
+
+[dependencies]
+liboos = { path = "../../user/liboos" }
+drift-core = { path = "../drift-core" }
