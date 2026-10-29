@@ -135,6 +135,9 @@ rm_entry:
     cld
     mov ax, 0x2401
     int 0x15
+    # Some BIOSes (VMware) return from INT 15h with interrupts enabled; in long mode the
+    # timer IRQ would then arrive as vector 8 (the BIOS PIC base) and look like a double fault.
+    cli
     in al, 0x92
     test al, 2
     jnz 1f
@@ -202,6 +205,7 @@ pm_entry:
 
 .code64
 lm_entry:
+    cli
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -338,6 +342,7 @@ pm_back:
 
 .code64
 lm_back:
+    cli
     mov ax, 0x10
     mov ds, ax
     mov es, ax
