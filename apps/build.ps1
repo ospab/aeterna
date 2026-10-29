@@ -68,7 +68,7 @@ try {
     if (-not $Repo) { Write-Host "Packages are in $dist"; return }
 
     # 4. Repository: add, index, sign, verify against the key compiled into the OS.
-    $tmts = (Get-ChildItem (Join-Path $dist '*.tmt')).FullName
+    $tmts = @((Get-ChildItem (Join-Path $dist '*.tmt')).FullName)
     Run 'Adding packages' { & $Tmt repo add $Repo @tmts }
     Run 'Writing index' { & $Tmt repo index $Repo }
     if ($Key) { Run 'Signing index' { & $Tmt repo sign $Repo --key $Key } }
@@ -81,8 +81,11 @@ try {
     if ($Upload) {
         $src = Join-Path $Repo 'x86_64'
         # With -Only, upload just the packages built now; the index still lists the whole repo.
-        $pkgs = (Get-ChildItem (Join-Path $src '*.tmt')).FullName
-        if ($Only) { $pkgs = $pkgs | Where-Object { $Only -contains ((Split-Path $_ -Leaf) -replace '-[0-9][^-]*\.tmt$', '') } }
+        $pkgs = @((Get-ChildItem (Join-Path $src '*.tmt')).FullName)
+        if ($Only) {
+            $built = @($tmts | ForEach-Object { Split-Path $_ -Leaf })
+            $pkgs = @($pkgs | Where-Object { $built -contains (Split-Path $_ -Leaf) })
+        }
         Run 'Uploading packages' { scp @pkgs "${Upload}:$RemoteDir/" }
         Run 'Uploading index' { scp (Join-Path $src 'index') "${Upload}:$RemoteDir/" }
         Run 'Uploading signature' { scp (Join-Path $src 'index.sig') "${Upload}:$RemoteDir/" }
