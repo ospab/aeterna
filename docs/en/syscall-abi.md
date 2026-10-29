@@ -196,3 +196,51 @@ screen and the keyboard are then released. Text pasted with Ctrl+V and serial in
 are not delivered in raw mode.
 
 **clock_ns.** Monotonic, from the TSC when it is calibrated (otherwise the 100 Hz tick).
+
+## Audio (sound output)
+
+Implementation: `core/syscall/audio.rs` and the mixer `drivers/audio/mixer.rs`; wrapper
+`user/liboos/src/audio.rs` (`Audio::open`, `write`, `queued`, `drain`); example `apps/tone`. The
+program needs the Framebuf capability (the same one as for the screen calls).
+
+| No. | Call | Arguments → result |
+|---|---|---|
+| 271 | audio_open | rate, channels → stream id (1..4) |
+| 272 | audio_write | stream, ptr, bytes → bytes accepted (never blocks) |
+| 273 | audio_queued | stream → frames still buffered |
+| 274 | audio_close | stream → 0 |
+| 275 | audio_volume | stream, percent (0..100) → 0 |
+
+**audio_open.** `rate` is 48000, 44100 or 22050 Hz, `channels` is 1 or 2. Samples are signed
+16-bit little endian, interleaved. The kernel resamples to the rate of the sound device (linear
+interpolation) and turns mono into stereo. Errors: -2 without the Framebuf capability, -3 for
+any other format, -7 if there is no sound device (the program should carry on silently), -14 if
+all 4 streams (all processes together) are in use, -6 out of memory.
+
+**audio_write.** Copies whole frames (`channels * 2` bytes) into the stream's kernel ring, which
+holds 200 ms (`rate / 5` frames). Returns the bytes accepted, 0 when the ring is full; the rest
+must be written again later. A trailing partial frame is ignored. At most 256 KiB are taken per
+call. -11 if `stream` is not an open stream of the caller, -10 for a bad pointer.
+
+**audio_queued.** Frames (at the stream's own rate) that the mixer has not consumed yet. Keep it
+above about 50 ms worth to avoid gaps; poll it (with `sleep_ms`) to pace a producer. The device
+holds up to about 60 ms more after a frame has left the stream. When it reads 0 the stream is
+empty; wait about 100 ms more for the tail to be heard (`Audio::drain` does this).
+
+**audio_volume.** Per-stream gain, default 100. The curve is `(percent / 100)^2`. The master volume
+of the device (shell `volume`) applies on top.
+
+**Mixing and pumping.** The kernel feeds the device from the 100 Hz audio timer tick
+(`audio::timer_tick`): every tick it keeps about 60 ms in the device ring, summing all streams,
+and applies a soft knee above 3/4 of full scale (as the DOOM mixer does) before clipping at
+16 bits. A program only has to keep its stream buffer topped up. While no stream has data
+nothing is written, so the device is silent and other users of `audio::submit` (DOOM,
+`soundtest`) are not disturbed; but ring-3 streams and DOOM are not summed with each other: if
+DOOM keeps the device queue full, the streams wait.
+
+**Cleanup.** Streams are closed when the program calls `audio_close`, exits or is killed
+(scheduler teardown, `screen::process_gone` -> `audio::process_gone`).
+
+Test: `apps/tone` plays 440 Hz (mono, 48000 Hz) and then a C major chord (stereo, 44100 Hz)
+and exits. Run QEMU with `-audiodev wav,id=a0,path=out.wav` and `intel-hda`/`hda-duplex`, `AC97` or
+`ES1370`, then check the WAV for level and frequency.

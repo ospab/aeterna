@@ -16,6 +16,7 @@ instruction to jump to our handler entry point.
 
 extern crate alloc;
 
+pub mod audio;
 pub mod objects;
 pub mod screen;
 
@@ -181,6 +182,12 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (263, |a| screen::kbd_mode(a.arg1)),
     (264, |_| screen::kbd_event()),
     (270, |_| screen::clock_ns()),
+    // Sound streams (docs/en/syscall-abi.md, "Audio")
+    (271, |a| audio::audio_open(a.arg1, a.arg2)),
+    (272, |a| audio::audio_write(a.arg1, a.arg2, a.arg3)),
+    (273, |a| audio::audio_queued(a.arg1)),
+    (274, |a| audio::audio_close(a.arg1)),
+    (275, |a| audio::audio_volume(a.arg1, a.arg2)),
     // Kernel objects and handles (docs/en/syscall-abi.md)
     (200, |a| objects::handle_close(a.arg1)),
     (201, |a| objects::handle_dup(a.arg1, a.arg2)),

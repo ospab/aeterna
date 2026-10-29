@@ -48,6 +48,11 @@ pub mod nr {
     pub const KBD_MODE: u64 = 263;
     pub const KBD_EVENT: u64 = 264;
     pub const CLOCK_NS: u64 = 270;
+    pub const AUDIO_OPEN: u64 = 271;
+    pub const AUDIO_WRITE: u64 = 272;
+    pub const AUDIO_QUEUED: u64 = 273;
+    pub const AUDIO_CLOSE: u64 = 274;
+    pub const AUDIO_VOLUME: u64 = 275;
 }
 
 /// Kernel error codes (negated in RAX).

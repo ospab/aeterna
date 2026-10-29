@@ -1,0 +1,9 @@
+[package]
+name = "tone"
+description = "Sound test: a 440 Hz tone, then a C major chord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../../user/liboos" }

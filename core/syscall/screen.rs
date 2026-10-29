@@ -161,8 +161,9 @@ pub fn sleep_ms(ms: u64) -> i64 {
     0
 }
 
-/// The process is gone: give back the screen and the keyboard.
+/// The process is gone: give back the screen and the keyboard, close its sound streams.
 pub fn process_gone(pid: u32) {
+    super::audio::process_gone(pid);
     crate::arch::x86_64::keyboard::raw_release(pid);
     crate::arch::x86_64::framebuffer::release_screen(pid);
 }

@@ -40,6 +40,7 @@
 pub mod ac97;
 pub mod hda;
 pub mod es1371;
+pub mod mixer;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use crate::arch::x86_64::serial;
@@ -341,8 +342,44 @@ pub fn timer_tick() {
     if ACTIVE_DRIVER.load(Ordering::Relaxed) == 0 || !is_ready() { return; }
     if ACTIVE_DRIVER.load(Ordering::Relaxed) == 3 { es1371::ack_irq(); }
     if try_lock() {
-        unsafe { update(true); }
+        unsafe {
+            update(true);
+            mix_feed();
+        }
         unlock();
+    }
+}
+
+/// How far ahead of the hardware the mixer keeps the ring filled (ms). The timer ticks every
+/// 10 ms, so this rides out a few missed ticks.
+const MIX_LEAD_MS: usize = 60;
+
+/// Top the ring up with the mixed ring-3 streams (STREAM_LOCK held). Writes nothing while no
+/// stream has data: the ring then stays silent and `submit` users (DOOM) are unaffected. If
+/// such a user keeps the ring above the lead, the streams wait: they are not summed with it.
+unsafe fn mix_feed() {
+    if !mixer::active() {
+        return;
+    }
+    let rate = sample_rate();
+    let target = (byte_rate() * MIX_LEAD_MS / 1000) & !3;
+    let mut buf = [0i16; mixer::CHUNK * 2];
+    loop {
+        let s = &*core::ptr::addr_of!(STREAM);
+        if s.queued >= target {
+            break;
+        }
+        let free = s.size.saturating_sub(s.queued + 64) & !3;
+        let want = (target - s.queued).min(free).min(mixer::CHUNK * 4) & !3;
+        if want < 4 {
+            break;
+        }
+        let frames = want / 4;
+        if !mixer::render(&mut buf[..frames * 2], rate) {
+            break;
+        }
+        let bytes = core::slice::from_raw_parts(buf.as_ptr() as *const u8, frames * 4);
+        ring_put(bytes);
     }
 }
 

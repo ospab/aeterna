@@ -23,6 +23,7 @@ pub mod ipc;
 pub mod mem;
 pub mod hw;
 pub mod screen;
+pub mod audio;
 mod heap;
 mod rt;
 

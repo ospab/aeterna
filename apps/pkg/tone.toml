@@ -1,0 +1,9 @@
+name = "tone"
+version = "0.1.0"
+description = "Sound test: a 440 Hz tone, then a C major chord"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/tone"
+dest = "/usr/bin/tone"
