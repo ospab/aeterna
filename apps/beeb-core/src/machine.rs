@@ -12,6 +12,7 @@
 use crate::cpu::{Bus, Cpu};
 use crate::disc::{Disc, Mem, Out};
 use crate::keyboard::{Key, Keyboard};
+use crate::sound::Sound;
 use crate::via::Via;
 use crate::video::Video;
 use alloc::collections::VecDeque;
@@ -73,6 +74,8 @@ struct Hw {
     ca1_delay: u32,
     trace: Vec<(u64, u8, u8)>,
     trace_on: bool,
+    snd: Sound,
+    snd_acc: u32,
 }
 
 impl Hw {
@@ -141,6 +144,8 @@ impl Hw {
                 if r == 0 {
                     let bit = 1u8 << (v & 7);
                     if v & 8 != 0 { self.latch |= bit } else { self.latch &= !bit }
+                    // Bit 0 is the sound write enable, active low: the chip takes the byte on port A.
+                    if v & 15 == 0 { let d = self.sys.port_a(); self.snd.write(d); }
                     self.update_ca2();
                 }
             }
@@ -156,6 +161,7 @@ impl Hw {
 
     fn advance(&mut self, c: u32) {
         self.cycles += c as u64;
+        self.snd.advance(&mut self.snd_acc, c);
         self.half += c;
         let t = self.half >> 1;
         self.half &= 1;
@@ -246,6 +252,7 @@ impl Beeb {
             kbd: Keyboard::new(), video: Video::new(), disc: Disc::new(), latch: 0,
             fred: vec![0xFF; 0x200], extra: 0, toggle: false, cycles: 0, line_cyc: 0, half: 0,
             adc_timer: 0, adc_busy: false, adc_chan: 0, ca1_delay: 0, trace: Vec::new(), trace_on: false,
+            snd: Sound::new(), snd_acc: 0,
         };
         let mut b = Beeb {
             cpu: Cpu::new(), hw,
@@ -301,6 +308,12 @@ impl Beeb {
             }
         }
     }
+
+    /// Sets the audio output rate in Hz (default 48000). Call before running.
+    pub fn set_audio_rate(&mut self, hz: u32) { self.hw.snd.set_rate(hz); }
+
+    /// Mono signed 16-bit samples produced since the previous call (about rate/50 per frame).
+    pub fn audio(&mut self) -> &[i16] { self.hw.snd.drain() }
 
     /// SCREEN_W * SCREEN_H pixels, 0x00RRGGBB.
     pub fn screen(&self) -> &[u32] { &self.hw.video.fb }

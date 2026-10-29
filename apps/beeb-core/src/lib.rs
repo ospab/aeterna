@@ -16,3 +16,4 @@ pub mod video;
 pub mod via;
 pub mod keyboard;
 pub mod disc;
+pub mod sound;

@@ -33,7 +33,7 @@ Get the files into the system with `curl` from a web server on your PC (QEMU use
 ```
 
 ```
-beeb [-mos os12.rom] [-basic basic.rom] [-rom SLOT file.rom] [-scale N] [disc.ssd]
+beeb [-mos os12.rom] [-basic basic.rom] [-rom SLOT file.rom] [-scale N] [-nosound] [disc.ssd]
 ```
 
 - `-mos PATH`: the MOS ROM. If the file is missing the program says so and exits.
@@ -44,6 +44,7 @@ beeb [-mos os12.rom] [-basic basic.rom] [-rom SLOT file.rom] [-scale N] [disc.ss
 - `-scale N`: horizontal pixel scale. Default: the largest integer scale that fits. The vertical
   scale is twice that when it fits (a BBC pixel is about twice as tall as wide on a 4:3
   monitor); otherwise 1.
+- `-nosound`: do not open the sound device.
 - `disc.ssd`: put in drive 0 and booted as with SHIFT+BREAK (the `!BOOT` file runs by the disc's
   `*OPT 4` option).
 
@@ -109,7 +110,16 @@ keys f0 to f9 for the views and menus (PC F1 to F10).
   emulator, so no DFS ROM and no 8271 are needed. Files written by the program stay in memory
   and are lost at exit; the image on disk is never changed.
 
-Not emulated: sound (SN76489), the 8271 disc controller, the second processor, Econet, ADC and
+- Sound: the SN76489 as wired in the Model B. Bytes written to System VIA port A are latched into
+  the chip when addressable latch bit 0 (sound write enable, active low) goes low. Three
+  square-wave tone channels (10-bit period, counters at 250 kHz), one noise channel (periodic or
+  white, 15-bit shift register, shift rate /512, /1024, /2048 or tone channel 3) and 2 dB
+  attenuation steps. The output is averaged over each output sample and passed through a
+  DC-blocking high-pass; the front end plays it as 48 kHz mono, about 960 samples per frame.
+  If the machine has no sound card, or with `-nosound` (or `sound=0` in `/etc/beeb.conf`),
+  `beeb` runs silently. It keeps 60 to 100 ms queued and drops a frame's audio if more is waiting.
+
+Not emulated: the 8271 disc controller, the second processor, Econet, ADC and
 joystick, tape, speech, the printer port.
 
 ## Limits
@@ -126,6 +136,6 @@ joystick, tape, speech, the printer port.
 
 - `apps/beeb-core/src/cpu.rs`: 6502.
 - `apps/beeb-core/src/machine.rs`: memory map, SHEILA, glue.
-- `apps/beeb-core/src/video.rs`, `via.rs`, `keyboard.rs`, `disc.rs`: the parts of the machine.
+- `apps/beeb-core/src/video.rs`, `via.rs`, `keyboard.rs`, `disc.rs`, `sound.rs`: the parts of the machine.
 - `apps/beeb/src/main.rs`: front end (arguments, files, keys, framebuffer, 50 Hz pacing).
 - `apps/gfxtest`: test program for the screen, raw keyboard and clock calls.

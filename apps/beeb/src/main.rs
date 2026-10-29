@@ -25,6 +25,9 @@ liboos::entry!(main);
 const CONF: &str = "/etc/beeb.conf";
 const DEFAULT_MOS: &str = "/usr/share/beeb/os12.rom";
 const FRAME_NS: u64 = 20_000_000;
+const AUDIO_RATE: u32 = 48_000;
+/// Frames queued above which a frame's audio is dropped (100 ms).
+const AUDIO_MAX_QUEUE: usize = 4800;
 const SC_F11: u8 = 0x57;
 const SC_F12: u8 = 0x58;
 
@@ -57,6 +60,7 @@ struct Config {
     scale: u32,
     /// Extra sideways ROMs: (slot, path). `basic=` is slot 15.
     roms: Vec<(usize, String)>,
+    sound: bool,
 }
 
 fn load_conf(c: &mut Config) {
@@ -73,6 +77,7 @@ fn load_conf(c: &mut Config) {
                 "mos" => c.mos = Some(String::from(v)),
                 "disc" => c.disc = Some(String::from(v)),
                 "scale" => c.scale = v.parse().unwrap_or(0),
+                "sound" => c.sound = !matches!(v, "0" | "off" | "no"),
                 "basic" => c.roms.push((15, String::from(v))),
                 _ if k.starts_with("rom") => {
                     if let Ok(slot) = k[3..].parse::<usize>() {
@@ -86,10 +91,11 @@ fn load_conf(c: &mut Config) {
 }
 
 fn usage() {
-    println!("usage: beeb [-mos os12.rom] [-basic basic.rom] [-rom SLOT file.rom] [-scale N] [disc.ssd]");
+    println!("usage: beeb [-mos os12.rom] [-basic basic.rom] [-rom SLOT file.rom] [-scale N] [-nosound] [disc.ssd]");
     println!("  -mos PATH    BBC MOS 1.20 ROM, 16384 bytes (default: mos= in {} or {})", CONF, DEFAULT_MOS);
     println!("  -basic PATH  a BBC BASIC ROM (16384 bytes) in sideways slot 15; Elite's loader needs it");
     println!("  -rom N PATH  any sideways ROM in slot N (0..13; slot 14 is the built-in disc system)");
+    println!("  -nosound     do not open the sound device");
     println!("  -scale N     horizontal pixel scale (default: largest that fits)");
     println!("  disc.ssd     single-sided DFS disc image, booted like SHIFT+BREAK");
     println!("keys: Esc = ESCAPE, F11 = reset, F12 = quit, Ctrl+C = kill; see docs/en/beeb.md");
@@ -171,7 +177,7 @@ fn blit(fb: &screen::Framebuffer, lay: &Layout, src: &[u32], prev: &mut [u32], f
 }
 
 fn main(args: liboos::Args) -> i32 {
-    let mut conf = Config { mos: None, disc: None, scale: 0, roms: Vec::new() };
+    let mut conf = Config { mos: None, disc: None, scale: 0, roms: Vec::new(), sound: true };
     load_conf(&mut conf);
     let mut i = 1;
     while i < args.len() {
@@ -213,6 +219,7 @@ fn main(args: liboos::Args) -> i32 {
                     }
                 }
             }
+            "-nosound" => conf.sound = false,
             "-scale" => {
                 i += 1;
                 conf.scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -284,6 +291,13 @@ fn main(args: liboos::Args) -> i32 {
             *p = black;
         }
     }
+    // Sound: mono, 48 kHz. No sound card (or -nosound): run silently.
+    let audio = if conf.sound { liboos::audio::Audio::open(AUDIO_RATE, 1).ok() } else { None };
+    if let Some(a) = &audio {
+        beeb.set_audio_rate(AUDIO_RATE);
+        // prime about 60 ms of silence so the first frames do not underrun
+        a.write(&[0i16; 2880]);
+    }
     let lay = layout(&fb, conf.scale);
     let mut prev = vec![0u32; SCREEN_W * SCREEN_H];
     let mut force = true;
@@ -307,6 +321,13 @@ fn main(args: liboos::Args) -> i32 {
             }
         }
         beeb.run_frame();
+        let samples = beeb.audio();
+        if let Some(a) = &audio {
+            // keep 60..100 ms queued: when more than 100 ms is waiting, drop this frame's samples
+            if a.queued() <= AUDIO_MAX_QUEUE {
+                a.write(samples);
+            }
+        }
         blit(&fb, &lay, beeb.screen(), &mut prev, force);
         force = false;
         screen::flush();
