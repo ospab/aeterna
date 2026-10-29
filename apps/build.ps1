@@ -41,8 +41,14 @@ try {
     $tmtSrc = Join-Path $TmtDir 'src\main.rs'
     if (-not (Test-Path $Tmt) -or (Get-Item $tmtSrc).LastWriteTime -gt (Get-Item $Tmt).LastWriteTime) {
         $hostTriple = ((rustc -vV) -match '^host:' -replace '^host:\s*', '').Trim()
+        $toolchain = @()
+        # Without Visual C++ Build Tools the msvc target has no link.exe; use the GNU toolchain.
+        if ($hostTriple -like '*-msvc' -and -not (Get-Command link.exe -ErrorAction SilentlyContinue | Where-Object { $_.Source -notlike '*Git*' })) {
+            $hostTriple = 'x86_64-pc-windows-gnu'
+            $toolchain = @('+stable-x86_64-pc-windows-gnu')
+        }
         Push-Location $TmtDir
-        try { Run 'Building tmt' { cargo build --release --target $hostTriple } } finally { Pop-Location }
+        try { Run 'Building tmt' { cargo @toolchain build --release --target $hostTriple } } finally { Pop-Location }
         New-Item -ItemType Directory -Force (Split-Path $Tmt) | Out-Null
         Copy-Item (Join-Path $TmtDir "target\$hostTriple\release\tmt.exe") $Tmt -Force
     }
