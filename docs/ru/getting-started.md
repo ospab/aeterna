@@ -59,7 +59,7 @@ qemu-system-x86_64 -cdrom isos/ospab-os-v2-N.iso -m 512M -serial stdio
 # date                 местное время; date -e — секунды с 2012-08-09
 # ip addr              сетевой адрес
 # curl ipinfo.io       настоящий HTTPS-запрос
-# tomato -Sy           синхронизировать репозиторий пакетов
+# tomato update           синхронизировать репозиторий пакетов
 # install              установить на диск
 # shutdown             выключить через ACPI
 ```

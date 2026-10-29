@@ -53,7 +53,7 @@ network stack and the console into isolated servers is the next stage of the roa
 1. Download an ISO from the releases or build one (see below).
 2. In VMware Workstation create a VM: **Other 64-bit**, firmware **UEFI** (Secure Boot off),
    USB controller **USB 3.x**. Attach the ISO and boot.
-3. In the console try `help`, `tutor`, `uname -a`, `tomato -Sy`, `install`.
+3. In the console try `help`, `tutor`, `uname -a`, `tomato update`, `install`.
 
 Full guide: [docs/en/getting-started.md](docs/en/getting-started.md).
 

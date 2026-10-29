@@ -3,13 +3,13 @@
 ## Using tomato
 
 ```
-# tomato -Sy              download the package index and check its signature
-# tomato -Ss [text]       search the synced index
-# tomato -S calc          install a package and its dependencies
-# tomato -Syu             sync and upgrade installed packages
-# tomato -Q               list installed packages (-Qi info, -Ql files)
-# tomato -R calc          remove a package (refused while another package depends on it)
-# tomato -U file.tmt      install a local package file
+# tomato update              download the package index and check its signature
+# tomato search [text]       search the synced index
+# tomato install calc          install a package and its dependencies
+# tomato update && tomato upgrade             sync and upgrade installed packages
+# tomato list               list installed packages (-Qi info, -Ql files)
+# tomato remove calc          remove a package (refused while another package depends on it)
+# tomato install file.tmt      install a local package file
 ```
 
 The default repository is `https://tmt.ospab.org/x86_64/`. Add `repo=<url>` lines to
@@ -22,7 +22,7 @@ The default repository is `https://tmt.ospab.org/x86_64/`. Add `repo=<url>` line
   stored index is re-checked every time it is used.
 - Every package's size and SHA-256 are listed in the signed index and checked before anything is
   installed.
-- `tomato -R` removes only the files the package installed.
+- `tomato remove` removes only the files the package installed.
 
 Known limit: there is no protection against replaying an older, correctly signed index.
 

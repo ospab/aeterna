@@ -54,20 +54,38 @@ fn ensure_dirs() {
 
 fn usage() {
     io::out_c("tomato", io::FG_OK);
-    io::out(" - package manager for ospab.os (.tmt packages)\n\n");
-    io::out("  tomato -Sy                  synchronize: download and verify the package index\n");
-    io::out("  tomato -S <name>...         install packages (+ dependencies) from the repository\n");
-    io::out("  tomato -Syu | -Su           upgrade installed packages (-Syu syncs first)\n");
-    io::out("  tomato -Ss [text]           search the synced index\n");
-    io::out("  tomato -U <file.tmt>...     install package files\n");
-    io::out("  tomato -R <name>...         remove packages (only the files they installed)\n");
-    io::out("  tomato -Q                   list installed packages\n");
-    io::out("  tomato -Qi <name>           package info      -Ql <name>  list its files\n");
-    io::out("  tomato --tmt pack <name> <version> <out.tmt> [-d desc] <file>...  build a package\n");
-    io::out("  tomato --tmt list|verify|install <file.tmt>\n");
-    io::out("\nrepository: ");
+    io::out(" - package manager for ospab.os (.tmt packages)
+
+");
+    io::out("  tomato update                  download and verify the package index
+");
+    io::out("  tomato upgrade                 upgrade installed packages (run update first)
+");
+    io::out("  tomato install <name>...       install packages and their dependencies
+");
+    io::out("  tomato install <file.tmt>...   install package files
+");
+    io::out("  tomato remove <name>...        remove packages (only the files they installed)
+");
+    io::out("  tomato search [text]           search the package index
+");
+    io::out("  tomato list                    list installed packages
+");
+    io::out("  tomato show <name>             package info
+");
+    io::out("  tomato files <name>            files installed by a package
+");
+    io::out("  tomato --tmt pack <name> <version> <out.tmt> [-d desc] <file>...  build a package
+");
+    io::out("  tomato --tmt list|verify|install <file.tmt>
+");
+    io::out("
+The pacman-style flags (-Sy, -S, -Syu, -Ss, -U, -R, -Q, -Qi, -Ql) still work.
+");
+    io::out("repository: ");
     io::out(&repos().join(" "));
-    io::out("  (override with repo=<url> in /etc/tomato.conf)\n");
+    io::out("  (override with repo=<url> in /etc/tomato.conf)
+");
 }
 
 fn record_path(name: &str) -> String {
@@ -97,7 +115,21 @@ pub fn run(args: &str) {
     }
     let mut parts = args.split_whitespace();
     let op = parts.next().unwrap_or("");
-    let targets: Vec<&str> = parts.collect();
+    // apt-style answers to "are you sure" are not asked, so -y is accepted and ignored
+    let targets: Vec<&str> = parts.filter(|t| *t != "-y" && *t != "--yes").collect();
+    // apt-style verbs map onto the original pacman-style operations
+    let op = match op {
+        "update" => "-Sy",
+        "upgrade" | "full-upgrade" => "-Su",
+        "install" if !targets.is_empty() && targets.iter().all(|t| t.ends_with(".tmt") || t.contains('/')) => "-U",
+        "install" => "-S",
+        "remove" | "uninstall" | "purge" => "-R",
+        "search" => "-Ss",
+        "list" => "-Q",
+        "show" | "info" => "-Qi",
+        "files" => "-Ql",
+        o => o,
+    };
     match op {
         "" | "-h" | "--help" | "help" => usage(),
         "-Sy" | "-Syy" => {
@@ -245,7 +277,7 @@ fn load_synced() -> Option<(String, Vec<RepoPkg>)> {
     if let Err(e) = verify_index_signature(&idx, &sig) {
         io::err("tomato: the synced index failed signature verification (");
         io::err(e);
-        io::err("); ignoring it - run 'tomato -Sy'\n");
+        io::err("); ignoring it - run 'tomato update'\n");
         return None;
     }
     Some((base, parse_index(&idx)?))
@@ -428,7 +460,7 @@ fn upgrade() {
     ensure_dirs();
     let (base, pkgs) = match load_synced() {
         Some(s) => s,
-        None => { io::err("tomato: no valid synced index; run 'tomato -Sy' first\n"); return; }
+        None => { io::err("tomato: no valid synced index; run 'tomato update' first\n"); return; }
     };
     let mut plan: Vec<RepoPkg> = Vec::new();
     if let Some(entries) = crate::fs::readdir(LOCAL_PATH) {
@@ -486,7 +518,7 @@ fn install_by_name_local(name: &str, have_index: bool) {
             if have_index {
                 io::err("\n");
             } else {
-                io::err("\n        (no package index yet: run 'tomato -Sy'; local packages are looked up in ");
+                io::err("\n        (no package index yet: run 'tomato update'; local packages are looked up in ");
                 io::err(CACHE_PATH);
                 io::err(")\n");
             }
@@ -531,7 +563,7 @@ fn search(q: &str) {
         io::out_c(&alloc::format!("  ({})\n", path), io::FG_DIM);
     }
     if found == 0 {
-        io::err("tomato: no synced index (run 'tomato -Sy') and no matching packages in ");
+        io::err("tomato: no synced index (run 'tomato update') and no matching packages in ");
         io::err(CACHE_PATH);
         io::err("\n");
     }

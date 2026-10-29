@@ -262,7 +262,7 @@ src = "../target/x86_64-unknown-oos/release/myapp"
 dest = "/usr/bin/myapp"
 ```
 
-`apps/build.sh` упакует его в `apps/dist/myapp.tmt`; установка — `tomato -U dist/myapp.tmt`.
+`apps/build.sh` упакует его в `apps/dist/myapp.tmt`; установка — `tomato install dist/myapp.tmt`.
 Ограничение сейчас: графическая программа в ring 3 работает с сессией внутри своего процесса
 (рисует в память), потому что у композитора ещё нет IPC-интерфейса. Код приложения тот же,
 меняется только среда. См. [gui.md](gui.md#перенос-композитора-в-ring-3).

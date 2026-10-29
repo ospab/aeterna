@@ -53,7 +53,7 @@ Rust. Её ядро называется **AETERNA**. Система не стр
 1. Скачайте ISO из релизов или соберите сами (см. ниже).
 2. В VMware Workstation создайте ВМ: **Other 64-bit**, прошивка **UEFI** (Secure Boot выключен),
    USB-контроллер **USB 3.x**. Подключите ISO и загрузитесь.
-3. В консоли попробуйте `help`, `tutor`, `uname -a`, `tomato -Sy`, `install`.
+3. В консоли попробуйте `help`, `tutor`, `uname -a`, `tomato update`, `install`.
 
 Подробно: [docs/ru/getting-started.md](docs/ru/getting-started.md).
 

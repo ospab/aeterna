@@ -258,7 +258,7 @@ src = "../target/x86_64-unknown-oos/release/myapp"
 dest = "/usr/bin/myapp"
 ```
 
-`apps/build.sh` packs it into `apps/dist/myapp.tmt`; install it with `tomato -U dist/myapp.tmt`.
+`apps/build.sh` packs it into `apps/dist/myapp.tmt`; install it with `tomato install dist/myapp.tmt`.
 Limit today: a ring-3 GUI program runs against an in-process session (it renders into memory)
 because the compositor has no IPC front end yet. The app code is the same; only the host changes.
 See [gui.md](gui.md#moving-the-compositor-to-ring-3).

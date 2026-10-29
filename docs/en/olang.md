@@ -7,7 +7,7 @@ It is a no_std + alloc port of the olang lexer, parser and tree-walking evaluato
 ## Install and run
 
 ```
-# tomato -S olang
+# tomato install olang
 # ol script.ol [args...]      run a script; args() returns the arguments
 # ol -e 'print(1 + 2)'        evaluate a string
 # ol                          REPL: ">>> " prompt, reads stdin; "... " continues an open { ( [

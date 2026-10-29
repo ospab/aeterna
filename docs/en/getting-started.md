@@ -65,7 +65,7 @@ Each boot step prints one status line on the screen and on the serial port:
 # date                 local time; date -e prints seconds since 2012-08-09
 # ip addr              network address
 # curl ipinfo.io       a real HTTPS request
-# tomato -Sy           sync the package repository
+# tomato update           sync the package repository
 # install              install to a disk
 # shutdown             power off through ACPI
 ```

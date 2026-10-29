@@ -25,7 +25,7 @@
 ## Запуск
 
 ```
-# tomato -U beeb.tmt
+# tomato install beeb.tmt
 # curl -o /usr/share/beeb/os12.rom http://10.0.2.2:8000/os12.rom
 # curl -o /tmp/disc.ssd http://10.0.2.2:8000/disc.ssd
 # beeb -mos /usr/share/beeb/os12.rom /tmp/disc.ssd
