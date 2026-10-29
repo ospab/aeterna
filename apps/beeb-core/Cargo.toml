@@ -1,0 +1,11 @@
+[package]
+name = "beeb-core"
+description = "BBC Micro Model B emulator core: 6502, CRTC/ULA video, VIAs, keyboard, DFS disc images; no_std, host-testable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

@@ -52,3 +52,7 @@ archive/
 user/target/
 boot/uefi/target/
 boot/bios/target/
+
+# BBC Micro emulator: ROMs and disc images are supplied by the user, never committed
+*.ssd
+*.rom

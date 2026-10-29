@@ -1,0 +1,14 @@
+[package]
+name = "beeb"
+description = "BBC Micro Model B emulator front end for ospab.os (ring 3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "beeb"
+path = "src/main.rs"
+
+[dependencies]
+liboos = { path = "../../user/liboos" }
+beeb-core = { path = "../beeb-core" }

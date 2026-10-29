@@ -11,6 +11,7 @@ translation and may lag behind.
 - [Packages](packages.md): `tomato`, the signed repository, writing and packaging programs.
 - [Networking and OSTP](networking.md): addresses, `curl`, DNS, time, the OSTP client.
 - [olang](olang.md): the `ol` interpreter for the olang language, what differs from the original.
+- [beeb](beeb.md): BBC Micro emulator (bring your own MOS ROM and disc images).
 - [Hardware](hardware.md): supported devices and recommended VM settings.
 
 ## Developing the system

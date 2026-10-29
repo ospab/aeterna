@@ -1,0 +1,9 @@
+name = "beeb"
+version = "0.1.0"
+description = "BBC Micro Model B emulator; you supply the MOS ROM (os12.rom) and the disc images"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/beeb"
+dest = "/usr/bin/beeb"
