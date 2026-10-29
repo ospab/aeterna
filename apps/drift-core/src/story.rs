@@ -57,7 +57,7 @@ pub fn chapter(n: u8) -> ChapterDef {
                 "Halda's checklist says to calibrate the nav beacon before every first flight. Launch, fly to the beacon, then come back and dock.",
                 "A raises throttle, Z lowers it, the arrow keys steer. To dock, fly nose first through the slot with your wings level with it and move slowly. Press D if you have a docking computer. Press Tab for the full key map.",
             ],
-            done: &["A clean landing. Halda would have scraped the paint.", "There is a message waiting for you on the contracts board (F11)."],
+            done: &["Flight school complete. A clean landing: Halda would have scraped the paint.", "The docking computer was on loan and has been returned. There is a message waiting for you on the contracts board (F11)."],
             reward: 150,
         },
         1 => ChapterDef {

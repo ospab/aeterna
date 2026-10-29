@@ -46,6 +46,7 @@ impl Game {
             Screen::Dead => self.draw_dead(c, ui),
             Screen::Ending => self.draw_ending(c, ui),
             Screen::FreePlay => self.draw_freeplay(c, ui),
+            Screen::TutorialAsk => self.draw_tutorial_ask(c, ui),
             _ => {
                 self.draw_tabs(c, ui);
                 match self.screen {
@@ -64,13 +65,15 @@ impl Game {
         if self.docked || !matches!(self.screen, Screen::Flight | Screen::Pause) {
             self.draw_log_bottom(c, ui);
         }
+        self.draw_tutorial(c, ui);
     }
 
     fn draw_log_bottom(&self, c: &mut Canvas, ui: &Ui) {
         if matches!(self.screen, Screen::Title | Screen::MainMenu | Screen::Intro | Screen::Credits | Screen::Ending) {
             return;
         }
-        let mut y = c.h as i32 - ui.px(34.0) - ui.fs * 2;
+        let strip = self.tut_strip_height(c, ui);
+        let mut y = c.h as i32 - ui.px(34.0) - ui.fs * 2 - if strip > 0 { strip + ui.px(4.0) } else { 0 };
         for l in self.log.iter().rev().take(2) {
             c.text_c(c.w as i32 / 2, y, ui.fs, &l.text, if l.warn { C_AMBER } else { C_ACCENT }, 230);
             y -= ui.fs + 4;
@@ -87,17 +90,17 @@ impl Game {
         c.text_c(c.w as i32 / 2, c.h as i32 - ui.fs - ui.px(10.0), ui.fs - 2, &t, C_DIM, 200);
     }
 
-    fn menu_list(&self, c: &mut Canvas, ui: &Ui, items: &[&str], y0: i32, enabled: &dyn Fn(usize) -> bool) {
+    pub(crate) fn menu_list(&self, c: &mut Canvas, ui: &Ui, items: &[&str], y0: i32, enabled: &dyn Fn(usize) -> bool) {
         let cx = c.w as i32 / 2;
-        let fs = ui.fs + ui.px(4.0);
-        let lh = fs * 2;
+        let fs = if items.len() > 8 { ui.fs + ui.px(1.0) } else { ui.fs + ui.px(4.0) };
+        let lh = if items.len() > 8 { fs * 2 + ui.px(2.0) } else { fs * 2 };
         for (i, it) in items.iter().enumerate() {
             let y = y0 + i as i32 * lh;
             let sel = i == self.sel;
             let en = enabled(i);
             let col = if !en { rgb(70, 82, 104) } else if sel { C_ACCENT } else { C_TEXT };
             if sel {
-                let w = (it.len() as i32 + 6) * fs;
+                let w = (c.tl(it).chars().count() as i32 + 6) * fs;
                 c.rect(cx - w / 2, y - fs / 3, w, fs + fs * 2 / 3, rgb(20, 46, 56), 200);
                 c.rect(cx - w / 2, y - fs / 3, 3, fs + fs * 2 / 3, C_ACCENT, 255);
             }
@@ -118,7 +121,9 @@ impl Game {
         let y = c.h as i32 / 3 - big / 2;
         for (i, ch) in letters.chars().enumerate() {
             let s: String = ch.into();
+            c.audit_off = true;
             c.text(x0 + i as i32 * adv + 3, y + 4, big, &s, rgb(10, 40, 50), 160);
+            c.audit_off = false;
             c.text(x0 + i as i32 * adv, y, big, &s, C_ACCENT, 255);
         }
         c.rect(cx - adv * 5 / 2, y + big + ui.px(10.0), adv * 5, 2, C_ACCENT, 160);
@@ -136,12 +141,12 @@ impl Game {
         c.text_c(cx, ui.px(60.0), ui.px(40.0), "DRIFT", C_ACCENT, 255);
         let has_save = self.latest_slot().is_some();
         let panel_w = ui.px(360.0);
-        panel(c, cx - panel_w / 2, ui.px(150.0), panel_w, ui.px(290.0), 170);
-        self.menu_list(c, ui, &MAIN_ITEMS, ui.px(178.0), &|i| i != 1 || has_save);
+        panel(c, cx - panel_w / 2, ui.px(150.0), panel_w, ui.px(330.0), 170);
+        self.menu_list(c, ui, &MAIN_ITEMS, ui.px(178.0), &|i| i != 2 || has_save);
         if let Some(i) = self.latest_slot() {
             if let Some(s) = &self.slots[i] {
                 let t = format!("Last: {} - {} - {} cr", s.name, self.gal_name_of(s), s.credits);
-                c.text_c(cx, ui.px(458.0), ui.fs - 1, &t, C_DIM, 255);
+                c.text_c(cx, ui.px(494.0), ui.fs - 1, &t, C_DIM, 255);
             }
         }
         c.text_c(cx, c.h as i32 - ui.px(60.0), ui.fs - 1, "Up/Down: select   Enter: confirm   Esc: back", C_DIM, 230);
@@ -162,7 +167,7 @@ impl Game {
         let page = self.page.min(story::INTRO.len() - 1);
         let w = ui.px(640.0).min(c.w as i32 - 40);
         let cols = (w / ui.fs) as usize - 2;
-        let lines = wrap(story::INTRO[page], cols);
+        let lines = wrap(self.intro_page(page), cols);
         let y0 = c.h as i32 / 2 - (lines.len() as i32 * ui.lh) / 2;
         let fade = clamp(self.ui_t * 1.5, 0.0, 1.0);
         for (i, l) in lines.iter().enumerate() {
@@ -174,25 +179,76 @@ impl Game {
     fn draw_settings(&mut self, c: &mut Canvas, ui: &Ui) {
         self.dim(c, 190);
         let cx = c.w as i32 / 2;
-        c.text_c(cx, ui.px(50.0), ui.px(28.0), "SETTINGS", C_ACCENT, 255);
-        let on = |b: bool| if b { "On" } else { "Off" };
-        let q = ["Low", "Medium", "High"][self.settings.quality as usize % 3];
+        c.text_c(cx, ui.px(24.0), ui.px(28.0), "SETTINGS", C_ACCENT, 255);
+        let on = |b: bool| self.t(if b { "On" } else { "Off" });
+        let q = self.t(["Low", "Medium", "High"][self.settings.quality as usize % 3]);
         let rows = [
-            format!("Invert pitch:       {}", on(self.settings.invert_pitch)),
-            format!("Bloom:              {}", on(self.settings.bloom)),
-            format!("Retro wireframe:    {}", on(self.settings.retro)),
-            format!("3D resolution:      {}", q),
-            String::from("Controls and key map"),
-            String::from("Back"),
+            self.td(&format!("Invert pitch:       {}", on(self.settings.invert_pitch))),
+            self.td(&format!("Bloom:              {}", on(self.settings.bloom))),
+            self.td(&format!("Retro wireframe:    {}", on(self.settings.retro))),
+            self.td(&format!("3D resolution:      {}", q)),
+            self.td(&format!("Language:           {}", self.settings.lang.name())),
+            self.td(&format!("Master volume:      {}", self.settings.vol_master)),
+            self.td(&format!("Effects volume:     {}", self.settings.vol_sfx)),
+            self.td(&format!("Music volume:       {}", self.settings.vol_music)),
+            String::from(self.t("Controls and key map")),
+            String::from(self.t("Back")),
         ];
         let items: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
         let pw = ui.px(520.0);
-        panel(c, cx - pw / 2, ui.px(110.0), pw, ui.px(300.0), 170);
-        self.menu_list(c, ui, &items, ui.px(138.0), &|_| true);
-        c.text_c(cx, ui.px(430.0), ui.fs - 1, "Left/Right or Enter changes a value. There is no audio in this version.", C_DIM, 230);
+        panel(c, cx - pw / 2, ui.px(70.0), pw, ui.px(420.0), 170);
+        self.menu_list(c, ui, &items, ui.px(88.0), &|_| true);
+        c.text_c(cx, ui.px(500.0), ui.fs - 1, "Left/Right or Enter changes a value.", C_DIM, 230);
+    }
+
+    fn draw_legend(&mut self, c: &mut Canvas, ui: &Ui) {
+        self.dim(c, 215);
+        let cx = c.w as i32 / 2;
+        c.text_c(cx, ui.px(24.0), ui.px(24.0), "DASHBOARD", C_ACCENT, 255);
+        let rows: [(u8, &'static str, &'static str); 11] = [
+            (0, "Shield fwd", "Front shield. Hits from ahead drain it first."),
+            (0, "Shield aft", "Rear shield. Hits from behind drain it first."),
+            (1, "Energy", "Hull reserve in four banks. At zero the ship is lost."),
+            (2, "Fuel", "Jump fuel in light years."),
+            (3, "Cabin temp", "Rises near stars. Above 90 percent it drains energy."),
+            (4, "Laser temp", "Heat of the laser on the current view. At 100 percent it overheats."),
+            (5, "Altitude", "Height above the planet surface."),
+            (6, "Speed", "Current speed in metres per second."),
+            (7, "Throttle", "Requested speed, set with A and Z."),
+            (8, "Roll", "Rotation rates. The centre mark is zero."),
+            (10, "Missiles", "Missile racks. They turn red when a lock is ready."),
+        ];
+        let pw = (c.w as i32 - ui.px(40.0)).min(ui.px(900.0));
+        let x0 = cx - pw / 2;
+        panel(c, x0, ui.px(60.0), pw, ui.px(420.0), 185);
+        let lab_w = rows.iter().map(|r| c.tl(r.1).chars().count() as i32).max().unwrap_or(10);
+        let lsz = (ui.fs - 1).min((pw / 4) / lab_w.max(1)).max(6);
+        let dx = ui.px(44.0) + lab_w * lsz + ui.px(12.0);
+        let mut y = ui.px(74.0);
+        for (ic, label, desc) in rows.iter() {
+            self.icon(c, *ic, x0 + ui.px(16.0), y, ui.fs, C_ACCENT);
+            c.text(x0 + ui.px(34.0), y, lsz, label, C_AMBER, 255);
+            let dn = c.tl(desc).chars().count() as i32;
+            let dsz = (ui.fs - 1).min((pw - dx - ui.px(16.0)) / dn.max(1)).max(6);
+            c.text(x0 + dx, y, dsz, desc, C_TEXT, 255);
+            y += ui.lh + ui.px(3.0);
+        }
+        y += ui.px(8.0);
+        for t in ["Scanner (bottom centre): contacts around you; the stick shows height above or below your plane.", "Compass (above the scanner): ST station, PL planet. Filled dot: ahead, ring: behind.", "Bars turn amber, then red, when a resource is low or something is hot."] {
+            let tr = self.td(t);
+            for l in wrap(&tr, ((pw - ui.px(32.0)) / (ui.fs - 1)).max(20) as usize) {
+                c.text(x0 + ui.px(16.0), y, ui.fs - 1, &l, C_DIM, 255);
+                y += ui.lh - 2;
+            }
+        }
+        c.text_c(cx, c.h as i32 - ui.px(46.0), ui.fs - 1, "Left/Right: key map / dashboard   Esc: back", C_DIM, 230);
     }
 
     fn draw_controls(&mut self, c: &mut Canvas, ui: &Ui) {
+        if self.page == 1 {
+            self.draw_legend(c, ui);
+            return;
+        }
         self.dim(c, 215);
         let cx = c.w as i32 / 2;
         c.text_c(cx, ui.px(24.0), ui.px(24.0), "KEY MAP", C_ACCENT, 255);
@@ -229,30 +285,36 @@ impl Game {
             ("Equipment", "Enter buy, Del remove laser"),
             ("Tab", "this screen"),
         ];
-        let col_w = ui.px(430.0);
+        let col_w = ((c.w as i32 - ui.px(60.0)) / 2).min(ui.px(430.0));
         let x1 = cx - col_w - ui.px(10.0);
         let x2 = cx + ui.px(10.0);
         for (x, list) in [(x1, &left[..]), (x2, &right[..])] {
             panel(c, x, ui.px(64.0), col_w, ui.px(410.0), 175);
+            let kw = list.iter().map(|(k, v)| if v.is_empty() { 0 } else { c.tl(k).chars().count() as i32 }).max().unwrap_or(0);
+            let ksz = (ui.fs - 1).min((col_w * 4 / 10) / kw.max(1)).max(6);
+            let koff = ui.px(14.0) + kw * ksz + ui.px(10.0);
             for (i, (k, v)) in list.iter().enumerate() {
                 let y = ui.px(80.0) + i as i32 * (ui.lh + ui.px(4.0));
                 if v.is_empty() {
                     c.text(x + ui.px(14.0), y, ui.fs, k, C_ACCENT, 255);
                 } else {
-                    c.text(x + ui.px(14.0), y, ui.fs - 1, k, C_AMBER, 255);
-                    c.text(x + ui.px(150.0), y, ui.fs - 1, v, C_TEXT, 255);
+                    c.text(x + ui.px(14.0), y, ksz, k, C_AMBER, 255);
+                    let vn = c.tl(v).chars().count() as i32;
+                    let vsz = (ui.fs - 1).min((col_w - koff - ui.px(8.0)) / vn.max(1)).max(6);
+                    c.text(x + koff, y, vsz, v, C_TEXT, 255);
                 }
             }
         }
-        c.text_c(cx, c.h as i32 - ui.px(46.0), ui.fs - 1, "Esc or Enter: back", C_DIM, 230);
+        c.text_c(cx, c.h as i32 - ui.px(46.0), ui.fs - 1, "Left/Right: key map / dashboard   Esc: back", C_DIM, 230);
     }
 
     fn draw_credits(&mut self, c: &mut Canvas, ui: &Ui) {
         self.dim(c, 200);
+        c.audit_off = true; // the crawl scrolls through the edges on purpose
         let cx = c.w as i32 / 2;
         let off = (self.credits_y * ui.s) as i32;
         let mut y = c.h as i32 + ui.px(40.0) - off;
-        for (i, (a, b)) in story::CREDITS.iter().enumerate() {
+        for (i, (a, b)) in self.credits_lines().iter().enumerate() {
             if i == 0 {
                 c.text_c(cx, y, ui.px(60.0), a, C_ACCENT, 255);
                 y += ui.px(140.0);
@@ -265,6 +327,7 @@ impl Game {
                 y += ui.px(90.0);
             }
         }
+        c.audit_off = false;
         c.text_c(cx, c.h as i32 - ui.px(30.0), ui.fs - 2, "Esc: skip", C_DIM, 160);
     }
 
@@ -281,12 +344,14 @@ impl Game {
             if sel {
                 c.rect(cx - pw / 2, y, 3, ui.px(58.0), C_ACCENT, 255);
             }
-            c.text(cx - pw / 2 + ui.px(16.0), y + ui.px(10.0), ui.fs + 2, &format!("Slot {}", i + 1), if sel { C_ACCENT } else { C_TEXT }, 255);
+            let slot_label = format!("Slot {}", i + 1);
+            let dx = c.text_w(&slot_label, ui.fs + 2) + ui.px(32.0);
+            c.text(cx - pw / 2 + ui.px(16.0), y + ui.px(10.0), ui.fs + 2, &slot_label, if sel { C_ACCENT } else { C_TEXT }, 255);
             match &self.slots[i] {
                 Some(s) => {
                     let loc = self.gal_name_of(s);
-                    c.text(cx - pw / 2 + ui.px(110.0), y + ui.px(10.0), ui.fs, &format!("{}  {}", s.name, s.rank()), C_TEXT, 255);
-                    c.text(cx - pw / 2 + ui.px(110.0), y + ui.px(10.0) + ui.lh, ui.fs - 1, &format!("{}  {} cr  {} kills  {}", loc, s.credits, s.kills, fmt_time(s.play_seconds)), C_DIM, 255);
+                    c.text(cx - pw / 2 + dx, y + ui.px(10.0), ui.fs, &format!("{}  {}", s.name, self.t(s.rank())), C_TEXT, 255);
+                    c.text(cx - pw / 2 + dx, y + ui.px(10.0) + ui.lh, ui.fs - 1, &format!("{}  {} cr  {} kills  {}", loc, s.credits, s.kills, fmt_time(s.play_seconds)), C_DIM, 255);
                     if s.story.free_play {
                         c.text_r(cx + pw / 2 - ui.px(14.0), y + ui.px(10.0), ui.fs - 1, "COMPLETED", C_GREEN, 255);
                     } else {
@@ -294,7 +359,7 @@ impl Game {
                     }
                 }
                 None => {
-                    c.text(cx - pw / 2 + ui.px(110.0), y + ui.px(20.0), ui.fs, "(empty)", C_DIM, 255);
+                    c.text(cx - pw / 2 + dx, y + ui.px(20.0), ui.fs, "(empty)", C_DIM, 255);
                 }
             }
         }
@@ -342,7 +407,7 @@ impl Game {
             let pw = ui.px(420.0);
             panel(c, cx - pw / 2, ui.px(170.0), pw, ui.px(150.0), 190);
             let rows = [
-                ("Kills", format!("{}  ({})", s.kills, RANKS[rank_of(s.kills)].0)),
+                ("Kills", format!("{}  ({})", s.kills, self.t(RANKS[rank_of(s.kills)].0))),
                 ("Credits", format!("{}", s.credits)),
                 ("Jumps", format!("{}", s.jumps)),
                 ("Time played", fmt_time(s.seconds)),
@@ -365,7 +430,7 @@ impl Game {
         let page = self.page.min(story::ENDING.len() - 1);
         let w = ui.px(720.0).min(c.w as i32 - 40);
         let cols = (w / (ui.fs + 1)) as usize - 2;
-        let lines = wrap(story::ENDING[page], cols);
+        let lines = wrap(self.ending_page(page), cols);
         let fade = clamp(self.ending_t * 1.2, 0.0, 1.0);
         let y0 = c.h as i32 - bar - lines.len() as i32 * ui.lh - ui.px(14.0);
         c.rect(0, y0 - ui.px(10.0), c.w as i32, bar + lines.len() as i32 * ui.lh + ui.px(24.0), rgb(0, 0, 0), 110);
@@ -380,8 +445,14 @@ impl Game {
         self.dim(c, 210);
         let cx = c.w as i32 / 2;
         c.text_c(cx, ui.px(90.0), ui.px(32.0), "CAMPAIGN COMPLETE", C_GREEN, 255);
-        c.text_c(cx, ui.px(150.0), ui.fs + 2, "Continue in free play? Your commander is saved and marked as completed.", C_TEXT, 255);
-        self.menu_list(c, ui, &["Yes, keep flying", "No, return to the main menu"], ui.px(230.0), &|_| true);
+        let cols = ((c.w as i32 - ui.px(60.0)) / (ui.fs + 2)).max(20) as usize;
+        let txt = self.t("Continue in free play? Your commander is saved and marked as completed.");
+        let mut yy = ui.px(150.0);
+        for l in wrap(txt, cols) {
+            c.text_c(cx, yy, ui.fs + 2, &l, C_TEXT, 255);
+            yy += ui.lh + 2;
+        }
+        self.menu_list(c, ui, &["Yes, keep flying", "No, return to the main menu"], yy + ui.px(40.0), &|_| true);
     }
 
     // ------------------------------------------------------------------ station screens
@@ -401,18 +472,21 @@ impl Game {
             ("F11 Contracts", Screen::Contracts, self.docked),
             ("F12 Save", Screen::Save, self.docked),
         ];
+        let total: i32 = tabs.iter().map(|t| c.tl(t.0).chars().count() as i32 + 2).sum();
+        let avail = c.w as i32 - ui.px(20.0) - 2 * tabs.len() as i32;
+        let tf = (ui.fs - 2).min(avail / total.max(1)).max(6);
         let mut x = ui.px(10.0);
         for (t, s, en) in tabs {
-            let w = (t.len() as i32 + 2) * (ui.fs - 2);
+            let w = (c.tl(t).chars().count() as i32 + 2) * tf;
             let cur = s == self.screen;
             if cur {
                 c.rect(x, 2, w, h - 2, rgb(20, 46, 56), 255);
                 c.rect(x, h - 2, w, 2, C_ACCENT, 255);
             }
-            c.text(x + (ui.fs - 2), (h - ui.fs + 2) / 2, ui.fs - 2, t, if cur { C_ACCENT } else if en { C_TEXT } else { rgb(70, 82, 104) }, 255);
+            c.text(x + tf, (h - tf) / 2, tf, t, if cur { C_ACCENT } else if en { C_TEXT } else { rgb(70, 82, 104) }, 255);
             x += w + 2;
         }
-        if c.w as i32 > ui.px(1500.0) {
+        if x + ui.px(260.0) < c.w as i32 {
             let right = format!("{}  {} cr", self.sys().name, self.cmdr.credits);
             c.text_r(c.w as i32 - ui.px(12.0), (h - ui.fs + 1) / 2, ui.fs - 1, &right, C_DIM, 255);
         }
@@ -433,12 +507,16 @@ impl Game {
 
     fn content_rect(&self, c: &Canvas, ui: &Ui) -> (i32, i32, i32, i32) {
         let m = ui.px(18.0);
-        (m, ui.px(30.0) + m, c.w as i32 - 2 * m, c.h as i32 - ui.px(30.0) - 2 * m - ui.px(30.0))
+        let strip = self.tut_strip_height(c, ui);
+        let strip = if strip > 0 { strip + ui.px(6.0) } else { 0 };
+        (m, ui.px(30.0) + m, c.w as i32 - 2 * m, c.h as i32 - ui.px(30.0) - 2 * m - ui.px(30.0) - strip - ui.fs * 2 - ui.px(4.0))
     }
 
     fn kv(&self, c: &mut Canvas, ui: &Ui, x: i32, y: &mut i32, w: i32, k: &str, v: &str, vc: u32) {
-        c.text(x, *y, ui.fs, k, C_DIM, 255);
-        c.text_r(x + w, *y, ui.fs, v, vc, 255);
+        let (kc, vcn) = (c.tl(k).chars().count() as i32, c.tl(v).chars().count() as i32);
+        let size = ui.fs.min(w / (kc + vcn + 2).max(1)).max(6);
+        c.text(x, *y + (ui.fs - size) / 2, size, k, C_DIM, 255);
+        c.text_r(x + w, *y + (ui.fs - size) / 2, size, v, vc, 255);
         *y += ui.lh;
     }
 
@@ -457,7 +535,7 @@ impl Game {
         self.kv(c, ui, ix, &mut y, iw, "Name", &cm.name, C_TEXT);
         let r = rank_of(cm.kills);
         self.kv(c, ui, ix, &mut y, iw, "Rank", RANKS[r].0, C_ACCENT);
-        let next = if r + 1 < RANKS.len() { format!("{} ({})", RANKS[r + 1].0, RANKS[r + 1].1 - cm.kills) } else { String::from("top rank") };
+        let next = if r + 1 < RANKS.len() { format!("{} ({})", self.t(RANKS[r + 1].0), RANKS[r + 1].1 - cm.kills) } else { String::from("top rank") };
         self.kv(c, ui, ix, &mut y, iw, "Next rank", &next, C_DIM);
         self.kv(c, ui, ix, &mut y, iw, "Kills", &format!("{}", cm.kills), C_TEXT);
         let (lt, lc) = match cm.legal() {
@@ -528,14 +606,14 @@ impl Game {
         y += ui.lh + 4;
         match self.objective_text() {
             Some(o) => {
-                for l in wrap(&o, (iw / (ui.fs - 1)) as usize) {
+                for l in wrap(&self.td(&o), (iw / (ui.fs - 1)) as usize) {
                     c.text(ix, y, ui.fs - 1, &l, C_TEXT, 255);
                     y += ui.lh - 2;
                 }
             }
             None => {
                 let t = if cm.story.free_play { "Free play. The campaign is complete." } else if self.story_offer_available() { "A new contract is waiting on the contracts board (F11)." } else { "No active objective." };
-                for l in wrap(t, (iw / (ui.fs - 1)) as usize) {
+                for l in wrap(self.t(t), (iw / (ui.fs - 1)) as usize) {
                     c.text(ix, y, ui.fs - 1, &l, C_DIM, 255);
                     y += ui.lh - 2;
                 }
@@ -543,7 +621,7 @@ impl Game {
         }
         for m in cm.missions.iter() {
             y += 4;
-            let t = self.side_text(m);
+            let t = self.td(&self.side_text(m));
             for l in wrap(&t, (iw / (ui.fs - 1)) as usize) {
                 c.text(ix, y, ui.fs - 1, &l, C_AMBER, 255);
                 y += ui.lh - 2;
@@ -590,7 +668,8 @@ impl Game {
         let iw = (w - ui.px(48.0)).min(ui.px(520.0));
         self.sys_line(c, ui, ix, &mut y, iw, &s);
         y += ui.lh;
-        for l in wrap(&s.description(), 60) {
+        let desc = if self.is_ru() { s.description_ru() } else { s.description() };
+        for l in wrap(&desc, 60) {
             c.text(ix, y, ui.fs, &l, C_TEXT, 255);
             y += ui.lh;
         }
@@ -629,7 +708,12 @@ impl Game {
         } else {
             c.ring(px, py, rr, 1.0, rgb(60, 130, 140), 150);
         }
-        for (i, s) in self.gal.sys.iter().enumerate() {
+        let mut labels: Vec<[i32; 4]> = Vec::new();
+        // nearest systems first so the labels that matter win
+        let mut order: Vec<usize> = (0..SYSTEMS).collect();
+        order.sort_by(|&a, &b| self.gal.dist_ly(cur, a).partial_cmp(&self.gal.dist_ly(cur, b)).unwrap_or(core::cmp::Ordering::Equal));
+        for i in order {
+            let s = &self.gal.sys[i];
             let p = to(s);
             if !inside(p) {
                 continue;
@@ -643,7 +727,12 @@ impl Game {
                 c.line(px, py, p.0, p.1, rgb(40, 70, 82), 90);
             }
             if local && i != cur {
-                c.text(p.0 as i32 + ui.px(6.0), p.1 as i32 - ui.fs / 2, ui.fs - 3, &s.name, if in_range { C_TEXT } else { C_DIM }, 200);
+                let (lx, ly, lw) = (p.0 as i32 + ui.px(6.0), p.1 as i32 - ui.fs / 2, s.name.len() as i32 * (ui.fs - 3));
+                let hit = labels.iter().any(|b: &[i32; 4]| lx < b[2] + 2 && b[0] < lx + lw + 2 && ly < b[3] + 1 && b[1] < ly + ui.fs - 2);
+                if !hit && lx + lw < x0 + side - 2 {
+                    c.text(lx, ly, ui.fs - 3, &s.name, if in_range { C_TEXT } else { C_DIM }, 200);
+                    labels.push([lx, ly, lx + lw, ly + ui.fs - 3]);
+                }
             }
         }
         // markers
@@ -716,8 +805,9 @@ impl Game {
             c.text(ix + ui.px(cols[i] as f32), hy, ui.fs - 1, t, C_DIM, 255);
         }
         c.rect(ix, hy + ui.fs + 2, w - ui.px(36.0), 1, C_BORDER, 255);
+        let rowp = (((y0 + h) - (hy + ui.lh + 4) - ui.fs * 2 - 8) / NCOM as i32).clamp(ui.fs + 3, ui.lh + 2);
         for (i, k) in COMMODITIES.iter().enumerate() {
-            let y = hy + ui.lh + 4 + i as i32 * (ui.lh + 2);
+            let y = hy + ui.lh + 4 + i as i32 * rowp;
             let sel = i == self.sel;
             if sel {
                 c.rect(ix - 6, y - 3, w - ui.px(24.0), ui.lh, rgb(20, 46, 56), 230);
@@ -734,7 +824,7 @@ impl Game {
             c.text(ix + ui.px(cols[4] as f32), y, ui.fs, &format!("{}", stock), if stock == 0 { C_DIM } else { C_TEXT }, 255);
             c.text(ix + ui.px(cols[5] as f32), y, ui.fs, &format!("{}", self.cmdr.cargo[i]), if self.cmdr.cargo[i] > 0 { C_GREEN } else { C_DIM }, 255);
         }
-        let y = hy + ui.lh + 4 + NCOM as i32 * (ui.lh + 2) + 6;
+        let y = hy + ui.lh + 4 + NCOM as i32 * rowp + 6;
         let k = &COMMODITIES[self.sel];
         c.text(ix, y, ui.fs - 1, &format!("Sell price {} cr. * marks illegal goods: customs here are level {} of 7.", self.market.sell_price(self.sel), s.law()), C_DIM, 255);
         let _ = k;
@@ -747,6 +837,7 @@ impl Game {
         c.text(ix, y0 + ui.px(12.0), ui.fs + 4, &format!("Equipment - tech level {}", self.sys().tech), C_ACCENT, 255);
         c.text_r(x0 + w - ui.px(18.0), y0 + ui.px(12.0), ui.fs, &format!("{} cr", self.cmdr.credits), C_AMBER, 255);
         let rows = self.equipment_rows();
+        let eq_pitch = (((y0 + h) - (y0 + ui.px(12.0) + ui.lh + ui.px(12.0)) - ui.fs * 2) / rows.len().max(1) as i32).clamp(ui.fs + 3, ui.lh + 1);
         let mut y = y0 + ui.px(12.0) + ui.lh + ui.px(12.0);
         for (i, r) in rows.iter().enumerate() {
             let sel = i == self.sel;
@@ -763,7 +854,7 @@ impl Game {
             let tc = if matches!(r.status, EqState::Locked(_)) { rgb(80, 92, 114) } else { C_TEXT };
             c.text(ix, y, ui.fs, &r.text, tc, 255);
             c.text_r(x0 + w - ui.px(24.0), y, ui.fs, &st, col, 255);
-            y += ui.lh + 1;
+            y += eq_pitch;
         }
         // description of the selected equipment
         if let Some(r) = rows.get(self.sel) {
@@ -796,13 +887,13 @@ impl Game {
                 if st.chapter >= CHAPTERS {
                     c.text(ix, y + ui.lh, ui.fs + 1, "Campaign complete", C_GREEN, 255);
                 } else if st.active {
-                    let d = story::chapter(st.chapter);
+                    let d = self.chapter_def(st.chapter);
                     c.text(ix, y + ui.lh, ui.fs + 1, &format!("Chapter {}: {} (active)", st.chapter + 1, d.title), C_TEXT, 255);
                     if let Some(o) = self.objective_text() {
                         c.text(ix, y + ui.lh * 2, ui.fs - 1, &o, C_ACCENT, 255);
                     }
                 } else if st.chapter >= 1 && self.cmdr.galaxy == 0 {
-                    let d = story::chapter(st.chapter);
+                    let d = self.chapter_def(st.chapter);
                     c.text(ix, y + ui.lh, ui.fs + 1, &format!("Chapter {}: {}", st.chapter + 1, d.title), C_TEXT, 255);
                     let ok = story::gate_ok(&d.gate, &self.cmdr);
                     let line = if ok { format!("Reward {} cr. Press Enter to accept.", d.reward) } else { story::gate_text(&d.gate) };

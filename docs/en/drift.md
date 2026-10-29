@@ -7,8 +7,7 @@ AGPL-3.0-only.
 
 The game draws everything itself with a software 3D renderer: z-buffered solid ships with flat
 and Gouraud shading, procedural planets with a day/night terminator and atmosphere, stars, a
-nebula sky, particle explosions, glowing laser bolts and a cheap bloom pass. There is no audio in
-this version.
+nebula sky, particle explosions, glowing laser bolts and a cheap bloom pass. Sound is generated, see below.
 
 ## Install and run
 
@@ -26,6 +25,19 @@ over the screen and the keyboard until you quit it. Ctrl+C always kills it.
 
 Commanders and settings are stored as small files (`drift-slotN.sav`, `drift.cfg`) in `/home`,
 or in `/tmp` if `/home` cannot be written.
+
+## The tutorial
+
+New Game offers a tutorial after the intro; the main menu also has a Tutorial item that runs it
+as a practice flight (nothing is saved). It is an interactive flight school of 13 steps, shown in
+a panel with the exact keys as key caps and a checklist of finished steps: launch, steer, throttle,
+rear and side views, the dashboard (the panel is highlighted and every instrument is named), the
+compass, locking a training drone, firing at it, flying to a beacon, the in-system jump (you are
+moved into open space first), docking by hand with a guide, trading one cargo and buying fuel.
+Each step waits for you to do it. X skips the tutorial at any moment. The tutorial lends you a
+docking computer (press D at the dock step) and returns it at the end. While you are close to a
+station the docking guide shows where to steer: a path marker for the nose, the roll to apply and
+your speed against the 150 m/s limit.
 
 ## The story
 
@@ -72,7 +84,7 @@ Flight:
 | D | docking computer on/off (any roll or pitch key turns it off) |
 | E | eject in the escape capsule |
 | P or Esc | pause menu |
-| Tab | key map |
+| Tab | key map and dashboard legend (Left/Right switches the page) |
 
 Screens: F1 front view (launch when docked), F2 rear, F3 left, F4 right, F5 status, F6 galactic
 chart, F7 local chart, F8 system data, F9 market, F10 equipment, F11 contracts, F12 save. F9 to
@@ -80,11 +92,33 @@ F12 work only when docked. On charts the arrows jump to the neighbouring system,
 destination, Home returns to your system. In the market B or Enter buys, S sells, Shift makes it
 ten at a time or everything. In equipment Enter buys, Del removes a laser (half price back).
 
-Menus use the arrow keys, Enter and Esc. The mouse is not used.
+Menus use the arrow keys, Enter and Esc. The mouse is not used. Every screen lays itself out from
+the real framebuffer size (a scale derived from a 960 by 540 design), so 800x600 up to 2560x1440
+work; the host harness checks every screen at eight resolutions in both languages for text that
+leaves the screen or overlaps other text.
+
+## Sound
+
+All sound is generated at run time (no sample files): oscillators, noise, envelopes and filters
+mixed to 48 kHz stereo. There is an engine hum that follows the throttle, the jump drive and the
+hyperspace charge, laser and enemy shots, shield and hull hits, explosions, missile launches, lock
+beeps, scooping, chaff, docking clamps, menu clicks, alarms for low energy, a hot cabin and
+incoming missiles, and a calm ambient pad with sparse bell notes on the title screen, in menus and
+while docked. Sounds are panned by their direction relative to your nose and fade with distance.
+Master, effects and music volume are in Settings (0 to 10). The program feeds the sound device
+every frame and stays silent if the device cannot be opened.
+
+## Dashboard
+
+The bottom panel names every bar and shows its value: Shield fwd and Shield aft, Energy (the hull,
+in four banks), Fuel in light years, Cabin temp, Laser temp (of the laser on the current view),
+Altitude above the planet, Speed in m/s, Throttle, Roll, Pitch, Missiles. Bars turn amber and then
+red when a resource is low or something is hot. The scanner shows contacts with a stick for height;
+the compass above it points to the station (ST) or planet (PL), a filled dot meaning ahead.
 
 ## Settings
 
-Invert pitch, bloom on/off, retro wireframe mode (flat green wireframes instead of solid
+Language (English or Russian, saved with the settings), invert pitch, bloom on/off, retro wireframe mode (flat green wireframes instead of solid
 shading), and the 3D resolution (low, medium, high; the scene is rendered at 0.34, 0.5 or 0.75 of
 the interface size and scaled up, the HUD is always drawn at full size). If the average frame
 takes longer than 38 ms the program lowers the 3D resolution on its own for that run.
@@ -197,7 +231,10 @@ configuration. Screenshots are written to the directory in the environment varia
 
 ## Known limits
 
-- No sound. No mouse.
+- No mouse. Sound needs the audio device of the system (silent without it).
+- Russian is complete for all interface text, story, tutorial and generated system descriptions;
+  generated system names stay in Latin letters. The font is the game's own 8x8 bitmap set with
+  original Cyrillic glyphs, so text is UTF-8 and monospaced.
 - The commander is saved only when docked, and a loaded game starts docked.
 - The story lives in the first galaxy; using the galactic drive leaves it behind.
 - Heap: the stock liboos heap of 4 MiB is too small; see the install section.

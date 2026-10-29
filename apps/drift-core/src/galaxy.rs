@@ -147,6 +147,34 @@ impl SystemInfo {
     }
 }
 
+impl SystemInfo {
+    /// The description line in Russian (agreement: the noun is masculine, adjectives follow it).
+    pub fn description_ru(&self) -> String {
+        use crate::i18n_text::*;
+        let mut rng = Rng::new(self.seed ^ 0xDE5C);
+        let adj = rng.below(16) as usize;
+        let tr = rng.below(16) as usize;
+        let fam = rng.below(16) as usize;
+        let kind = match self.planet {
+            PlanetKind::Ocean => 0,
+            PlanetKind::Arid => 1,
+            PlanetKind::Frozen => 2,
+            PlanetKind::Volcanic => 3,
+            PlanetKind::Barren => 4,
+            PlanetKind::Jungle => 5,
+        };
+        // "with an amber sky" and "with low gravity" follow the noun
+        let head = if adj == 3 || adj == 4 {
+            alloc::format!("{} {}", KIND_RU[kind], ADJ_RU[adj])
+        } else {
+            alloc::format!("{} {}", ADJ_RU[adj], KIND_RU[kind])
+        };
+        let mut cs = head.chars();
+        let first: String = cs.next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+        alloc::format!("{}{} под властью {}. {}. Славится {}.", first, cs.as_str(), GOV_GEN_RU[self.govt as usize], TRAIT_RU[tr], FAMOUS_RU[fam])
+    }
+}
+
 pub struct Galaxy {
     pub index: usize,
     pub sys: Vec<SystemInfo>,

@@ -222,40 +222,30 @@ impl Scene {
                 self.small[y * sw + x] = acc;
             }
         }
-        // total weight 16*16 per cell sum -> average = /256 (weights) /16 (pixels) = >>12
-        for y in 0..self.h {
-            let fy = (y % 4) as i32;
-            let sy0 = y / 4;
-            let sy1 = (sy0 + 1).min(sh - 1);
-            let wy1 = fy * 2 + 1; // 1,3,5,7 /8
-            let wy0 = 8 - wy1;
-            let row = y * self.w;
-            for x in 0..self.w {
-                let fx = (x % 4) as i32;
-                let sx0 = x / 4;
-                let sx1 = (sx0 + 1).min(sw - 1);
-                let wx1 = fx * 2 + 1;
-                let wx0 = 8 - wx1;
-                let a = self.small[sy0 * sw + sx0];
-                let b = self.small[sy0 * sw + sx1];
-                let c = self.small[sy1 * sw + sx0];
-                let d = self.small[sy1 * sw + sx1];
-                if a[0] | a[1] | a[2] | b[0] | b[1] | b[2] | c[0] | c[1] | c[2] | d[0] | d[1] | d[2] == 0 {
+        // average = cell sum / 16 pixels / 256 (blur weights); gain is in 1/256 units. The blurred
+        // buffer is smooth, so each 4x4 block gets one constant value, added with saturation.
+        for sy in 0..sh {
+            for sx in 0..sw {
+                let s = self.small[sy * sw + sx];
+                let add = [(s[0] * gain) >> 20, (s[1] * gain) >> 20, (s[2] * gain) >> 20];
+                if add[0] <= 0 && add[1] <= 0 && add[2] <= 0 {
                     continue;
                 }
-                let mut add = [0i32; 3];
-                for k in 0..3 {
-                    let top = a[k] * wx0 + b[k] * wx1;
-                    let bot = c[k] * wx0 + d[k] * wx1;
-                    add[k] = ((top * wy0 + bot * wy1) >> 6) * gain >> 20;
-                }
-                if add[0] > 0 || add[1] > 0 || add[2] > 0 {
-                    let (r, g, b) = chan(self.col[row + x]);
-                    self.col[row + x] = pack(
-                        (r as i32 + add[0]).max(0) as u32,
-                        (g as i32 + add[1]).max(0) as u32,
-                        (b as i32 + add[2]).max(0) as u32,
-                    );
+                let (ar, ag, ab) = (add[0].clamp(0, 255) as u32, add[1].clamp(0, 255) as u32, add[2].clamp(0, 255) as u32);
+                for dy in 0..4 {
+                    let y = sy * 4 + dy;
+                    if y >= self.h {
+                        break;
+                    }
+                    let x0 = sx * 4;
+                    let x1 = (x0 + 4).min(self.w);
+                    for px in &mut self.col[y * self.w + x0..y * self.w + x1] {
+                        let v = *px;
+                        let r = ((v >> 16) & 255) + ar;
+                        let g = ((v >> 8) & 255) + ag;
+                        let b = (v & 255) + ab;
+                        *px = (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
+                    }
                 }
             }
         }

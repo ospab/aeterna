@@ -2,8 +2,13 @@
 // Copyright (c) 2026 ospab
 //! 2D drawing on a 32-bit 0x00RRGGBB pixel buffer: blending, shapes, smooth text.
 use crate::math::*;
+use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
+
+use crate::i18n::Tr;
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
@@ -40,11 +45,17 @@ pub struct Canvas {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u32>,
+    /// When `Some`, every text run records its bounding box (layout checks in tests).
+    pub audit: Option<Vec<[i32; 4]>>,
+    pub audit_off: bool,
+    /// Fixed strings are looked up here before drawing (the Russian string table).
+    pub tr: Option<Rc<Tr>>,
+    glyphs: BTreeMap<(u32, i32), Vec<u8>>,
 }
 
 impl Canvas {
     pub fn new(w: usize, h: usize) -> Canvas {
-        Canvas { w, h, px: vec![0; w * h] }
+        Canvas { w, h, px: vec![0; w * h], audit: None, audit_off: false, tr: None, glyphs: BTreeMap::new() }
     }
     pub fn resize(&mut self, w: usize, h: usize) {
         self.w = w;
@@ -88,8 +99,15 @@ impl Canvas {
                     *p = c;
                 }
             } else {
+                // packed blend: two channels at a time, division by 255 as shift and add
+                let (inv, src_rb, src_g) = (255 - a, (c & 0x00FF_00FF) * a, (c & 0x0000_FF00) * a);
                 for p in &mut self.px[row + x0 as usize..row + x1 as usize] {
-                    *p = mix(*p, c, a);
+                    let d = *p;
+                    let rb = (d & 0x00FF_00FF) * inv + src_rb + 0x0080_0080;
+                    let gg = (d & 0x0000_FF00) * inv + src_g + 0x0000_8000;
+                    let rb = ((rb + ((rb >> 8) & 0x00FF_00FF)) >> 8) & 0x00FF_00FF;
+                    let gg = ((gg + ((gg >> 8) & 0x0000_FF00)) >> 8) & 0x0000_FF00;
+                    *p = rb | gg;
                 }
             }
         }
@@ -194,78 +212,155 @@ impl Canvas {
             py = y;
         }
     }
-    /// Smooth text. `size` is the glyph cell height in pixels (the 8x8 font is scaled).
+    /// Translate a string if a table is set.
+    pub fn tl<'a>(&self, s: &'a str) -> Cow<'a, str> {
+        match &self.tr {
+            Some(m) => m.translate(s),
+            None => Cow::Borrowed(s),
+        }
+    }
+    /// Width in pixels of `s` as drawn at `size` (after translation).
+    pub fn text_w(&self, s: &str, size: i32) -> i32 {
+        self.tl(s).chars().count() as i32 * size
+    }
+    /// Smooth text (UTF-8). `size` is the glyph cell height in pixels (the 8x8 font is scaled).
     /// Returns the advance width. Text is monospaced with advance == size.
     pub fn text(&mut self, x: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) -> i32 {
+        let s = self.tl(s);
+        let s: &str = &s;
         let mut cx = x;
-        for ch in s.bytes() {
+        if !self.audit_off && !s.trim().is_empty() {
+            let w = s.chars().count() as i32 * size;
+            if let Some(a) = self.audit.as_mut() {
+                a.push([x, y, x + w, y + size]);
+            }
+        }
+        for ch in s.chars() {
             self.glyph(cx, y, size, ch, c, alpha);
             cx += size;
         }
         cx - x
     }
     pub fn text_c(&mut self, cx: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) {
-        let w = s.len() as i32 * size;
+        let w = self.text_w(s, size);
         self.text(cx - w / 2, y, size, s, c, alpha);
     }
     pub fn text_r(&mut self, rx: i32, y: i32, size: i32, s: &str, c: u32, alpha: u32) {
-        let w = s.len() as i32 * size;
+        let w = self.text_w(s, size);
         self.text(rx - w, y, size, s, c, alpha);
     }
-    fn glyph(&mut self, x: i32, y: i32, size: i32, ch: u8, c: u32, alpha: u32) {
-        if x + size < 0 || y + size < 0 || x >= self.w as i32 || y >= self.h as i32 || ch == b' ' {
+    fn glyph(&mut self, x: i32, y: i32, size: i32, ch: char, c: u32, alpha: u32) {
+        if size <= 0 || x + size < 0 || y + size < 0 || x >= self.w as i32 || y >= self.h as i32 || ch == ' ' {
             return;
         }
-        let g = glyph_bits(ch);
-        let s = size as f32 / 8.0;
-        let inv = 1.0 / s;
-        let tex = |tx: i32, ty: i32| -> f32 {
-            if !(0..8).contains(&tx) || !(0..8).contains(&ty) {
-                0.0
-            } else {
-                ((g[ty as usize] >> tx) & 1) as f32
+        let key = (ch as u32, size);
+        if !self.glyphs.contains_key(&key) {
+            let mask = glyph_mask(ch, size);
+            if self.glyphs.len() > 2000 {
+                self.glyphs.clear();
             }
-        };
+            self.glyphs.insert(key, mask);
+        }
+        let mask = &self.glyphs[&key];
+        let (w, h) = (self.w as i32, self.h as i32);
         for oy in 0..size {
             let py = y + oy;
-            if py < 0 || py >= self.h as i32 {
+            if py < 0 || py >= h {
                 continue;
             }
-            let v = (oy as f32 + 0.5) * inv - 0.5;
-            let fy = floor(v);
-            let ty = fy as i32;
-            let wy = v - fy;
+            let row = &mask[(oy * size) as usize..((oy + 1) * size) as usize];
             for ox in 0..size {
-                let px = x + ox;
-                if px < 0 || px >= self.w as i32 {
+                let cov = row[ox as usize] as u32;
+                if cov == 0 {
                     continue;
                 }
-                let u = (ox as f32 + 0.5) * inv - 0.5;
-                let fx = floor(u);
-                let tx = fx as i32;
-                let wx = u - fx;
-                let v00 = tex(tx, ty);
-                let v10 = tex(tx + 1, ty);
-                let v01 = tex(tx, ty + 1);
-                let v11 = tex(tx + 1, ty + 1);
-                let val = lerp(lerp(v00, v10, wx), lerp(v01, v11, wx), wy);
-                let cov = if size >= 12 { smoothstep(0.3, 0.7, val) } else { val };
-                if cov > 0.02 {
-                    self.put(px, py, c, (cov * alpha as f32) as u32);
+                let px = x + ox;
+                if px < 0 || px >= w {
+                    continue;
                 }
+                let a = cov * alpha / 255;
+                if a == 0 {
+                    continue;
+                }
+                let i = py as usize * self.w + px as usize;
+                self.px[i] = if a >= 255 { c } else { mix(self.px[i], c, a) };
             }
         }
     }
 }
 
+/// Coverage mask (size x size, 0..255) of a glyph scaled with bilinear sampling and a soft edge.
+fn glyph_mask(ch: char, size: i32) -> Vec<u8> {
+    let g = glyph_bits(ch);
+    let s = size as f32 / 8.0;
+    let inv = 1.0 / s;
+    let tex = |tx: i32, ty: i32| -> f32 {
+        if !(0..8).contains(&tx) || !(0..8).contains(&ty) {
+            0.0
+        } else {
+            ((g[ty as usize] >> tx) & 1) as f32
+        }
+    };
+    let mut m = vec![0u8; (size * size) as usize];
+    for oy in 0..size {
+        let v = (oy as f32 + 0.5) * inv - 0.5;
+        let fy = floor(v);
+        let ty = fy as i32;
+        let wy = v - fy;
+        for ox in 0..size {
+            let u = (ox as f32 + 0.5) * inv - 0.5;
+            let fx = floor(u);
+            let tx = fx as i32;
+            let wx = u - fx;
+            let val = lerp(lerp(tex(tx, ty), tex(tx + 1, ty), wx), lerp(tex(tx, ty + 1), tex(tx + 1, ty + 1), wx), wy);
+            let cov = if size >= 12 { smoothstep(0.3, 0.7, val) } else { val };
+            m[(oy * size + ox) as usize] = if cov > 0.02 { (cov * 255.0) as u8 } else { 0 };
+        }
+    }
+    m
+}
+
 static COPYRIGHT: [u8; 8] = [0x3C, 0x42, 0x99, 0x85, 0x85, 0x99, 0x42, 0x3C];
 
-pub fn glyph_bits(ch: u8) -> &'static [u8; 8] {
-    if ch == 0x7f {
+pub fn glyph_bits(ch: char) -> &'static [u8; 8] {
+    if ch == '\u{7f}' || ch == '\u{a9}' {
         return &COPYRIGHT;
     }
-    let i = if (32..127).contains(&ch) { ch - 32 } else { b'?' - 32 };
-    &FONT[i as usize]
+    let ascii = |c: char| &FONT[(c as u8 - 32) as usize];
+    if (' '..='~').contains(&ch) {
+        return ascii(ch);
+    }
+    // Cyrillic letters that look like Latin ones share the Latin glyph.
+    let twin = match ch {
+        'А' => 'A',
+        'В' => 'B',
+        'Е' => 'E',
+        'К' => 'K',
+        'М' => 'M',
+        'Н' => 'H',
+        'О' => 'O',
+        'Р' => 'P',
+        'С' => 'C',
+        'Т' => 'T',
+        'Х' => 'X',
+        'а' => 'a',
+        'с' => 'c',
+        'е' => 'e',
+        'о' => 'o',
+        'р' => 'p',
+        'х' => 'x',
+        'у' => 'y',
+        _ => '\0',
+    };
+    if twin != '\0' {
+        return ascii(twin);
+    }
+    for (c, g) in crate::font_cyr::CYR.iter() {
+        if *c == ch {
+            return g;
+        }
+    }
+    ascii('?')
 }
 
 /// 8x8 bitmap font, ASCII 32..126, bit 0 is the leftmost pixel.

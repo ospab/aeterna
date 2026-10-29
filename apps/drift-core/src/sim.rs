@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ospab
 //! Flight simulation: the player's ship, NPC ships and their AI, weapons, docking, effects.
+use crate::audio::Sfx;
 use crate::commander::*;
 use crate::econ::*;
 use crate::galaxy::*;
@@ -293,6 +294,8 @@ pub struct World {
     pub dust: Vec<V3>,
     pub beacon: Option<V3>,
     pub contact_t: f32,
+    /// Sound events for the mixer: (sound, world position, loudness).
+    pub sfx: Vec<(Sfx, V3, f32)>,
 }
 
 pub fn hostile(a: Faction, b: Faction) -> bool {
@@ -406,6 +409,13 @@ impl World {
             dust: Vec::new(),
             beacon: None,
             contact_t: 0.0,
+            sfx: Vec::new(),
+        }
+    }
+
+    pub fn sound(&mut self, s: Sfx, pos: V3, gain: f32) {
+        if self.sfx.len() < 48 {
+            self.sfx.push((s, pos, gain));
         }
     }
 
@@ -792,6 +802,7 @@ impl World {
     // ------------------------------------------------------------------ damage
 
     pub fn explosion(&mut self, pos: V3, size: f32, debris: usize) {
+        self.sound(Sfx::Explosion, pos, clamp(size / 50.0, 0.25, 1.0));
         if self.parts.len() > MAX_PARTICLES - 80 {
             self.parts.drain(0..80);
         }
@@ -856,6 +867,9 @@ impl World {
         if self.ships[idx].flash > 0.0 && !died {
             let dir = (from - pos).norm();
             self.parts.push(Particle { pos: pos + dir * r * 0.9, vel: V3::ZERO, life: 0.25, max: 0.25, size: r * 0.9, col: 0x7FB8FF, kind: PKind::Flash, o: Orient::ID, spin: V3::ZERO });
+        }
+        if !died && (pos - self.p.pos).len() < 6000.0 {
+            self.sound(if self.ships[idx].flash > 0.0 { Sfx::ShieldHit } else { Sfx::Hit }, pos, 0.7);
         }
         if by_player && was_civil && !died {
             if !self.ships[idx].provoked || self.ships[idx].age >= 0.0 {
@@ -982,6 +996,7 @@ impl World {
             dmg -= a;
         }
         self.p.hit_flash = 1.0;
+        self.sound(if dmg > 0.0 { Sfx::Hit } else { Sfx::ShieldHit }, from, 1.0);
         if dmg > 0.0 {
             self.p.energy -= dmg;
             if self.rng.chance(0.06 + dmg * 0.002) {
@@ -1012,6 +1027,7 @@ impl World {
     }
 
     fn launch_missile(&mut self, pos: V3, o: Orient, speed: f32, fac: Faction, target: u32, by_player: bool) {
+        self.sound(Sfx::Missile, pos, 0.9);
         let i = self.add_ship(Kind::Missile, pos + o.f * 40.0, o, Faction::Neutral);
         let s = &mut self.ships[i];
         s.speed = speed + 60.0;
@@ -1058,6 +1074,8 @@ impl World {
         let flip = if self.p.fire_cd > 0.0 && (self.t * 10.0) as i32 % 2 == 0 { 1.0 } else { -1.0 };
         let pos = self.p.pos + dir * 30.0 + side * (flip * 18.0) + down;
         self.fire_bolt(pos, dir, speed, dmg, PLAYER_ID, Faction::Neutral, col, life, mining, V3::ZERO);
+        let pp = self.p.pos;
+        self.sound(Sfx::Laser, pp + dir * 50.0, 0.9);
         let h = if cmdr.has(EQ_HEATSINK) { heat * 0.8 } else { heat };
         let v = view as usize & 3;
         self.p.laser_heat[v] += h;
@@ -1204,6 +1222,7 @@ impl World {
                     }
                 }
                 self.spark_burst(pp + self.p.o.f * -60.0, 30, 0xC0E0FF, 220.0);
+                self.sound(Sfx::Chaff, pp, 0.8);
                 self.events.push(Ev::Msg(if n > 0 { format!("Chaff released: {} missile(s) neutralised", n) } else { String::from("Chaff released") }));
             } else if !cmdr.has(EQ_CHAFF) {
                 self.events.push(Ev::Warn(String::from("No countermeasure pod")));
@@ -1279,6 +1298,8 @@ impl World {
                 self.p.lock = best;
                 self.p.lock_t = 0.0;
                 self.events.push(Ev::Msg(String::from("Target acquired")));
+                let pp = self.p.pos;
+                self.sound(Sfx::Lock, pp, 0.8);
             } else {
                 self.events.push(Ev::Warn(String::from("No target in view")));
             }
@@ -1287,6 +1308,8 @@ impl World {
             self.p.lock_t += dt;
             if self.p.lock_t >= 1.0 {
                 self.events.push(Ev::Msg(String::from("Missile lock")));
+                let pp = self.p.pos;
+                self.sound(Sfx::Ready, pp, 0.8);
             }
         }
         if ctl.missile {
@@ -1536,6 +1559,7 @@ impl World {
         self.p.dockcomp = false;
         let pos = self.p.pos;
         self.spark_burst(pos, 14, 0xFFD090, 200.0);
+        self.sound(Sfx::Hit, pos, 1.0);
         self.events.push(Ev::Warn(String::from("Hull collision")));
     }
 
@@ -1618,6 +1642,7 @@ impl World {
                 Faction::Alien => 0x60FFB0,
                 _ => 0xFFFFFF,
             };
+            self.sound(Sfx::EnemyLaser, pos, 0.8);
             self.fire_bolt(pos, dir, speed, dmg, owner, fac, col, 1.4, false, V3::ZERO);
         }
         // ship-ship collisions for large things are ignored; separate overlapping NPCs lightly

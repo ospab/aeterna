@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ospab
 //! The game: state machine, menus, trading, hyperspace, campaign and side contracts.
+use crate::audio::{AudioState, Sfx, Synth};
 use crate::commander::*;
 use crate::econ::*;
 use crate::galaxy::*;
+use crate::i18n::{Lang, Tr};
 use crate::math::*;
 use crate::models;
 use crate::raster::*;
@@ -61,6 +63,7 @@ pub enum Act {
     N3,
     N4,
     N5,
+    Skip,
 }
 
 impl Act {
@@ -113,20 +116,25 @@ pub struct Settings {
     pub retro: bool,
     /// 0 low, 1 medium, 2 high internal 3D resolution.
     pub quality: u8,
+    pub lang: Lang,
+    /// Volumes 0..=10.
+    pub vol_master: u8,
+    pub vol_sfx: u8,
+    pub vol_music: u8,
 }
 
 impl Settings {
     pub fn default_settings() -> Settings {
-        Settings { invert_pitch: false, bloom: true, retro: false, quality: 1 }
+        Settings { invert_pitch: false, bloom: true, retro: false, quality: 1, lang: Lang::En, vol_master: 8, vol_sfx: 8, vol_music: 6 }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
-        alloc::vec![b'D', b'C', 1, self.invert_pitch as u8, self.bloom as u8, self.retro as u8, self.quality]
+        alloc::vec![b'D', b'C', 1, self.invert_pitch as u8, self.bloom as u8, self.retro as u8, self.quality, self.lang.code(), self.vol_master, self.vol_sfx, self.vol_music]
     }
     pub fn from_bytes(b: &[u8]) -> Option<Settings> {
         if b.len() < 7 || b[0] != b'D' || b[1] != b'C' || b[2] != 1 || b[6] > 2 {
             return None;
         }
-        Some(Settings { invert_pitch: b[3] != 0, bloom: b[4] != 0, retro: b[5] != 0, quality: b[6] })
+        Some(Settings { invert_pitch: b[3] != 0, bloom: b[4] != 0, retro: b[5] != 0, quality: b[6], lang: Lang::from_code(b.get(7).copied().unwrap_or(0)), vol_master: b.get(8).copied().unwrap_or(8).min(10), vol_sfx: b.get(9).copied().unwrap_or(8).min(10), vol_music: b.get(10).copied().unwrap_or(6).min(10) })
     }
 }
 
@@ -153,6 +161,7 @@ pub enum Screen {
     Dead,
     Ending,
     FreePlay,
+    TutorialAsk,
 }
 
 pub enum Io {
@@ -178,6 +187,20 @@ pub struct Hyper {
     pub dest: usize,
     pub galaxy_jump: bool,
     pub free: bool,
+}
+
+/// State of the interactive tutorial.
+pub struct Tut {
+    pub step: usize,
+    /// Practice run from the main menu: nothing is saved and the story is untouched.
+    pub practice: bool,
+    pub roll_t: f32,
+    pub pitch_t: f32,
+    pub saw_rear: bool,
+    pub drone: u32,
+    pub drone_dead: bool,
+    pub jumped: bool,
+    pub flash: f32,
 }
 
 pub struct DeathStats {
@@ -228,10 +251,14 @@ pub struct Game {
     pub(crate) save_msg: Option<String>,
     pub(crate) tab_flash: f32,
     pub(crate) ending_t: f32,
-    pub(crate) credits_y: f32,
-    pub(crate) after_credits: Screen,
+    pub credits_y: f32,
+    pub after_credits: Screen,
     pub(crate) started: bool,
     pub cur_slot: usize,
+    pub tut: Option<Tut>,
+    pub bd_frame: u32,
+    pub synth: Synth,
+    pub tr: alloc::rc::Rc<Tr>,
 }
 
 pub fn start_system(g: &Galaxy) -> usize {
@@ -312,10 +339,62 @@ impl Game {
             after_credits: Screen::MainMenu,
             started: false,
             cur_slot: 0,
+            tut: None,
+            bd_frame: 0,
+            synth: Synth::new(),
+            tr: alloc::rc::Rc::new(Tr::russian()),
         }
     }
 
     // ------------------------------------------------------------------ io
+
+    /// Convert the world's sound events into panned, attenuated mixer voices.
+    fn route_sfx(&mut self) {
+        let evs = core::mem::take(&mut self.world.sfx);
+        let p = &self.world.p;
+        let flying = !self.docked && self.started;
+        for (s, pos, gain) in evs {
+            if !flying {
+                continue;
+            }
+            let rel = p.o.to_local(pos - p.pos);
+            let d = rel.len().max(1.0);
+            let pan = clamp(rel.x / d * 1.3, -1.0, 1.0);
+            let near = 1.0 / (1.0 + d / 1800.0);
+            let behind = if rel.z < 0.0 { 0.8 } else { 1.0 };
+            self.synth.trigger(s, pan, gain * near * behind);
+        }
+        // continuous state
+        let w = &self.world;
+        let in_flight = flying && matches!(self.screen, Screen::Flight | Screen::Status | Screen::GalChart | Screen::LocalChart | Screen::SysInfo | Screen::Briefing);
+        let hyper_k = match self.hyper {
+            Some(h) => {
+                let total = if h.galaxy_jump { 5.0 } else if h.free { 3.0 } else { 4.0 };
+                clamp(1.0 - h.t / total, 0.0, 1.0)
+            }
+            None => 0.0,
+        };
+        self.synth.st = AudioState {
+            throttle: w.p.throttle,
+            speed_k: clamp(w.p.speed / PLAYER_MAX_SPEED, 0.0, 1.0),
+            jump_k: clamp(w.p.jump_speed / JUMP_SPEED, 0.0, 1.0),
+            hyper_k,
+            low_energy: in_flight && w.p.alive && w.p.energy < w.p.energy_max * 0.25,
+            hot: in_flight && w.p.cabin > 85.0,
+            missile_warn: in_flight && w.p.missile_warn,
+            in_flight: in_flight && w.p.alive,
+            music: !in_flight && !matches!(self.screen, Screen::Pause if !self.docked),
+        };
+    }
+
+    /// Fill `out` (interleaved stereo, 48 kHz) with the next samples.
+    pub fn mix_audio(&mut self, out: &mut [i16]) {
+        let v = |x: u8| x as f32 / 10.0;
+        self.synth.master = v(self.settings.vol_master);
+        self.synth.sfx_vol = v(self.settings.vol_sfx);
+        self.synth.music_vol = v(self.settings.vol_music);
+        self.synth.render(out);
+    }
 
     pub fn take_io(&mut self) -> Vec<Io> {
         core::mem::take(&mut self.io)
@@ -335,13 +414,15 @@ impl Game {
     }
 
     pub fn say(&mut self, t: &str) {
-        self.log.push(LogLine { text: String::from(t), age: 0.0, warn: false });
+        let t = self.td(t);
+        self.log.push(LogLine { text: t, age: 0.0, warn: false });
         if self.log.len() > 6 {
             self.log.remove(0);
         }
     }
     pub fn warn(&mut self, t: &str) {
-        self.log.push(LogLine { text: String::from(t), age: 0.0, warn: true });
+        let t = self.td(t);
+        self.log.push(LogLine { text: t, age: 0.0, warn: true });
         if self.log.len() > 6 {
             self.log.remove(0);
         }
@@ -405,7 +486,7 @@ impl Game {
     }
 
     /// Put the player in the station of the current system (docked), with a showcase world behind.
-    fn enter_station(&mut self, arrival: Arrival) {
+    pub(crate) fn enter_station(&mut self, arrival: Arrival) {
         self.load_assets_for_system();
         let s = self.gal.sys[self.cmdr.system as usize].clone();
         self.world.setup(&s, arrival, &self.cmdr);
@@ -428,7 +509,7 @@ impl Game {
 
     pub fn objective_text(&self) -> Option<String> {
         let st = &self.cmdr.story;
-        if !st.active || self.cmdr.galaxy != 0 {
+        if !st.active || self.cmdr.galaxy != 0 || self.tut.is_some() || st.chapter == 0 {
             return None;
         }
         let n = self.names();
@@ -536,7 +617,9 @@ impl Game {
         if self.screen == Screen::Credits {
             self.credits_y += DT * 38.0;
         }
+        self.route_sfx();
         self.process_events();
+        self.tut_update();
         if !self.docked && self.screen != Screen::Pause {
             self.heat_acc += DT;
             if self.heat_acc >= 1.0 {
@@ -563,15 +646,6 @@ impl Game {
         // campaign waypoints and contact
         let st = self.cmdr.story.clone();
         if st.active && self.cmdr.galaxy == 0 {
-            if st.chapter == 0 && st.stage == 0 {
-                if let Some(b) = self.world.beacon {
-                    if (b - self.world.p.pos).len() < 500.0 {
-                        self.world.beacon = None;
-                        self.cmdr.story.stage = 1;
-                        self.say("Beacon calibrated. Return to the station and dock.");
-                    }
-                }
-            }
             if st.chapter == 4 && st.stage == 0 {
                 let pp = self.world.p.pos;
                 let near = self.world.ships.iter().any(|s| s.tag == 5 && (s.pos - pp).len() < 1300.0);
@@ -621,6 +695,7 @@ impl Game {
                     self.on_tagged_kill(tag);
                 }
                 Ev::Scoop { item, tag } => {
+                    self.synth.trigger(Sfx::Scoop, 0.0, 0.8);
                     if tag == 3 {
                         self.on_story_scoop();
                     } else if item >= 0 {
@@ -641,7 +716,10 @@ impl Game {
                         }
                     }
                 }
-                Ev::Docked => self.on_docked(),
+                Ev::Docked => {
+                    self.synth.trigger(Sfx::Clamp, 0.0, 0.9);
+                    self.on_docked()
+                }
                 Ev::Died(why) => {
                     if self.dying <= 0.0 {
                         self.dying = 3.0;
@@ -666,6 +744,7 @@ impl Game {
                     }
                 }
                 Ev::Rescue(cr) => {
+                    self.synth.trigger(Sfx::Ding, 0.0, 0.8);
                     self.cmdr.credits += cr;
                     let t = format!("Evacuee rescued: reward {} cr", cr);
                     self.say(&t);
@@ -764,7 +843,12 @@ impl Game {
         self.hyper = None;
         self.acc = 0.0;
         self.story_spawn(true);
+        self.synth.trigger(Sfx::Clamp, 0.0, 0.9);
+        self.synth.trigger(Sfx::Whoosh, 0.0, 0.5);
         self.say("Launch");
+        if self.tut.is_some() {
+            self.tut_enter();
+        }
     }
 
     // ------------------------------------------------------------------ hyperspace
@@ -826,6 +910,7 @@ impl Game {
     }
 
     fn complete_hyper(&mut self, h: Hyper) {
+        self.synth.trigger(Sfx::Whoosh, 0.0, 1.0);
         if h.galaxy_jump {
             let next = (self.cmdr.galaxy as usize + 1) % GALAXIES;
             let ng = Galaxy::generate(next);
@@ -925,7 +1010,7 @@ impl Game {
             return;
         }
         let ch = self.cmdr.story.chapter;
-        let def = story::chapter(ch);
+        let def = self.chapter_def(ch);
         if !story::gate_ok(&def.gate, &self.cmdr) {
             self.warn("You are not ready for this contract yet");
             return;
@@ -953,7 +1038,7 @@ impl Game {
     }
 
     pub fn show_start_brief(&mut self) {
-        let def = story::chapter(0);
+        let def = self.chapter_def(0);
         let names = self.names();
         let body: Vec<String> = def.accept.iter().map(|t| story::fill(t, &names)).collect();
         self.brief = Some(Brief { title: String::from(def.title), body, reward: def.reward });
@@ -961,14 +1046,14 @@ impl Game {
         self.screen = Screen::Briefing;
     }
 
-    fn complete_chapter(&mut self) {
+    pub(crate) fn complete_chapter(&mut self) {
         let ch = self.cmdr.story.chapter;
-        let def = story::chapter(ch);
+        let def = self.chapter_def(ch);
         self.cmdr.credits += def.reward;
         let names = self.names();
         let mut body: Vec<String> = def.done.iter().map(|t| story::fill(t, &names)).collect();
-        body.push(format!("Reward: {} credits", def.reward));
-        self.brief = Some(Brief { title: format!("{}: complete", def.title), body, reward: def.reward });
+        body.push(self.td(&format!("Reward: {} credits", def.reward)));
+        self.brief = Some(Brief { title: self.td(&format!("{}: complete", def.title)), body, reward: def.reward });
         self.brief_next = Screen::Status;
         self.screen = Screen::Briefing;
         let st = &mut self.cmdr.story;
@@ -991,7 +1076,6 @@ impl Game {
         let st = self.cmdr.story.clone();
         if st.active && self.cmdr.galaxy == 0 {
             let done = match (st.chapter, st.stage) {
-                (0, 1) => here == st.sys[0],
                 (1, 0) => {
                     if here == st.sys[0] {
                         self.cmdr.sealed = self.cmdr.sealed.saturating_sub(1);
@@ -1036,6 +1120,12 @@ impl Game {
 
     fn on_tagged_kill(&mut self, tag: u8) {
         if tag == 0 {
+            return;
+        }
+        if tag == 30 {
+            if let Some(t) = self.tut.as_mut() {
+                t.drone_dead = true;
+            }
             return;
         }
         let st = self.cmdr.story.clone();
@@ -1094,12 +1184,6 @@ impl Game {
         }
         let here = self.cmdr.system;
         match (st.chapter, st.stage) {
-            (0, 0) if launched => {
-                if let Some((sp, fr)) = self.world.station_frame() {
-                    self.world.beacon = Some(sp + fr.f * 5500.0 + fr.r * 1500.0 + fr.u * 700.0);
-                }
-                self.say("Fly to the beacon. A and Z set throttle, arrows steer.");
-            }
             (2, 0) if here == st.sys[1] && !launched => {
                 for _ in 0..(3 - st.progress.min(3)) {
                     let d = self.rng.unit() * 2500.0 + self.world.p.pos + self.world.p.o.f * 3000.0;

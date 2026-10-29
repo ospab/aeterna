@@ -34,8 +34,9 @@ pub struct Ui {
 
 impl Ui {
     pub fn new(w: usize, h: usize) -> Ui {
-        let s = max(1.0, h as f32 / 540.0);
-        let fs = ((11.0 * s) as i32).max(8);
+        // Layouts are designed on a 960x540 canvas and scaled by the limiting dimension.
+        let s = clamp(min(w as f32 / 960.0, h as f32 / 540.0), 0.83, 4.0);
+        let fs = ((11.0 * s + 0.5) as i32).max(9);
         Ui { s, fs, lh: fs * 8 / 5, w: w as i32, h: h as i32 }
     }
     pub fn px(&self, v: f32) -> i32 {
@@ -63,7 +64,7 @@ pub fn wrap(text: &str, cols: usize) -> alloc::vec::Vec<String> {
     let mut lines = alloc::vec::Vec::new();
     let mut cur = String::new();
     for w in text.split(' ') {
-        if !cur.is_empty() && cur.len() + 1 + w.len() > cols {
+        if !cur.is_empty() && cur.chars().count() + 1 + w.chars().count() > cols {
             lines.push(core::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -105,15 +106,18 @@ impl Game {
         }
     }
 
-    fn ensure_scene(&mut self, ow: usize, oh: usize) {
-        let q = self.quality_scale();
+    fn ensure_scene(&mut self, ow: usize, oh: usize, backdrop: bool) -> bool {
+        // menu and station backdrops move slowly: draw them smaller
+        let q = if backdrop { 0.34f32.min(self.quality_scale()) } else { self.quality_scale() };
         let mut sw = ((ow as f32 * q) as usize).clamp(256, 1280);
         // keep the aspect ratio of the output
         let sh = (sw * oh / ow.max(1)).clamp(144, 720);
         sw = sw.max(8) & !3;
         if self.scene.w != sw || self.scene.h != sh {
             self.scene.resize(sw, sh);
+            return true;
         }
+        false
     }
 
     fn view_orient(&self) -> Orient {
@@ -349,11 +353,17 @@ impl Game {
 
     /// Render one frame into `out`.
     pub fn render(&mut self, out: &mut Canvas) {
-        self.ensure_scene(out.w, out.h);
+        out.tr = self.tr_for_canvas();
         let ui = Ui::new(out.w, out.h);
         let flight_view = self.screen == Screen::Flight || (self.screen == Screen::Pause && !self.docked);
-        let cam = if flight_view && !self.docked { self.flight_camera() } else { self.showcase_camera() };
-        self.draw_scene(&cam);
+        let backdrop = !(flight_view && !self.docked);
+        let resized = self.ensure_scene(out.w, out.h, backdrop);
+        let cam = if !backdrop { self.flight_camera() } else { self.showcase_camera() };
+        // a backdrop is redrawn every fourth frame; the interface on top is drawn every frame
+        self.bd_frame = self.bd_frame.wrapping_add(1);
+        if !backdrop || resized || self.bd_frame % 4 == 0 {
+            self.draw_scene(&cam);
+        }
         self.blit(out);
         if self.screen == Screen::Flight || (self.screen == Screen::Pause && !self.docked) {
             self.draw_hud(out, &ui, &cam);
@@ -427,9 +437,9 @@ impl Game {
                 }
                 if locked || s.kind == Kind::Brood {
                     let name = spec(s.kind).name;
-                    c.text(sx as i32 - (name.len() as i32 * (fs - 2)) / 2, (sy + pr) as i32 + 3, fs - 2, name, col, 230);
+                    c.text(sx as i32 - c.text_w(name, fs - 2) / 2, (sy + pr) as i32 + 3, fs - 2, name, col, 230);
                     let ds = format!("{} m", d as i32);
-                    c.text(sx as i32 - (ds.len() as i32 * (fs - 2)) / 2, (sy + pr) as i32 + 3 + fs, fs - 2, &ds, C_DIM, 230);
+                    c.text(sx as i32 - c.text_w(&ds, fs - 2) / 2, (sy + pr) as i32 + 3 + fs, fs - 2, &ds, C_DIM, 230);
                 }
                 if locked {
                     // lock progress ring and lead marker
@@ -463,7 +473,7 @@ impl Game {
         let mut y = ui.px(12.0);
         let mut rows: alloc::vec::Vec<(String, u32, u32)> = alloc::vec::Vec::new();
         if let Some(o) = self.objective_text() {
-            for (i, l) in wrap(&o, cols - 4).into_iter().enumerate() {
+            for (i, l) in wrap(&self.td(&o), cols - 4).into_iter().enumerate() {
                 rows.push((if i == 0 { format!("> {}", l) } else { format!("  {}", l) }, C_ACCENT, 255));
             }
         }
@@ -474,7 +484,7 @@ impl Game {
             }
         }
         for (t, col, a) in rows {
-            c.rect(ui.px(10.0), y - 2, (t.len() as i32 + 2) * (fs - 1), fs + 4, C_PANEL, a * 150 / 255);
+            c.rect(ui.px(10.0), y - 2, (t.chars().count() as i32 + 2) * (fs - 1), fs + 4, C_PANEL, a * 150 / 255);
             c.text(ui.px(14.0), y, fs - 1, &t, col, a);
             y += fs + 5;
         }
@@ -491,28 +501,35 @@ impl Game {
         c.text_r(tx, ui.px(12.0) + (fs + 4) * 2, fs - 1, &format!("{} cr", self.cmdr.credits), C_DIM, 255);
         // locked target panel
         if let Some(s) = w.find(p.lock) {
-            let pw = ui.px(190.0);
+            let pw = ui.px(190.0).max(fs * 17);
             let px = ow - pw - ui.px(12.0);
             let py = ui.px(12.0) + (fs + 4) * 3 + 6;
-            panel(c, px, py, pw, ui.px(62.0), 190);
+            let b1 = py + 6 + fs + 4;
+            let b2 = b1 + fs + 2;
+            let ty = b2 + fs + 4;
+            panel(c, px, py, pw, ty + fs + 6 - py, 190);
             c.text(px + 8, py + 6, fs - 1, spec(s.kind).name, fac_color(s.fac, s.kind), 255);
-            bar(c, ui, px + 8, py + 6 + fs + 6, pw - 16, s.shield_f / s.shield_max.max(1.0), C_BLUE, "SH");
-            bar(c, ui, px + 8, py + 6 + fs + 6 + ui.px(10.0), pw - 16, s.energy / s.energy_max.max(1.0), C_GREEN, "EN");
+            let shf = s.shield_f / s.shield_max.max(1.0);
+            let enf = s.energy / s.energy_max.max(1.0);
+            let lw = c.tl("Shield").chars().count().max(c.tl("Energy").chars().count()) as i32 * (fs - 2);
+            self.meter(c, ui, px + 8, b1, pw - 16, lw, 0, "Shield", &format!("{}%", (shf * 100.0) as i32), shf, C_BLUE);
+            self.meter(c, ui, px + 8, b2, pw - 16, lw, 1, "Energy", &format!("{}%", (enf * 100.0) as i32), enf, if enf < 0.3 { C_RED } else { C_GREEN });
             let d = (s.pos - p.pos).len();
-            c.text(px + 8, py + ui.px(46.0), fs - 2, &format!("{} m", d as i32), C_DIM, 255);
+            c.text(px + 8, ty, fs - 2, &format!("{} m", d as i32), C_DIM, 255);
             let st = if p.lock_t >= 1.0 { "LOCKED" } else { "LOCKING" };
-            c.text_r(px + pw - 8, py + ui.px(46.0), fs - 2, st, if p.lock_t >= 1.0 { C_RED } else { C_AMBER }, 255);
+            c.text_r(px + pw - 8, ty, fs - 2, st, if p.lock_t >= 1.0 { C_RED } else { C_AMBER }, 255);
         }
+        self.draw_dock_guide(c, ui);
         // bottom instrument panel
         self.draw_panel(c, ui, cam);
         // centre warnings
-        let mut wy = cy + ui.px(70.0);
+        let mut wy = cy + ui.px(40.0);
         let warn = |c: &mut Canvas, t: &str, col: u32, wy: &mut i32| {
             c.text_c(cx, *wy, fs + 2, t, col, 255);
             *wy += fs + 8;
         };
         if let Some(h) = self.hyper {
-            let t = format!("{}  {:.0}", if h.galaxy_jump { "GALACTIC DRIVE" } else { "JUMP DRIVE" }, floor(h.t + 0.999));
+            let t = format!("{}  {:.0}", self.t(if h.galaxy_jump { "GALACTIC DRIVE" } else { "JUMP DRIVE" }), floor(h.t + 0.999));
             c.text_c(cx, cy - ui.px(120.0), fs * 2, &t, rgb(180, 210, 255), 255);
         }
         if p.missile_warn && ((self.ui_t * 4.0) as i32 % 2 == 0) {
@@ -538,6 +555,166 @@ impl Game {
             c.rect(0, 0, ow, oh, rgb(0, 0, 0), 120);
         }
         let _ = (CYAN_UNUSED,);
+    }
+
+    /// One dashboard row: icon, label, bar, value.
+    fn meter(&self, c: &mut Canvas, ui: &Ui, x: i32, y: i32, w: i32, lab_w: i32, ic: u8, label: &'static str, value: &str, frac: f32, col: u32) {
+        let sl = (ui.fs - 2).max(7);
+        let icon_w = sl + 4;
+        self.icon(c, ic, x, y, sl, C_DIM);
+        c.text(x + icon_w, y, sl, self.t(label), C_DIM, 255);
+        let val_w = sl * 10;
+        let bx = x + icon_w + lab_w + 6;
+        let bw = w - (icon_w + lab_w + 6) - val_w - 6;
+        let bh = ui.px(5.0).max(3);
+        let by = y + sl / 2 - bh / 2;
+        c.rect(bx, by, bw, bh, rgb(24, 32, 46), 255);
+        let f = clamp(frac, 0.0, 1.0);
+        c.rect(bx, by, (bw as f32 * f) as i32, bh, col, 255);
+        c.rect(bx, by + bh - 1, (bw as f32 * f) as i32, 1, scale_col(col, 0.6), 255);
+        c.text_r(x + w, y, sl, value, if col == C_RED { C_RED } else if col == C_AMBER { C_AMBER } else { C_TEXT }, 255);
+    }
+
+    /// Small vector icons for the dashboard rows.
+    pub(crate) fn icon(&self, c: &mut Canvas, kind: u8, x: i32, y: i32, s: i32, col: u32) {
+        let (x, y, s) = (x as f32, y as f32, s as f32);
+        match kind {
+            0 => {
+                // shield
+                c.line(x, y, x + s, y, col, 230);
+                c.line(x, y, x, y + s * 0.5, col, 230);
+                c.line(x + s, y, x + s, y + s * 0.5, col, 230);
+                c.line(x, y + s * 0.5, x + s * 0.5, y + s, col, 230);
+                c.line(x + s, y + s * 0.5, x + s * 0.5, y + s, col, 230);
+            }
+            1 => {
+                // energy bolt
+                c.line(x + s * 0.7, y, x + s * 0.2, y + s * 0.55, col, 230);
+                c.line(x + s * 0.2, y + s * 0.55, x + s * 0.8, y + s * 0.5, col, 230);
+                c.line(x + s * 0.8, y + s * 0.5, x + s * 0.3, y + s, col, 230);
+            }
+            2 => {
+                // fuel drop
+                c.line(x + s * 0.5, y, x + s * 0.15, y + s * 0.6, col, 230);
+                c.line(x + s * 0.5, y, x + s * 0.85, y + s * 0.6, col, 230);
+                c.ring(x + s * 0.5, y + s * 0.65, s * 0.35, 1.0, col, 230);
+            }
+            3 | 4 => {
+                // thermometer (laser: with a spark)
+                c.line(x + s * 0.4, y, x + s * 0.4, y + s * 0.7, col, 230);
+                c.disc(x + s * 0.4, y + s * 0.8, s * 0.22, col, 230);
+                if kind == 4 {
+                    c.line(x + s * 0.7, y + s * 0.2, x + s, y, col, 230);
+                    c.line(x + s * 0.7, y + s * 0.4, x + s, y + s * 0.4, col, 230);
+                }
+            }
+            5 => {
+                // altitude: mountain
+                c.line(x, y + s, x + s * 0.4, y + s * 0.2, col, 230);
+                c.line(x + s * 0.4, y + s * 0.2, x + s * 0.7, y + s * 0.6, col, 230);
+                c.line(x + s * 0.7, y + s * 0.6, x + s, y + s, col, 230);
+            }
+            6 => {
+                // speed: gauge
+                c.line(x, y + s, x + s, y + s, col, 230);
+                c.line(x + s * 0.5, y + s, x + s * 0.85, y + s * 0.25, col, 230);
+                c.ring(x + s * 0.5, y + s, s * 0.5, 1.0, col, 200);
+            }
+            7 => {
+                // throttle: lever
+                c.line(x + s * 0.5, y, x + s * 0.5, y + s, col, 230);
+                c.line(x + s * 0.2, y + s * 0.3, x + s * 0.8, y + s * 0.3, col, 230);
+            }
+            8 => {
+                // roll: tilted wings
+                c.line(x, y + s * 0.8, x + s, y + s * 0.2, col, 230);
+                c.disc(x + s * 0.5, y + s * 0.5, s * 0.16, col, 230);
+            }
+            9 => {
+                // pitch: nose-up arrow
+                c.line(x + s * 0.5, y, x + s * 0.5, y + s, col, 230);
+                c.line(x + s * 0.5, y, x + s * 0.15, y + s * 0.4, col, 230);
+                c.line(x + s * 0.5, y, x + s * 0.85, y + s * 0.4, col, 230);
+            }
+            _ => {
+                // missile
+                c.line(x + s * 0.5, y, x + s * 0.5, y + s, col, 230);
+                c.line(x + s * 0.5, y, x + s * 0.3, y + s * 0.3, col, 230);
+                c.line(x + s * 0.5, y, x + s * 0.7, y + s * 0.3, col, 230);
+                c.line(x + s * 0.2, y + s, x + s * 0.8, y + s, col, 230);
+            }
+        }
+    }
+
+    /// Guidance for a manual approach: path marker, roll hint, distance and speed.
+    fn draw_dock_guide(&self, c: &mut Canvas, ui: &Ui) {
+        let w = &self.world;
+        let (sp, fr) = match w.station_frame() {
+            Some(x) => x,
+            None => return,
+        };
+        let p = &w.p;
+        let loc = fr.to_local(p.pos - sp);
+        if loc.z < STATION_HALF_LEN - 20.0 || loc.z > 4500.0 || w.pocket {
+            return;
+        }
+        let fs = ui.fs;
+        let box_h = ui.px(96.0);
+        let pw = ui.px(176.0).max(fs * 15);
+        let ph = 8 + fs + 6 + box_h + 6 + (fs + 3) * 3 + 8;
+        let px = ui.px(12.0);
+        let py = c.h as i32 / 2 - ph / 2;
+        panel(c, px, py, pw, ph, 205);
+        c.text(px + 8, py + 8, fs - 1, self.t("DOCKING GUIDE"), C_ACCENT, 255);
+        let (bx, by) = (px + 8, py + 8 + fs + 6);
+        let bw = pw - 16;
+        c.rect(bx, by, bw, box_h, rgb(8, 12, 18), 255);
+        c.rect_outline(bx, by, bw, box_h, 1, C_BORDER, 255);
+        let (cx, cy) = ((bx + bw / 2) as f32, (by + box_h / 2) as f32);
+        // the nose (fixed, centre) and the ideal flight path (pip)
+        let lat = fr.r * loc.x + fr.u * loc.y;
+        let ahead = loc.z - STATION_HALF_LEN;
+        let gain = clamp(ahead / 800.0, 0.0, 1.0) * 0.9 + 0.6;
+        let aim = if ahead > 1300.0 { (sp + fr.f * (STATION_HALF_LEN + 300.0) - p.pos).norm() } else { (-fr.f * 80.0 - lat * 1.5 * gain).norm() };
+        let al = p.o.to_local(aim);
+        let kk = (box_h as f32 * 0.5 - 6.0) / 0.5;
+        let lim = box_h as f32 * 0.5 - 5.0;
+        let (qx, qy) = (clamp(al.x * kk, -lim, lim), clamp(-al.y * kk, -lim, lim));
+        c.ring(cx, cy, ui.px(5.0) as f32, 1.0, C_TEXT, 220);
+        c.line(cx - ui.px(9.0) as f32, cy, cx + ui.px(9.0) as f32, cy, C_DIM, 160);
+        c.line(cx, cy - ui.px(9.0) as f32, cx, cy + ui.px(9.0) as f32, C_DIM, 160);
+        let near = abs(al.x) < 0.04 && abs(al.y) < 0.04;
+        let pc = if near { C_GREEN } else { C_AMBER };
+        c.line(cx, cy, cx + qx, cy + qy, scale_col(pc, 0.6), 160);
+        let r = ui.px(4.0) as f32;
+        c.line(cx + qx - r, cy + qy, cx + qx, cy + qy - r, pc, 255);
+        c.line(cx + qx, cy + qy - r, cx + qx + r, cy + qy, pc, 255);
+        c.line(cx + qx + r, cy + qy, cx + qx, cy + qy + r, pc, 255);
+        c.line(cx + qx, cy + qy + r, cx + qx - r, cy + qy, pc, 255);
+        // roll: match the slot, either way up
+        let sr = fr.to_local(p.o.r);
+        let mut err = atan2(sr.y, sr.x);
+        if err > PI / 2.0 {
+            err -= PI;
+        } else if err < -PI / 2.0 {
+            err += PI;
+        }
+        let need = err * if p.o.f.dot(fr.f) < 0.0 { -1.0 } else { 1.0 };
+        let (rt, rc) = if need > 0.12 {
+            (self.t("ROLL RIGHT >>"), C_AMBER)
+        } else if need < -0.12 {
+            (self.t("<< ROLL LEFT"), C_AMBER)
+        } else {
+            (self.t("ROLL OK"), C_GREEN)
+        };
+        let mut y = by + box_h + 6;
+        c.text(px + 8, y, fs - 1, rt, rc, 255);
+        y += fs + 3;
+        let spd = p.speed;
+        let sc = if spd > DOCK_MAX_SPEED { C_RED } else { C_GREEN };
+        c.text(px + 8, y, fs - 2, &format!("{} {:.0}/{:.0}", self.t("SPEED"), spd, DOCK_MAX_SPEED), sc, 255);
+        y += fs + 3;
+        c.text(px + 8, y, fs - 2, &format!("{} {:.0} m", self.t("DIST"), max(ahead, 0.0)), C_DIM, 255);
     }
 
     fn edge_marker(&self, c: &mut Canvas, ui: &Ui, cam: &Camera, pos: V3, label: &str, col: u32) {
@@ -567,7 +744,7 @@ impl Game {
         let (ow, oh) = (c.w as i32, c.h as i32);
         let fs = ui.fs;
         let ph = ui.px(124.0);
-        let pw = ((ow as f32 * 0.66) as i32).min(ui.px(1000.0));
+        let pw = ((ow as f32 * 0.94) as i32).min(ui.px(1100.0));
         let px = (ow - pw) / 2;
         let py = oh - ph - ui.px(8.0);
         panel(c, px, py, pw, ph, 175);
@@ -607,66 +784,91 @@ impl Game {
             let sz = if r > 300.0 { 3.2 } else if r > 60.0 { 2.4 } else { 1.7 };
             c.disc(ex, hy, sz, col, 255);
         }
-        // left: shields, energy, fuel, temperatures
-        let lx = px + ui.px(12.0);
-        let lw = pw / 2 - rx as i32 - ui.px(26.0);
-        let mut y = py + ui.px(14.0);
+        // dashboard: readable labels, icons, numeric values, colours that warn
+        let sl = (fs - 2).max(7);
+        let icon_w = sl + 4;
+        let val_w = sl * 10;
+        let cluster_w = pw / 2 - rx as i32 - ui.px(26.0);
         let dy = ui.px(14.5);
-        bar(c, ui, lx, y, lw, p.shield_f / p.shield_max, C_BLUE, "FS");
-        y += dy;
-        bar(c, ui, lx, y, lw, p.shield_a / p.shield_max, C_BLUE, "AS");
-        y += dy;
-        bar(c, ui, lx, y, lw, p.energy / p.energy_max, if p.energy < p.energy_max * 0.3 { C_RED } else { C_GREEN }, "EN");
-        y += dy;
-        bar(c, ui, lx, y, lw, self.cmdr.fuel as f32 / MAX_FUEL_TENTHS as f32, C_AMBER, "FU");
-        y += dy;
-        bar(c, ui, lx, y, lw, p.cabin / 140.0, if p.cabin > 80.0 { C_RED } else { rgb(210, 120, 80) }, "CT");
-        y += dy;
-        let lt = p.laser_heat[(self.view & 3) as usize];
-        bar(c, ui, lx, y, lw, lt / 100.0, if p.overheated[(self.view & 3) as usize] { C_RED } else { rgb(255, 140, 90) }, "LT");
-        y += dy;
-        bar(c, ui, lx, y, lw, clamp(w.altitude() / 40000.0, 0.0, 1.0), C_DIM, "AL");
-        // right: speed, roll, pitch, missiles, compass, flags
+        let good = |f: f32, ok: u32| if f < 0.25 { C_RED } else if f < 0.5 { C_AMBER } else { ok };
+        let hot = |f: f32, ok: u32| if f > 0.85 { C_RED } else if f > 0.6 { C_AMBER } else { ok };
+        let sfrac = |s: f32| s / p.shield_max.max(1.0);
+        let alt = w.altitude();
+        let alt_s = if alt >= 10000.0 { format!("{:.1} km", alt / 1000.0) } else { format!("{} m", alt as i32) };
+        let ls = (self.view & 3) as usize;
+        let left: [(u8, &'static str, String, f32, u32); 7] = [
+            (0, "Shield fwd", format!("{}%", (sfrac(p.shield_f) * 100.0) as i32), sfrac(p.shield_f), good(sfrac(p.shield_f), C_BLUE)),
+            (0, "Shield aft", format!("{}%", (sfrac(p.shield_a) * 100.0) as i32), sfrac(p.shield_a), good(sfrac(p.shield_a), C_BLUE)),
+            (1, "Energy", format!("{}%", (p.energy / p.energy_max * 100.0) as i32), p.energy / p.energy_max, good(p.energy / p.energy_max, C_GREEN)),
+            (2, "Fuel", format!("{:.1} LY", self.cmdr.fuel as f32 / 10.0), self.cmdr.fuel as f32 / MAX_FUEL_TENTHS as f32, {
+                let f = self.cmdr.fuel as f32 / MAX_FUEL_TENTHS as f32;
+                if f < 0.15 { C_RED } else if f < 0.3 { C_AMBER } else { rgb(236, 206, 96) }
+            }),
+            (3, "Cabin temp", format!("{}%", (p.cabin / 140.0 * 100.0) as i32), p.cabin / 140.0, hot(p.cabin / 140.0, rgb(96, 200, 190))),
+            (4, "Laser temp", format!("{}%", p.laser_heat[ls] as i32), p.laser_heat[ls] / 100.0, if p.overheated[ls] { C_RED } else { hot(p.laser_heat[ls] / 100.0, rgb(96, 200, 190)) }),
+            (5, "Altitude", alt_s, clamp(alt / 40000.0, 0.0, 1.0), C_DIM),
+        ];
+        let lab_w = left.iter().map(|r| c.tl(r.1).chars().count() as i32).max().unwrap_or(8) * sl;
+        let lx = px + ui.px(12.0);
+        let mut y = py + ui.px(12.0);
+        for (ic, label, val, f, col) in left.iter() {
+            self.meter(c, ui, lx, y, cluster_w, lab_w, *ic, label, val, *f, *col);
+            y += dy;
+        }
+        // right cluster
+        let spd = p.speed.max(p.jump_speed);
         let rxx = px + pw / 2 + rx as i32 + ui.px(20.0);
         let rw = px + pw - ui.px(12.0) - rxx;
-        let mut y = py + ui.px(14.0);
-        let spd = p.speed.max(p.jump_speed);
-        bar(c, ui, rxx, y, rw, spd / PLAYER_MAX_SPEED, C_ACCENT, "SP");
+        let rlabels = ["Speed", "Throttle", "Roll", "Pitch", "Missiles"];
+        let rlab_w = rlabels.iter().map(|s| c.tl(s).chars().count() as i32).max().unwrap_or(8) * sl;
+        let mut y = py + ui.px(12.0);
+        self.meter(c, ui, rxx, y, rw, rlab_w, 6, "Speed", &format!("{} m/s", spd as i32), spd / PLAYER_MAX_SPEED, C_ACCENT);
         y += dy;
-        bar(c, ui, rxx, y, rw, p.throttle, rgb(80, 150, 200), "TH");
+        self.meter(c, ui, rxx, y, rw, rlab_w, 7, "Throttle", &format!("{}%", (p.throttle * 100.0) as i32), p.throttle, rgb(110, 170, 220));
         y += dy;
-        // roll / pitch centred indicators
-        for (label, v) in [("RL", p.roll_r), ("PT", p.pitch_r)] {
-            c.text(rxx, y - fs / 2, fs - 1, label, C_DIM, 255);
-            let bx = rxx + (fs - 1) * 5;
-            let bw = rw - (fs - 1) * 5;
-            c.rect(bx, y, bw, ui.px(5.0).max(3), rgb(24, 32, 46), 255);
-            c.rect(bx + bw / 2 - 1, y - 2, 2, ui.px(5.0).max(3) + 4, C_DIM, 255);
-            c.rect(bx + bw / 2 + (v * bw as f32 * 0.5) as i32 - 2, y - 1, 4, ui.px(5.0).max(3) + 2, C_ACCENT, 255);
+        for (ic, label, v) in [(8u8, "Roll", p.roll_r), (9u8, "Pitch", p.pitch_r)] {
+            self.icon(c, ic, rxx, y, sl, C_DIM);
+            c.text(rxx + icon_w, y, sl, self.t(label), C_DIM, 255);
+            let bx = rxx + icon_w + rlab_w + 6;
+            let bw = rw - (icon_w + rlab_w + 6) - val_w - 6;
+            let bh = ui.px(5.0).max(3);
+            let by = y + sl / 2 - bh / 2;
+            c.rect(bx, by, bw, bh, rgb(24, 32, 46), 255);
+            c.rect(bx + bw / 2 - 1, by - 2, 2, bh + 4, C_DIM, 255);
+            c.rect(bx + bw / 2 + (v * bw as f32 * 0.5) as i32 - 2, by - 1, 4, bh + 2, C_ACCENT, 255);
+            c.text_r(rxx + rw, y, sl, &format!("{:+}%", (v * 100.0) as i32), C_TEXT, 255);
             y += dy;
         }
         // missiles
-        c.text(rxx, y - fs / 2, fs - 1, "MS", C_DIM, 255);
-        let mx = rxx + (fs - 1) * 5;
+        self.icon(c, 10, rxx, y, sl, C_DIM);
+        c.text(rxx + icon_w, y, sl, self.t("Missiles"), C_DIM, 255);
+        let mx = rxx + icon_w + rlab_w + 6;
         for i in 0..MISSILE_MAX as i32 {
             let on = i < self.cmdr.missiles as i32;
             let col = if on { if p.lock_t >= 1.0 && p.lock != 0 { C_RED } else { C_GREEN } } else { rgb(40, 50, 66) };
-            let x0 = (mx + i * ui.px(14.0)) as f32;
-            c.line(x0, y as f32 + 6.0, x0 + 6.0, y as f32 - 4.0, col, 255);
-            c.line(x0 + 6.0, y as f32 - 4.0, x0 + 12.0, y as f32 + 6.0, col, 255);
-            c.line(x0, y as f32 + 6.0, x0 + 12.0, y as f32 + 6.0, col, 255);
+            let x0 = (mx + i * (sl + 6)) as f32;
+            let s = sl as f32;
+            c.line(x0, y as f32 + s, x0 + s * 0.5, y as f32, col, 255);
+            c.line(x0 + s * 0.5, y as f32, x0 + s, y as f32 + s, col, 255);
+            c.line(x0, y as f32 + s, x0 + s, y as f32 + s, col, 255);
         }
+        c.text_r(rxx + rw, y, sl, &format!("{}/{}", self.cmdr.missiles, MISSILE_MAX), C_TEXT, 255);
         y += dy;
         // flags
         let locked = w.mass_locked();
         let mut fx = rxx;
         let flag = |c: &mut Canvas, x: &mut i32, t: &str, on: bool, col: u32| {
             c.text(*x, y, fs - 2, t, if on { col } else { rgb(44, 56, 76) }, 255);
-            *x += (t.len() as i32 + 1) * (fs - 2);
+            *x += (c.tl(t).chars().count() as i32 + 1) * (fs - 2);
         };
         flag(c, &mut fx, "MASS", locked, C_AMBER);
         flag(c, &mut fx, "JUMP", p.jump_speed > 100.0, C_ACCENT);
         flag(c, &mut fx, "DOCK", p.dockcomp, C_ACCENT);
+        // tutorial: highlight the dashboard while its step is active
+        if self.tut.as_ref().map_or(false, |t| t.step == crate::tutorial::STEP_DASHBOARD) {
+            let a = (160.0 + 90.0 * sin(self.ui_t * 5.0)) as u32;
+            c.rect_outline(px - 3, py - 3, pw + 6, ph + 6, 2, C_ACCENT, a);
+        }
         // compass
         let cc = (px + pw / 2 + rx as i32 + ui.px(6.0) - ui.px(6.0), py + ph - ui.px(44.0));
         let _ = cc;
@@ -709,7 +911,7 @@ impl Game {
             } else {
                 c.ring(ccx + dxn, ccy + dyn_, 3.2, 1.2, C_GREEN, 255);
             }
-            c.text_c(ccx as i32, (ccy - comp_r) as i32 - fs, fs - 3, lab, C_DIM, 255);
+            c.text_r((ccx - comp_r) as i32 - 6, ccy as i32 - fs / 2, fs - 2, lab, C_DIM, 255);
         }
         let _ = cam;
     }

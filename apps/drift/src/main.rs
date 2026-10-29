@@ -48,6 +48,7 @@ fn map_key(code: u8, ext: bool) -> Option<Act> {
         (0x30, _) => Act::Buy,
         (0x1F, _) => Act::Sell,
         (0x12, _) => Act::Eject,
+        (0x2D, _) => Act::Skip,
         (0x3B, _) => Act::F1,
         (0x3C, _) => Act::F2,
         (0x3D, _) => Act::F3,
@@ -160,6 +161,34 @@ fn present(fb: &Framebuffer, px: &mut [u32], out: &Canvas, scale: usize, xmap: &
     }
 }
 
+/// Keep about 90 ms of sound queued in the kernel.
+fn feed_audio(audio: Option<&liboos::audio::Audio>, game: &mut Game, buf: &mut Vec<i16>, pending: &mut Vec<i16>) {
+    let a = match audio {
+        Some(a) => a,
+        None => return,
+    };
+    if !pending.is_empty() {
+        let n = a.write(pending);
+        pending.drain(..n);
+        if !pending.is_empty() {
+            return;
+        }
+    }
+    let target = (drift_core::audio::RATE as usize) * 90 / 1000;
+    let queued = a.queued();
+    if queued >= target {
+        return;
+    }
+    let frames = (target - queued).min(6000);
+    buf.clear();
+    buf.resize(frames * 2, 0);
+    game.mix_audio(buf);
+    let n = a.write(buf);
+    if n < buf.len() {
+        pending.extend_from_slice(&buf[n..]);
+    }
+}
+
 fn parse_div(args: &liboos::Args) -> Option<usize> {
     let mut i = 1;
     while i + 1 < args.len() {
@@ -213,6 +242,10 @@ fn main(args: liboos::Args) -> i32 {
     }
     let mut game = Game::new(screen::clock_ns() ^ 0xD1F7);
     load_state(&mut game);
+    // sound: 48 kHz stereo; stay silent when there is no device
+    let audio = liboos::audio::Audio::open(drift_core::audio::RATE, 2).ok();
+    let mut audio_buf: Vec<i16> = Vec::new();
+    let mut audio_pending: Vec<i16> = Vec::new();
     let mut last = screen::clock_ns();
     let mut ema_ms = 16.0f32;
     let mut frames = 0u64;
@@ -231,6 +264,7 @@ fn main(args: liboos::Args) -> i32 {
         let _ = ext;
         game.update(dt);
         store(game.take_io());
+        feed_audio(audio.as_ref(), &mut game, &mut audio_buf, &mut audio_pending);
         game.render(&mut out);
         present(&fb, px, &out, scale, &xmap);
         screen::flush();

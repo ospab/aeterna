@@ -7,9 +7,9 @@ use crate::game::*;
 use crate::galaxy::MAX_JUMP_LY;
 use crate::story;
 
-pub const MAIN_ITEMS: [&str; 6] = ["New Game", "Continue", "Load Game", "Settings", "Credits", "Quit"];
+pub const MAIN_ITEMS: [&str; 7] = ["New Game", "Tutorial", "Continue", "Load Game", "Settings", "Credits", "Quit"];
 pub const PAUSE_ITEMS: [&str; 4] = ["Resume", "Settings", "Save (docked only)", "Quit to menu"];
-pub const SETTINGS_ROWS: usize = 6;
+pub const SETTINGS_ROWS: usize = 10;
 pub const CREDITS_LEN: f32 = 700.0;
 
 fn nav(sel: &mut usize, n: usize, up: bool, down: bool) {
@@ -32,6 +32,16 @@ impl Game {
     }
 
     pub(crate) fn ui_input(&mut self) {
+        if self.input.p(Act::Skip) && self.tut.is_some() && self.started && !matches!(self.screen, Screen::Pause | Screen::Settings | Screen::Controls) {
+            self.tut_finish(true);
+            return;
+        }
+        if self.screen != Screen::Flight && (self.input.p(Act::Up) || self.input.p(Act::Down) || self.input.p(Act::Left) || self.input.p(Act::Right)) {
+            self.synth.trigger(crate::audio::Sfx::Click, 0.0, 0.7);
+        }
+        if self.screen != Screen::Flight && self.input.p(Act::Enter) {
+            self.synth.trigger(crate::audio::Sfx::Select, 0.0, 0.8);
+        }
         let up = self.input.p(Act::Up);
         let down = self.input.p(Act::Down);
         let left = self.input.p(Act::Left);
@@ -49,17 +59,18 @@ impl Game {
                 if enter {
                     match self.sel {
                         0 => self.new_game(),
-                        1 => {
+                        1 => self.start_tutorial(true),
+                        2 => {
                             if let Some(s) = self.latest_slot() {
                                 self.load_slot(s);
                             }
                         }
-                        2 => self.goto(Screen::Load),
-                        3 => {
+                        3 => self.goto(Screen::Load),
+                        4 => {
                             self.settings_from = Screen::MainMenu;
                             self.goto(Screen::Settings);
                         }
-                        4 => {
+                        5 => {
                             self.after_credits = Screen::MainMenu;
                             self.credits_y = 0.0;
                             self.goto(Screen::Credits);
@@ -76,11 +87,11 @@ impl Game {
                     self.page += 1;
                     self.ui_t = 0.0;
                     if self.page >= story::INTRO.len() {
-                        self.show_start_brief();
+                        self.goto(Screen::TutorialAsk);
                     }
                 }
                 if back {
-                    self.show_start_brief();
+                    self.goto(Screen::TutorialAsk);
                 }
             }
             Screen::Settings => {
@@ -94,6 +105,20 @@ impl Game {
                         2 => self.settings.retro = !self.settings.retro,
                         3 => self.settings.quality = ((self.settings.quality as i32 + dir).rem_euclid(3)) as u8,
                         4 => {
+                            let l = if self.settings.lang == crate::i18n::Lang::En { crate::i18n::Lang::Ru } else { crate::i18n::Lang::En };
+                            self.settings.lang = l;
+                        }
+                        5 | 6 | 7 => {
+                            let d = if left { -1 } else { 1 };
+                            let r = match self.sel {
+                                5 => &mut self.settings.vol_master,
+                                6 => &mut self.settings.vol_sfx,
+                                _ => &mut self.settings.vol_music,
+                            };
+                            *r = (*r as i32 + d).clamp(0, 10) as u8;
+                            self.synth.trigger(crate::audio::Sfx::Select, 0.0, 0.8);
+                        }
+                        8 => {
                             if enter {
                                 self.goto_keep(Screen::Controls);
                             }
@@ -107,7 +132,7 @@ impl Game {
                             }
                         }
                     }
-                    if self.sel < 4 {
+                    if self.sel < 8 {
                         self.io.push(Io::WriteSettings(self.settings.to_bytes()));
                     }
                 }
@@ -118,6 +143,9 @@ impl Game {
                 }
             }
             Screen::Controls => {
+                if left || right {
+                    self.page = 1 - self.page.min(1);
+                }
                 if back || enter || self.input.p(Act::Help) {
                     let s = if self.settings_from == Screen::Controls { Screen::MainMenu } else { self.settings_from };
                     self.goto(s);
@@ -186,6 +214,16 @@ impl Game {
                     }
                 }
             }
+            Screen::TutorialAsk => {
+                nav(&mut self.sel, 2, up, down);
+                if enter {
+                    if self.sel == 0 {
+                        self.start_tutorial(false);
+                    } else {
+                        self.skip_tutorial_choice();
+                    }
+                }
+            }
             Screen::Dead => {
                 nav(&mut self.sel, 2, up, down);
                 if enter {
@@ -240,6 +278,7 @@ impl Game {
         let from = self.settings_from;
         self.screen = s;
         self.settings_from = from;
+        self.page = 0;
     }
 
     fn leave_to_status(&mut self) {
@@ -301,6 +340,7 @@ impl Game {
         if i.p(Act::Help) {
             self.settings_from = self.screen;
             self.screen = Screen::Controls;
+            self.page = 0;
             return;
         }
         if let Some(t) = target {
