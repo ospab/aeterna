@@ -355,8 +355,13 @@ unsafe fn ac97_read(reg: u8) -> Option<u16> {
 }
 
 unsafe fn ac97_write_verify(name: &str, reg: u8, val: u16) {
-    ac97_write(reg, val);
-    let rb = ac97_read(reg);
+    let mut rb = None;
+    for _ in 0..4 {
+        ac97_write(reg, val);
+        rb = ac97_read(reg);
+        if rb == Some(val) { break; }
+        mdelay(10);
+    }
     serial::write_str("[ES1371]   AC97 "); serial::write_str(name);
     serial::write_str(" (0x"); log_hex8(reg); serial::write_str(") <- 0x"); log_hex16(val);
     match rb {
@@ -503,7 +508,10 @@ pub fn init() -> bool {
         outl(REG_DAC2_SIZE, RING_DWORDS - 1);
         SCTRL &= !(SER_P2_LOOP_SEL | SER_P2_PAUSE | SER_P2_DAC_SEN | SER_P2_END_INC_MASK
                    | SER_P2_ST_INC_MASK | SER_P2_MODE_MASK | SER_P2_INT_EN);
-        SCTRL |= ser_p2_mode(3) | ser_p2_end_inc(2); // 16-bit stereo, loop, no IRQ
+        // 16-bit stereo, loop.  P2_INT_EN is set exactly like Linux does (some
+        // emulations, VMware included, only run the DAC with it on); the PIC
+        // line stays masked and the status is acknowledged by ack_irq().
+        SCTRL |= ser_p2_mode(3) | ser_p2_end_inc(2) | SER_P2_INT_EN;
         outl(REG_SERIAL, SCTRL);
         outl(REG_DAC2_COUNT, PERIOD_FRAMES - 1);
 
@@ -718,6 +726,10 @@ pub fn handle_irq() {
         outl(REG_SERIAL, SCTRL);
     }
 }
+
+/// Called from the 100 Hz timer: clears the (masked) DAC2 interrupt so the
+/// chip keeps streaming with P2_INT_EN set.
+pub fn ack_irq() { handle_irq(); }
 
 pub fn dump_status() {
     serial::write_str("[ES1371-DIAG] === "); serial::write_str(chip_name());

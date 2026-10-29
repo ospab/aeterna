@@ -339,6 +339,7 @@ pub fn pump() {
 /// when no producer is running.  Skips if a producer holds the stream.
 pub fn timer_tick() {
     if ACTIVE_DRIVER.load(Ordering::Relaxed) == 0 || !is_ready() { return; }
+    if ACTIVE_DRIVER.load(Ordering::Relaxed) == 3 { es1371::ack_irq(); }
     if try_lock() {
         unsafe { update(true); }
         unlock();

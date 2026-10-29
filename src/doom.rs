@@ -372,65 +372,86 @@ pub extern "C" fn rust_doom_get_key(pressed: *mut i32, key: *mut u8) -> i32 {
 
 // ─── Framebuffer blit (exported to DOOM C engine) ───────────────────────────
 
-/// Blit DOOM's 640×400 ARGB pixel buffer to the UEFI framebuffer.
-/// Blits DOOM's framebuffer to the kernel framebuffer with correct colour
-/// handling and integer up-scaling.  DOOM emits 0x00RRGGBB; we remap to the
-/// actual channel shifts reported by the Limine bootloader.
+/// Blit DOOM's ARGB frame (640x400, a 2x-oversampled 320x200 picture) to the
+/// framebuffer, filling the screen with the correct 4:3 aspect ratio:
+/// centred, black bars, nearest-neighbour with precomputed x/y maps (rebuilt
+/// only when the framebuffer geometry changes).  Each distinct source row is
+/// converted once into a RAM line buffer and then copied to every destination
+/// row that maps to it, so the (slow) video memory is only ever written.
+const BLIT_MAX: usize = 8192;
+static mut XMAP: [u16; BLIT_MAX] = [0; BLIT_MAX];
+static mut YMAP: [u16; BLIT_MAX] = [0; BLIT_MAX];
+static mut LINE: [u32; BLIT_MAX] = [0; BLIT_MAX];
+// (fb addr, fb_w, fb_h, pitch, src_w, src_h, dst_w, dst_h)
+static mut BLIT_GEOM: [u64; 8] = [0; 8];
+
 #[no_mangle]
 pub unsafe extern "C" fn rust_doom_blit(pixels: *const u32, width: i32, height: i32) {
     use crate::arch::x86_64::framebuffer;
 
-    if pixels.is_null() { return; }
-
+    if pixels.is_null() || width <= 0 || height <= 0 { return; }
     let fb = match framebuffer::info() {
         Some(f) => f,
         None => return,
     };
+    let fb_w = (fb.width as usize).min(BLIT_MAX);
+    let fb_h = (fb.height as usize).min(BLIT_MAX);
+    let src_w = width as usize;
+    let src_h = height as usize;
+    if fb_w == 0 || fb_h == 0 { return; }
+    let pitch_px = (fb.pitch / 4) as usize;
+    let base = fb.address;
 
-    let fb_w = fb.width as i32;
-    let fb_h = fb.height as i32;
-    let src_w = width;
-    let src_h = height;
-
-    // Integer scale that fits the screen (at least 1x)
-    let scale_x = if fb_w / src_w >= 1 { fb_w / src_w } else { 1 };
-    let scale_y = if fb_h / src_h >= 1 { fb_h / src_h } else { 1 };
-    let scale = if scale_x < scale_y { scale_x } else { scale_y };
-
-    let dst_w = src_w * scale;
-    let dst_h = src_h * scale;
+    // 4:3 display area that fits the screen.
+    let mut dst_h = fb_h;
+    let mut dst_w = dst_h * 4 / 3;
+    if dst_w > fb_w { dst_w = fb_w; dst_h = dst_w * 3 / 4; }
+    if dst_w == 0 || dst_h == 0 { return; }
     let off_x = (fb_w - dst_w) / 2;
     let off_y = (fb_h - dst_h) / 2;
 
-    let rs = fb.red_shift;
-    let gs = fb.green_shift;
-    let bs = fb.blue_shift;
-
-    // Direct pointer for fast row writes
-    let fb_base = fb.address;
-    let pitch_px = (fb.pitch / 4) as i32; // pitch in u32 pixels
-
-    for y in 0..src_h {
-        for x in 0..src_w {
-            // DOOM pixel: 0x00RRGGBB
-            let px = *pixels.add((y * src_w + x) as usize);
-            let r = (px >> 16) & 0xFF;
-            let g = (px >>  8) & 0xFF;
-            let b = (px      ) & 0xFF;
-            let colour = (r << rs) | (g << gs) | (b << bs);
-
-            // Write scaled block
-            for sy in 0..scale {
-                let dy = off_y + y * scale + sy;
-                if dy < 0 || dy >= fb_h { continue; }
-                let row = fb_base.offset((dy * pitch_px) as isize);
-                for sx in 0..scale {
-                    let dx = off_x + x * scale + sx;
-                    if dx < 0 || dx >= fb_w { continue; }
-                    *row.offset(dx as isize) = colour;
-                }
+    let geom = [base as u64, fb_w as u64, fb_h as u64, pitch_px as u64,
+                src_w as u64, src_h as u64, dst_w as u64, dst_h as u64];
+    let xmap = &mut *core::ptr::addr_of_mut!(XMAP);
+    let ymap = &mut *core::ptr::addr_of_mut!(YMAP);
+    let line = &mut *core::ptr::addr_of_mut!(LINE);
+    let cached = &mut *core::ptr::addr_of_mut!(BLIT_GEOM);
+    if *cached != geom {
+        for x in 0..dst_w { xmap[x] = ((x * src_w) / dst_w) as u16; }
+        for y in 0..dst_h { ymap[y] = ((y * src_h) / dst_h) as u16; }
+        // Black bars (drawn once per geometry change).
+        for y in 0..fb_h {
+            let row = base.add(y * pitch_px);
+            if y < off_y || y >= off_y + dst_h {
+                core::ptr::write_bytes(row, 0, fb_w);
+            } else {
+                if off_x > 0 { core::ptr::write_bytes(row, 0, off_x); }
+                let right = fb_w - off_x - dst_w;
+                if right > 0 { core::ptr::write_bytes(row.add(off_x + dst_w), 0, right); }
             }
         }
+        *cached = geom;
+    }
+
+    let (rs, gs, bs) = (fb.red_shift as u32, fb.green_shift as u32, fb.blue_shift as u32);
+    let native = rs == 16 && gs == 8 && bs == 0;
+
+    let mut last_sy = usize::MAX;
+    for y in 0..dst_h {
+        let sy = ymap[y] as usize;
+        if sy != last_sy {
+            let src = pixels.add(sy * src_w);
+            if native {
+                for x in 0..dst_w { line[x] = *src.add(xmap[x] as usize) & 0x00FF_FFFF; }
+            } else {
+                for x in 0..dst_w {
+                    let px = *src.add(xmap[x] as usize);
+                    line[x] = (((px >> 16) & 0xFF) << rs) | (((px >> 8) & 0xFF) << gs) | ((px & 0xFF) << bs);
+                }
+            }
+            last_sy = sy;
+        }
+        core::ptr::copy_nonoverlapping(line.as_ptr(), base.add((off_y + y) * pitch_px + off_x), dst_w);
     }
 }
 

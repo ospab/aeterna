@@ -153,6 +153,7 @@ static mut USE_CORB: bool = false;
 static mut USE_IMM: bool = true;
 
 static mut MASTER_VOLUME: u8 = 100;
+static mut WTYPE: [u8; 256] = [0xFF; 256];
 static mut DAC_COUNT: u8 = 0;
 static mut OUT_PIN_COUNT: u8 = 0;
 
@@ -375,6 +376,58 @@ fn amp_0db(caps: u32) -> u16 {
     offset.min(steps)
 }
 
+
+/// Read a widget's connection list (handles short/long form and ranges).
+unsafe fn conn_list(codec: u8, nid: u8, out: &mut [u8; 32]) -> usize {
+    let cl = cmd(make_get_param(codec, nid, 0x0E));
+    let len = (cl & 0x7F) as usize;
+    let long = cl & 0x80 != 0;
+    let per = if long { 2 } else { 4 };
+    let rbit: u32 = if long { 0x8000 } else { 0x80 };
+    let mut n = 0usize;
+    let mut prev = 0u8;
+    let mut i = 0usize;
+    while i < len && n < 32 {
+        let r = cmd(make_verb(codec, nid, 0xF02, i as u32));
+        for k in 0..per {
+            if i + k >= len || n >= 32 { break; }
+            let e = if long { (r >> (16 * k)) & 0xFFFF } else { (r >> (8 * k)) & 0xFF };
+            let id = (e & (rbit - 1)) as u8;
+            if e & rbit != 0 && i + k > 0 {
+                let mut x = prev.wrapping_add(1);
+                while x <= id && n < 32 { out[n] = x; n += 1; x = x.wrapping_add(1); if x == 0 { break; } }
+            } else {
+                out[n] = id; n += 1;
+            }
+            prev = id;
+        }
+        i += per;
+    }
+    n
+}
+
+/// Depth-first search from `nid` towards a DAC; programs the connection
+/// select of every pin/selector on the successful route.  Mixers need no
+/// select (they sum all inputs; their input amps are already unmuted).
+unsafe fn route_to_dac(codec: u8, nid: u8, depth: u32, route: &mut [u8; 8], rlen: &mut usize) -> bool {
+    let t = WTYPE[nid as usize];
+    if t == 0 { route[*rlen % 8] = nid; *rlen += 1; return true; }
+    if depth > 6 { return false; }
+    let mut list = [0u8; 32];
+    let n = conn_list(codec, nid, &mut list);
+    for i in 0..n {
+        let c = list[i];
+        if WTYPE[c as usize] == 0xFF { continue; }
+        if route_to_dac(codec, c, depth + 1, route, rlen) {
+            if t != 2 && n > 1 {
+                cmd(make_verb(codec, nid, VERB_SET_CONNECT_SEL, i as u32));
+            }
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn configure_codec(codec: u8) -> bool {
     let vendor = cmd(make_get_param(codec, 0x00, PARAM_VENDOR_ID));
     serial::write_str("[HDA] Codec "); super::log_dec(codec as u64);
@@ -421,6 +474,7 @@ unsafe fn configure_codec(codec: u8) -> bool {
     for nid in w_start..w_end {
         let wcap = cmd(make_get_param(codec, nid, PARAM_AUDIO_CAP));
         let wtype = (wcap >> 20) & 0xF;
+        WTYPE[nid as usize] = wtype as u8;
         let has_in_amp  = wcap & (1 << 1) != 0;
         let has_out_amp = wcap & (1 << 2) != 0;
         let override_amp = wcap & (1 << 3) != 0;
@@ -469,6 +523,33 @@ unsafe fn configure_codec(codec: u8) -> bool {
             _ => {}
         }
     }
+    // Route every connected output pin to a DAC (jack-aware, via the
+    // pin default configuration), selecting the right input on the way.
+    let mut routed = 0u8;
+    for nid in w_start..w_end {
+        if WTYPE[nid as usize] != 4 { continue; }
+        let pincap = cmd(make_get_param(codec, nid, PARAM_PIN_CAP));
+        if pincap & (1 << 4) == 0 { continue; }
+        let defcfg = cmd(make_verb(codec, nid, 0xF1C, 0));
+        let conn = (defcfg >> 30) & 3;
+        let dev = (defcfg >> 20) & 0xF;
+        serial::write_str("[HDA]   pin 0x"); super::log_hex8(nid);
+        serial::write_str(" defcfg=0x"); super::log_hex32(defcfg);
+        serial::write_str(" (conn="); super::log_dec(conn as u64);
+        serial::write_str(" dev="); super::log_dec(dev as u64);
+        if conn == 1 || dev > 2 && dev != 0xF { serial::write_str(") skipped\r\n"); continue; }
+        let mut route = [0u8; 8];
+        let mut rlen = 0usize;
+        if route_to_dac(codec, nid, 0, &mut route, &mut rlen) {
+            routed += 1;
+            serial::write_str(") -> DAC 0x"); super::log_hex8(route[(rlen - 1) % 8]);
+            serial::write_str("\r\n");
+        } else {
+            serial::write_str(") no route to a DAC\r\n");
+        }
+    }
+    serial::write_str("[HDA] routed output pins: "); super::log_dec(routed as u64);
+    serial::write_str("\r\n");
     DAC_COUNT = dacs;
     OUT_PIN_COUNT = pins;
     serial::write_str("[HDA] Codec configured: ");
