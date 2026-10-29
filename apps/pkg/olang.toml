@@ -1,0 +1,45 @@
+name = "olang"
+version = "0.1.0"
+description = "olang interpreter (ol): scripts and REPL, no JIT, no networking yet"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/ol"
+dest = "/usr/bin/ol"
+
+[[files]]
+src = "../olang/std/math.ol"
+dest = "/usr/share/olang/std/math.ol"
+
+[[files]]
+src = "../olang/examples/hello.ol"
+dest = "/usr/share/olang/examples/hello.ol"
+
+[[files]]
+src = "../olang/examples/fib.ol"
+dest = "/usr/share/olang/examples/fib.ol"
+
+[[files]]
+src = "../olang/examples/structs.ol"
+dest = "/usr/share/olang/examples/structs.ol"
+
+[[files]]
+src = "../olang/examples/strings.ol"
+dest = "/usr/share/olang/examples/strings.ol"
+
+[[files]]
+src = "../olang/examples/modules.ol"
+dest = "/usr/share/olang/examples/modules.ol"
+
+[[files]]
+src = "../olang/examples/readfile.ol"
+dest = "/usr/share/olang/examples/readfile.ol"
+
+[[files]]
+src = "../olang/examples/net.ol"
+dest = "/usr/share/olang/examples/net.ol"
+
+[[files]]
+src = "../olang/examples/depth.ol"
+dest = "/usr/share/olang/examples/depth.ol"

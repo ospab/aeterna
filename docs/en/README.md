@@ -10,6 +10,7 @@ translation and may lag behind.
 - [Shell and tools](shell.md): the `plum` shell, coreutils, keys, clipboard, serial console.
 - [Packages](packages.md): `tomato`, the signed repository, writing and packaging programs.
 - [Networking and OSTP](networking.md): addresses, `curl`, DNS, time, the OSTP client.
+- [olang](olang.md): the `ol` interpreter for the olang language, what differs from the original.
 - [Hardware](hardware.md): supported devices and recommended VM settings.
 
 ## Developing the system

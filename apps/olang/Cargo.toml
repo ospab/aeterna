@@ -1,0 +1,13 @@
+[package]
+name = "olang"
+description = "olang interpreter for ospab.os (ol): lexer, parser and tree-walking evaluator, no_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ol"
+path = "src/main.rs"
+
+[dependencies]
+liboos = { path = "../../user/liboos" }
