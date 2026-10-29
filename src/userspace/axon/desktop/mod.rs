@@ -51,6 +51,7 @@ use oos_ui::theme::{Theme, DARK};
 use oos_ui::app::{AppHost, Application, DirItem, Platform};
 
 use crate::arch::x86_64::{framebuffer, mouse, serial, tsc};
+use crate::drivers::gpu::display;
 use crate::userspace::plum::io;
 
 // ─── Session-wide requests from apps ─────────────────────────────────────────
@@ -171,7 +172,7 @@ fn screen_hook(s: &str, color: u32) {
         let now = tsc::tsc_us();
         if now.saturating_sub(LAST_LIVE_US) > 40_000 {
             LAST_LIVE_US = now;
-            if let Some(d) = DESK.as_mut() { d.frame(); }
+            if let Some(d) = DESK.as_mut() { d.sync_display(); d.frame(); }
         }
     }
 }
@@ -240,6 +241,8 @@ struct Desk {
     stats: Stats,
     first_frame_us: u64,
     full_frame_us: u64,
+    /// `display::generation()` this layout was made for.
+    gen: u32,
 }
 
 static mut DESK: Option<Box<Desk>> = None;
@@ -293,14 +296,26 @@ impl Desk {
         self.session.desktop.invalidate_all();
     }
 
+    /// Settings -> Display: switch the mode and remember it.
     fn set_resolution(&mut self, w: i32, h: i32) {
-        if !crate::drivers::gpu::svga_ready() { return; }
-        if !crate::drivers::gpu::set_mode(w as u32, h as u32, 32) { return; }
-        crate::drivers::gpu::svga_activate();
-        let (cw, ch, bpl) = crate::drivers::gpu::vmware_svga::display_info();
-        if let Some(i) = framebuffer::info() {
-            unsafe { framebuffer::redirect(i.address, cw as u64, ch as u64, bpl as u64); }
+        match display::set(w as u32, h as u32) {
+            Ok((nw, nh)) => display::save_mode(nw, nh),
+            Err(e) => {
+                serial::write_str("[DISPLAY] ");
+                serial::write_str(&e);
+                serial::write_str("\r\n");
+            }
         }
+        self.sync_display();
+    }
+
+    /// The mode or pitch changed (Settings, `display` in a terminal window, VMware
+    /// autofit): take the new framebuffer and lay the shell out again. The window
+    /// manager keeps windows on screen; the top bar and the dock follow the width.
+    fn sync_display(&mut self) {
+        let g = display::generation();
+        if g == self.gen { return; }
+        self.gen = g;
         if let Some(fb) = Fb::current() {
             self.fb = fb;
             let (fw, fh) = (self.fb.width, self.fb.height);
@@ -379,7 +394,7 @@ pub fn run_session() {
     unsafe {
         DESK = Some(Box::new(Desk {
             session, text, theme, fb, start_us: tsc::tsc_us(), stats: Stats::default(),
-            first_frame_us: 0, full_frame_us: 0,
+            first_frame_us: 0, full_frame_us: 0, gen: display::generation(),
         }));
         REQUESTS.clear();
         TERM_OUT.clear();
@@ -397,6 +412,7 @@ pub fn run_session() {
         d.full_frame_us = d.frame();
         d.stats = Stats::default();
     }
+    display::set_desktop_active(true);
     serial::write_str("[DESKTOP] session started\r\n");
 
     input::reset();
@@ -496,6 +512,9 @@ pub fn run_session() {
                 Request::Logout => logout = true,
             }
         }
+        // VMware autofit, then follow any mode change (also from Settings or a terminal window).
+        if display::poll() { busy = true; }
+        desk().sync_display();
         // Clock / status once a second.
         let d = desk();
         let now = d.now_ms();
@@ -517,14 +536,16 @@ pub fn run_session() {
         if d.stats.frames > 0 { d.stats.total_us / d.stats.frames } else { 0 }, d.stats.max_us,
         if d.stats.frames > 0 { d.stats.area / d.stats.frames } else { 0 });
     io::set_screen_hook(None, 80, 25);
+    display::set_desktop_active(false);
     if let Some(fb) = Fb::current() {
         if (fb.width, fb.height, fb.stride) == saved_geom {
             unsafe { core::ptr::copy_nonoverlapping(saved.as_ptr(), fb.base, saved_len); }
             crate::drivers::gpu::flush_screen();
             framebuffer::set_cursor_pos(cursor.0, cursor.1);
         } else {
-            framebuffer::clear(0);
-            framebuffer::set_cursor_pos(0, 0);
+            // The mode changed while the desktop ran: redraw the console text at the new size.
+            framebuffer::repaint();
+            crate::drivers::gpu::flush_screen();
         }
     }
     drop(d);
@@ -547,5 +568,7 @@ fn exec(id: WinId, line: &str, cols: usize, rows: usize) {
     // and the keyboard driver may hold their leftovers: repaint everything.
     while crate::arch::x86_64::keyboard::try_read_key().is_some() {}
     input::reset();
+    // The command may have changed the display mode (`display set`): new pitch and size.
+    desk().sync_display();
     desk().session.desktop.invalidate_all();
 }

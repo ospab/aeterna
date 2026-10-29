@@ -140,6 +140,8 @@ static mut CAPABILITIES: u32 = 0;
 static mut CURRENT_WIDTH:  u32 = 0;
 static mut CURRENT_HEIGHT: u32 = 0;
 static mut CURRENT_BPP:    u32 = 0;
+static mut MAX_W: u32 = 0;
+static mut MAX_H: u32 = 0;
 
 // ─── I/O helpers ──────────────────────────────────────────────────────────────
 
@@ -256,9 +258,11 @@ pub fn set_mode(width: u32, height: u32, bpp: u32) -> bool {
         svga_write(SVGA_REG_HEIGHT,        height);
         svga_write(SVGA_REG_BITS_PER_PIXEL, bpp);
         svga_write(SVGA_REG_ENABLE, 1);
-        CURRENT_WIDTH  = width;
-        CURRENT_HEIGHT = height;
-        CURRENT_BPP    = bpp;
+        // The device may round or clamp the request: keep what it really set.
+        CURRENT_WIDTH  = svga_read(SVGA_REG_WIDTH);
+        CURRENT_HEIGHT = svga_read(SVGA_REG_HEIGHT);
+        CURRENT_BPP    = svga_read(SVGA_REG_BITS_PER_PIXEL);
+        let (width, height, bpp) = (CURRENT_WIDTH, CURRENT_HEIGHT, CURRENT_BPP);
 
         serial::write_str("[SVGA] Mode set to ");
         serial_dec(width as u64);
@@ -269,6 +273,16 @@ pub fn set_mode(width: u32, height: u32, bpp: u32) -> bool {
         serial::write_str("\r\n");
     }
     true
+}
+
+/// Device limits: (max width, max height, video memory in bytes).
+pub fn limits() -> (u32, u32, u32) {
+    unsafe { (MAX_W, MAX_H, FB_SIZE) }
+}
+
+/// True once `activate()` has programmed the FIFO.
+pub fn is_active() -> bool {
+    FIFO_ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Send an SVGA_CMD_UPDATE command to blit a dirty region to the screen.
@@ -382,6 +396,8 @@ pub fn init() -> bool {
         CURRENT_WIDTH  = svga_read(SVGA_REG_WIDTH);
         CURRENT_HEIGHT = svga_read(SVGA_REG_HEIGHT);
         CURRENT_BPP    = svga_read(SVGA_REG_BITS_PER_PIXEL);
+        MAX_W = svga_read(SVGA_REG_MAX_WIDTH);
+        MAX_H = svga_read(SVGA_REG_MAX_HEIGHT);
     }
 
     SVGA_READY.store(true, Ordering::Release);

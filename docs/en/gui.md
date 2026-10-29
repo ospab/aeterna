@@ -102,6 +102,23 @@ Implemented in `gui/src/desktop.rs`.
 | Dock | One icon per pinned app; a dot marks a running app; click raises or launches |
 | Redraw | Damage rectangles only: window moves and repaints add the old and new areas |
 
+### Display changes
+
+The session reads `display::generation()` every frame (`drivers/gpu/display.rs`). When it changes
+(Settings → Display, `display` in a terminal window, VMware autofit) the desktop takes the new
+framebuffer (size, pitch), recreates the back buffer and calls `Desktop::resize_screen`: windows
+larger than the work area shrink, all windows are moved back on screen, maximized windows follow
+the work area, and the top bar and dock are laid out for the new width. Apps receive a normal
+`Configure` message. On logout the console is restored from its saved pixels, or redrawn from the
+text shadow if the mode changed meanwhile.
+
+### Scale
+
+Text and controls use fixed pixel sizes from the theme. A UI scale (1x, 1.25x, 1.5x, 2x) is a
+next step: it needs the theme metrics, the type scale, and the pixel constants inside apps to go
+through one factor. Until then, at 2560 px and wider the console font is doubled
+(`display scale`), while the desktop stays at 1x.
+
 The clock uses the time zone from `/etc/timezone` (`UTC+3`, `UTC-5`, `UTC+5:30`).
 
 ## Frame cost

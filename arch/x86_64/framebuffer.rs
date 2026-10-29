@@ -40,18 +40,54 @@ static mut CURSOR_Y: u64 = 0;
 /// remember a screen position (e.g. the prompt) notice that it moved up.
 static mut SCROLLS: u64 = 0;
 
+/// Integer scale of the 8x16 bitmap font (1 = 8x16 cells, 2 = 16x32 ...).
+static mut SCALE: u64 = 1;
+/// True when the scale was set by hand (`display scale`); otherwise it follows the width.
+static mut SCALE_FORCED: bool = false;
+/// The scale asked for by hand (valid while SCALE_FORCED).
+static mut SCALE_REQ: u64 = 1;
+/// Width from which the automatic scale becomes 2.
+const AUTO_SCALE2_WIDTH: u64 = 2560;
+
+/// Colour the screen was last cleared to (for cells the shadow never saw).
+static mut CLEAR_BG: u32 = 0;
+
+// Text shadow: a copy of the text drawn through `draw_char`, one cell per
+// character, so the console can be redrawn after a resolution change.
+// Allocated by `shadow_enable` once the heap is up; nothing is recorded before.
+#[derive(Clone, Copy)]
+struct Cell { ch: char, fg: u32, bg: u32 }
+
+static mut SHADOW: alloc::vec::Vec<Cell> = alloc::vec::Vec::new();
+static mut SH_COLS: u64 = 0;
+static mut SH_ROWS: u64 = 0;
+static mut SHADOW_ON: bool = false;
+
+/// Left by the last `reconfigure`, for `remap_pos`:
+/// (old cell w, old cell h, rows dropped from the top, new cols, new rows).
+static mut REMAP: (u64, u64, u64, u64, u64) = (8, 16, 0, 0, 0);
+
 // ─── Pager state ────────────────────────────────────────────────────────────
 static mut PAGER_HOOK: Option<fn() -> bool> = None;
 static mut PAGER_LINES: u64 = 0;
 static mut PAGER_SUPPRESS: bool = false;
 static mut PAGER_IN_HOOK: bool = false;
 
-/// Character cell dimensions (8x16 font)
+/// Base glyph size (8x16 font). The real cell size is `cell_w()` x `cell_h()`.
 pub const CHAR_WIDTH: u64 = font::FONT_WIDTH;
 pub const CHAR_HEIGHT: u64 = font::FONT_HEIGHT;
 
 /// Tab stop width in character cells.
 const TAB_WIDTH: u64 = 8;
+
+/// Width of one text cell in pixels (glyph width times the font scale).
+#[inline(always)]
+pub fn cell_w() -> u64 { unsafe { CHAR_WIDTH * SCALE } }
+/// Height of one text cell in pixels.
+#[inline(always)]
+pub fn cell_h() -> u64 { unsafe { CHAR_HEIGHT * SCALE } }
+/// Current font scale (1, 2, ...).
+pub fn scale() -> u64 { unsafe { SCALE } }
 
 /// Initialize framebuffer with raw parameters from bootloader
 pub unsafe fn init(
@@ -103,9 +139,10 @@ pub unsafe fn redirect(address: *mut u32, width: u64, height: u64, pitch: u64) {
         NATIVE_RGB = true;
     }
     // Clamp cursor to new dimensions
+    let chh = cell_h();
     if CURSOR_X >= width  { CURSOR_X = 0; }
-    if CURSOR_Y + CHAR_HEIGHT >= height {
-        CURSOR_Y = if height > CHAR_HEIGHT { height - CHAR_HEIGHT } else { 0 };
+    if CURSOR_Y + chh >= height {
+        CURSOR_Y = if height > chh { height - chh } else { 0 };
     }
 }
 
@@ -154,6 +191,8 @@ pub fn clear(color: u32) {
             CURSOR_X = 0;
             CURSOR_Y = 0;
             PAGER_LINES = 0;
+            CLEAR_BG = color;
+            shadow_clear();
         }
     }
 }
@@ -176,7 +215,8 @@ pub fn fill_rect(x: u64, y: u64, w: u64, h: u64, color: u32) {
     }
 }
 
-/// Draw single character at pixel position (8x16 font, 1 byte per row, MSB left)
+/// Draw single character at pixel position. The glyph is the 8x16 bitmap
+/// scaled by the current integer font scale (cell = `cell_w()` x `cell_h()`).
 pub fn draw_char_at(x: u64, y: u64, c: char, fg_color: u32, bg_color: u32) {
     let bitmap = match font::get_char_bitmap(c) {
         Some(b) => b,
@@ -189,29 +229,38 @@ pub fn draw_char_at(x: u64, y: u64, c: char, fg_color: u32, bg_color: u32) {
             Some(fb) => fb,
             None => return,
         };
-        if x + CHAR_WIDTH <= fb.width && y + CHAR_HEIGHT <= fb.height {
+        let s = SCALE;
+        let (cw, chh) = (CHAR_WIDTH * s, CHAR_HEIGHT * s);
+        let ppr = fb.pitch / 4;
+        if x + cw <= fb.width && y + chh <= fb.height {
             // Fast path: glyph fully on screen.
-            let ppr = fb.pitch / 4;
             for row in 0..CHAR_HEIGHT {
                 let bits = bitmap[row as usize];
-                let base = fb.address.add(((y + row) * ppr + x) as usize);
-                for col in 0..CHAR_WIDTH {
-                    let px = if bits & (0x80 >> col) != 0 { fg } else { bg };
-                    ptr::write_volatile(base.add(col as usize), px);
+                for sy in 0..s {
+                    let base = fb.address.add(((y + row * s + sy) * ppr + x) as usize);
+                    for col in 0..CHAR_WIDTH {
+                        let px = if bits & (0x80 >> col) != 0 { fg } else { bg };
+                        for sx in 0..s {
+                            ptr::write_volatile(base.add((col * s + sx) as usize), px);
+                        }
+                    }
                 }
             }
         } else {
             // Clipped glyph at the screen edge.
-            let ppr = fb.pitch / 4;
             for row in 0..CHAR_HEIGHT {
-                let py = y + row;
-                if py >= fb.height { break; }
                 let bits = bitmap[row as usize];
-                for col in 0..CHAR_WIDTH {
-                    let px_x = x + col;
-                    if px_x >= fb.width { break; }
-                    let px = if bits & (0x80 >> col) != 0 { fg } else { bg };
-                    ptr::write_volatile(fb.address.add((py * ppr + px_x) as usize), px);
+                for sy in 0..s {
+                    let py = y + row * s + sy;
+                    if py >= fb.height { return; }
+                    for col in 0..CHAR_WIDTH {
+                        let px = if bits & (0x80 >> col) != 0 { fg } else { bg };
+                        for sx in 0..s {
+                            let px_x = x + col * s + sx;
+                            if px_x >= fb.width { break; }
+                            ptr::write_volatile(fb.address.add((py * ppr + px_x) as usize), px);
+                        }
+                    }
                 }
             }
         }
@@ -221,10 +270,11 @@ pub fn draw_char_at(x: u64, y: u64, c: char, fg_color: u32, bg_color: u32) {
 /// Advance the cursor to the next text line, scrolling if needed.
 unsafe fn newline(fb: &Framebuffer) {
     CURSOR_X = 0;
-    CURSOR_Y += CHAR_HEIGHT;
-    if CURSOR_Y + CHAR_HEIGHT > fb.height {
+    let chh = cell_h();
+    CURSOR_Y += chh;
+    if CURSOR_Y + chh > fb.height {
         scroll_up();
-        CURSOR_Y = fb.height - CHAR_HEIGHT;
+        CURSOR_Y = fb.height - chh;
     }
     pager_line_done();
 }
@@ -259,9 +309,9 @@ pub fn draw_char(c: char, fg_color: u32, bg_color: u32) {
                     CURSOR_X = 0;
                 }
                 '\t' => {
-                    let col = CURSOR_X / CHAR_WIDTH;
+                    let col = CURSOR_X / cell_w();
                     let next = (col / TAB_WIDTH + 1) * TAB_WIDTH;
-                    let cols = fb.width / CHAR_WIDTH;
+                    let cols = fb.width / cell_w();
                     if next >= cols {
                         newline(&fb);
                     } else {
@@ -272,17 +322,19 @@ pub fn draw_char(c: char, fg_color: u32, bg_color: u32) {
                 }
                 _ => {
                     // Wrap if at right edge
-                    if CURSOR_X + CHAR_WIDTH > fb.width {
+                    let (cw, chh) = (cell_w(), cell_h());
+                    if CURSOR_X + cw > fb.width {
                         newline(&fb);
                         if PAGER_SUPPRESS && !PAGER_IN_HOOK { return; }
                     }
                     // Scroll if at bottom
-                    if CURSOR_Y + CHAR_HEIGHT > fb.height {
+                    if CURSOR_Y + chh > fb.height {
                         scroll_up();
-                        CURSOR_Y = fb.height - CHAR_HEIGHT;
+                        CURSOR_Y = fb.height - chh;
                     }
                     draw_char_at(CURSOR_X, CURSOR_Y, c, fg_color, bg_color);
-                    CURSOR_X += CHAR_WIDTH;
+                    shadow_put(CURSOR_X / cw, CURSOR_Y / chh, c, fg_color, bg_color);
+                    CURSOR_X += cw;
                 }
             }
         }
@@ -311,25 +363,33 @@ pub fn clear_to_eol(bg_color: u32) {
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
             if CURSOR_X < fb.width {
-                fill_rect(CURSOR_X, CURSOR_Y, fb.width - CURSOR_X, CHAR_HEIGHT, bg_color);
+                fill_rect(CURSOR_X, CURSOR_Y, fb.width - CURSOR_X, cell_h(), bg_color);
+                let (cw, chh) = (cell_w(), cell_h());
+                let (row, mut col) = (CURSOR_Y / chh, (CURSOR_X + cw - 1) / cw);
+                while col < SH_COLS {
+                    shadow_put(col, row, ' ', 0x00FFFFFF, bg_color);
+                    col += 1;
+                }
             }
         }
     }
 }
 
-/// Scroll screen content up by one text row (CHAR_HEIGHT pixels).
+/// Scroll screen content up by one text row (`cell_h()` pixels).
 fn scroll_up() {
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
             let pixels_per_row = fb.pitch / 4;
+            let chh = cell_h();
 
             // One overlapping move of everything below the first text row.
-            let src = fb.address.add((CHAR_HEIGHT * pixels_per_row) as usize);
-            let count = ((fb.height - CHAR_HEIGHT) * pixels_per_row) as usize;
+            let src = fb.address.add((chh * pixels_per_row) as usize);
+            let count = ((fb.height - chh) * pixels_per_row) as usize;
             ptr::copy(src, fb.address, count);
+            shadow_scroll();
 
-            // Clear the bottom CHAR_HEIGHT rows
-            let clear_start = fb.height - CHAR_HEIGHT;
+            // Clear the bottom text row
+            let clear_start = fb.height - chh;
             for y in clear_start..fb.height {
                 let row_base = fb.address.add((y * pixels_per_row) as usize);
                 for x in 0..fb.width {
@@ -396,7 +456,7 @@ pub fn info() -> Option<Framebuffer> {
 pub fn screen_cols() -> u64 {
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
-            fb.width / CHAR_WIDTH
+            fb.width / cell_w()
         } else {
             80
         }
@@ -406,9 +466,137 @@ pub fn screen_cols() -> u64 {
 pub fn screen_rows() -> u64 {
     unsafe {
         if let Some(fb) = FRAMEBUFFER {
-            fb.height / CHAR_HEIGHT
+            fb.height / cell_h()
         } else {
             25
         }
     }
+}
+
+
+// ─── Text shadow ────────────────────────────────────────────────────────────
+
+unsafe fn shadow_alloc(cols: u64, rows: u64) {
+    let blank = Cell { ch: ' ', fg: 0x00FFFFFF, bg: CLEAR_BG };
+    SHADOW = alloc::vec![blank; (cols * rows) as usize];
+    SH_COLS = cols;
+    SH_ROWS = rows;
+}
+
+/// Start recording drawn text so the console can be redrawn after a mode
+/// change. Call once after the heap is up, right after clearing the screen.
+pub fn shadow_enable() {
+    unsafe {
+        if SHADOW_ON { return; }
+        if let Some(fb) = FRAMEBUFFER {
+            shadow_alloc((fb.width / cell_w()).max(1), (fb.height / cell_h()).max(1));
+            SHADOW_ON = true;
+        }
+    }
+}
+
+#[inline]
+unsafe fn shadow_put(col: u64, row: u64, ch: char, fg: u32, bg: u32) {
+    if SHADOW_ON && col < SH_COLS && row < SH_ROWS {
+        SHADOW[(row * SH_COLS + col) as usize] = Cell { ch, fg, bg };
+    }
+}
+
+unsafe fn shadow_clear() {
+    if SHADOW_ON {
+        let blank = Cell { ch: ' ', fg: 0x00FFFFFF, bg: CLEAR_BG };
+        for c in SHADOW.iter_mut() { *c = blank; }
+    }
+}
+
+unsafe fn shadow_scroll() {
+    if SHADOW_ON && SH_ROWS > 0 {
+        let cols = SH_COLS as usize;
+        SHADOW.copy_within(cols.., 0);
+        let n = SHADOW.len();
+        let blank = Cell { ch: ' ', fg: 0x00FFFFFF, bg: 0 };
+        for c in SHADOW[n - cols..].iter_mut() { *c = blank; }
+    }
+}
+
+/// Redraw the whole screen from the text shadow (console only).
+pub fn repaint() {
+    unsafe {
+        if let Some(fb) = FRAMEBUFFER {
+            fill_rect(0, 0, fb.width, fb.height, CLEAR_BG);
+            if !SHADOW_ON { return; }
+            let (cw, chh) = (cell_w(), cell_h());
+            for r in 0..SH_ROWS {
+                for c in 0..SH_COLS {
+                    let cell = SHADOW[(r * SH_COLS + c) as usize];
+                    if cell.ch != ' ' || cell.bg != CLEAR_BG {
+                        draw_char_at(c * cw, r * chh, cell.ch, cell.fg, cell.bg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Mode change / scale ────────────────────────────────────────────────────
+
+/// Switch the framebuffer to a new geometry (address and pitch may change).
+/// Recomputes the font scale (unless forced), the text grid, the cursor and
+/// the text shadow; with `paint` the console is redrawn from the shadow.
+pub unsafe fn reconfigure(address: *mut u32, width: u64, height: u64, pitch: u64, paint: bool) {
+    let (ocw, och) = (cell_w(), cell_h());
+    let (ocols, orows) = (SH_COLS, SH_ROWS);
+    let cur_col = CURSOR_X / ocw;
+    let cur_row = CURSOR_Y / och;
+    redirect(address, width, height, pitch);
+    SCALE = if SCALE_FORCED { SCALE_REQ } else if width >= AUTO_SCALE2_WIDTH { 2 } else { 1 };
+    let (cw, chh) = (cell_w(), cell_h());
+    let (ncols, nrows) = ((width / cw).max(1), (height / chh).max(1));
+    let shift = if cur_row >= nrows { cur_row - nrows + 1 } else { 0 };
+    if SHADOW_ON {
+        let old = core::mem::take(&mut SHADOW);
+        shadow_alloc(ncols, nrows);
+        for r in 0..nrows {
+            let or = r + shift;
+            if or >= orows { break; }
+            for c in 0..ncols.min(ocols) {
+                SHADOW[(r * ncols + c) as usize] = old[(or * ocols + c) as usize];
+            }
+        }
+    }
+    let new_row = (cur_row - shift).min(nrows - 1);
+    CURSOR_X = cur_col.min(ncols - 1) * cw;
+    CURSOR_Y = new_row * chh;
+    REMAP = (ocw, och, shift, ncols, nrows);
+    PAGER_LINES = 0;
+    if paint { repaint(); }
+}
+
+/// Set the font scale: 1, 2, ... or 0 for automatic (2 from 2560 px wide).
+/// Redraws the console from the text shadow when `paint` is set.
+pub fn set_scale(scale: u64, paint: bool) {
+    unsafe {
+        let Some(fb) = FRAMEBUFFER else { return };
+        if scale == 0 { SCALE_FORCED = false; } else { SCALE_FORCED = true; SCALE_REQ = scale.min(4); }
+        reconfigure(fb.address, fb.width, fb.height, fb.pitch, paint);
+    }
+}
+
+/// True when the scale follows the screen width.
+pub fn scale_is_auto() -> bool { unsafe { !SCALE_FORCED } }
+
+/// Map a pixel position saved before the last `reconfigure` to the new grid.
+pub fn remap_pos(x: u64, y: u64) -> (u64, u64) {
+    unsafe {
+        let (ocw, och, shift, ncols, nrows) = REMAP;
+        if ncols == 0 { return (x, y); }
+        let col = (x / ocw).min(ncols - 1);
+        let row = (y / och).saturating_sub(shift).min(nrows - 1);
+        (col * cell_w(), row * cell_h())
+    }
+}
+
+/// Panic screen: its layout uses the 8x16 base cell.
+pub fn reset_scale_for_panic() {
+    unsafe { SCALE = 1; }
 }

@@ -25,8 +25,6 @@ static mut PAGE_REQ: Option<usize> = None;
 /// Ask the running Settings window to show `page` (consumed on its next tick).
 pub fn show_page(_win: WinId, page: usize) { unsafe { PAGE_REQ = Some(page); } }
 
-const MODES: [(i32, i32); 5] = [(1024, 768), (1280, 800), (1440, 900), (1600, 900), (1920, 1080)];
-
 pub struct Settings {
     win: WinId,
     sidebar: NodeId,
@@ -43,7 +41,10 @@ pub struct Settings {
     vol_slider: NodeId,
     vol_label: NodeId,
     mode_btns: Vec<NodeId>,
+    modes: Vec<(i32, i32)>,
     mode_note: NodeId,
+    auto_btn: NodeId,
+    scale_btns: Vec<NodeId>,
     time_label: NodeId,
     tz_label: NodeId,
     tz_minus: NodeId,
@@ -75,7 +76,7 @@ impl Settings {
     pub fn new() -> Settings {
         Settings {
             win: 0, sidebar: 0, headline: 0, pages: Vec::new(), page: 0, net_status: 0, net_ip: 0, net_gw: 0, net_dns: 0, net_mac: 0,
-            ostp_status: 0, vol_slider: 0, vol_label: 0, mode_btns: Vec::new(), mode_note: 0, time_label: 0, tz_label: 0,
+            ostp_status: 0, vol_slider: 0, vol_label: 0, mode_btns: Vec::new(), modes: Vec::new(), mode_note: 0, auto_btn: 0, scale_btns: Vec::new(), time_label: 0, tz_label: 0,
             tz_minus: 0, tz_plus: 0, sync_btn: 0, sync_note: 0, timer: 0,
         }
     }
@@ -117,7 +118,17 @@ impl Settings {
         if audio && ui.focused() != Some(me.7) { ui.set_slider(me.7, vol as u16 * 10); }
         ui.set_text(me.8, &clock);
         ui.set_text(me.9, &tz_s);
-        ui.set_text(me.10, if svga { "Pick a resolution. The screen is resized without a reboot." } else { "This display driver has a fixed resolution." });
+        let (cw, ch, pitch) = crate::drivers::gpu::display::current();
+        let auto = crate::drivers::gpu::display::auto_enabled();
+        let note = if svga {
+            format!("Now {} x {} (pitch {} bytes). Pick a resolution; the screen is resized without a reboot.", cw, ch, pitch)
+        } else {
+            format!("Now {} x {}. This display driver has a fixed resolution.", cw, ch)
+        };
+        ui.set_text(me.10, &note);
+        let auto_btn = self.auto_btn;
+        let vmware = crate::drivers::gpu::vmrpc::available();
+        ui.set_text(auto_btn, if !vmware { "Autofit: needs VMware" } else if auto { "Autofit with the VMware window: on" } else { "Autofit with the VMware window: off" });
     }
 }
 
@@ -185,10 +196,12 @@ impl Application for Settings {
         self.mode_note = ui.paragraph(p, "", TextRole::Secondary);
         let g = ui.grid(p, 3);
         ui.gap(g, 8);
-        for (w, h) in MODES {
+        for (w, h) in crate::drivers::gpu::display::list() {
             let b = ui.button(g, &format!("{} × {}", w, h), ButtonKind::Secondary);
             self.mode_btns.push(b);
+            self.modes.push((w as i32, h as i32));
         }
+        self.auto_btn = ui.button(p, "", ButtonKind::Secondary);
         self.pages.push(p);
 
         // Time.
@@ -244,7 +257,11 @@ impl Application for Settings {
             AppEvent::Action(Action::Clicked(n)) => {
                 let n = *n;
                 if let Some(i) = self.mode_btns.iter().position(|&b| b == n) {
-                    super::request(super::Request::SetResolution(MODES[i].0, MODES[i].1));
+                    super::request(super::Request::SetResolution(self.modes[i].0, self.modes[i].1));
+                } else if n == self.auto_btn {
+                    use crate::drivers::gpu::display;
+                    if crate::drivers::gpu::vmrpc::available() { display::save_auto(!display::auto_enabled()); }
+                    self.refresh(cx);
                 } else if n == self.tz_minus || n == self.tz_plus {
                     let cur = crate::net::sntp::read_timezone_offset() / 3600;
                     let new = (cur + if n == self.tz_plus { 1 } else { -1 }).clamp(-12, 14);
