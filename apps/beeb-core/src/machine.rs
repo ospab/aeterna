@@ -34,6 +34,8 @@ const T_PUMP: u16 = 0xFC18;
 /// BRK opcode served from the FRED buffer: error number and text follow.
 const T_ERROR: u16 = 0xFC40;
 const FRED_CLI: usize = 0x100;
+/// The System VIA sees vsync about half a character row after the 6845 starts it (Elite's split-screen timing assumes 34.5 rows).
+const CA1_DELAY_LINES: u32 = 4;
 const DFS_SLOT: usize = 14;
 
 enum Act {
@@ -68,6 +70,9 @@ struct Hw {
     adc_timer: i32,
     adc_busy: bool,
     adc_chan: u8,
+    ca1_delay: u32,
+    trace: Vec<(u64, u8, u8)>,
+    trace_on: bool,
 }
 
 impl Hw {
@@ -120,6 +125,11 @@ impl Hw {
 
     fn sheila_write(&mut self, a: u16, v: u8) {
         let off = (a & 0xFF) as u8;
+        if self.trace_on && (off < 8 || (0x20..0x22).contains(&off) || (0x44..0x48).contains(&off) || off == 0x4D || off == 0x4E) {
+            let sel = if off < 8 { self.video.crtc_sel } else { 0 };
+            self.trace.push((((self.video.tvline() as i64 - 38) * 128 + self.line_cyc as i64) as u64, off, v));
+            if off < 8 && off & 1 == 1 { self.trace.push((self.cycles, 0x80 | sel, v)); }
+        }
         match off {
             0x00..=0x07 => if off & 1 == 0 { self.video.crtc_sel = v & 31 } else { self.video.crtc_write(v) },
             0x20..=0x2F => if off & 1 == 0 { self.video.ula = v } else { self.video.palette_write(v) },
@@ -162,7 +172,12 @@ impl Hw {
             let size = [0x4000u32, 0x2000, 0x5000, 0x2800][(((l >> 4) & 1) | ((l >> 5) & 1) << 1) as usize];
             let ev = self.video.line(&self.ram, size, &self.mos);
             let rising = self.sys.pcr_ca1_rising();
-            if (ev.vsync_start && !rising) || (ev.vsync_end && rising) { self.sys.ca1_edge(); }
+            if ev.vsync_start && !rising { self.ca1_delay = CA1_DELAY_LINES; }
+            if self.ca1_delay > 0 {
+                self.ca1_delay -= 1;
+                if self.ca1_delay == 0 { self.sys.ca1_edge(); }
+            }
+            if ev.vsync_end && rising { self.sys.ca1_edge(); }
         }
     }
 
@@ -199,7 +214,13 @@ pub struct Beeb {
     cpu: Cpu,
     hw: Hw,
     hle: Hle,
+    /// Keys currently down with the cycle they went down, and releases held back until the key
+    /// has been down for MIN_HOLD (the MOS and Elite poll the matrix, a short tap would be missed).
+    held: Vec<(Key, u64)>,
+    deferred: Vec<(Key, u64)>,
 }
+
+const MIN_HOLD: u64 = 120_000;
 
 fn dfs_rom() -> Vec<u8> {
     let mut r = vec![0u8; 0x4000];
@@ -224,11 +245,12 @@ impl Beeb {
             ram: vec![0; 0x8000], mos: m, roms, romsel: 0, sys: Via::new(), usr: Via::new(),
             kbd: Keyboard::new(), video: Video::new(), disc: Disc::new(), latch: 0,
             fred: vec![0xFF; 0x200], extra: 0, toggle: false, cycles: 0, line_cyc: 0, half: 0,
-            adc_timer: 0, adc_busy: false, adc_chan: 0,
+            adc_timer: 0, adc_busy: false, adc_chan: 0, ca1_delay: 0, trace: Vec::new(), trace_on: false,
         };
         let mut b = Beeb {
             cpu: Cpu::new(), hw,
             hle: Hle { queue: VecDeque::new(), saved: (0, 0, 0, 0), boot_pending: false, hooked: false },
+            held: Vec::new(), deferred: Vec::new(),
         };
         b.cpu.reset(&mut b.hw);
         b
@@ -258,7 +280,8 @@ impl Beeb {
         self.hw.usr = Via::new();
         self.hle.queue.clear();
         self.hle.hooked = false;
-        self.hle.hooked = false;
+        self.held.clear();
+        self.deferred.clear();
         self.hle.boot_pending = shift_break && self.hw.disc.present();
         self.hw.romsel = 0;
         self.cpu.reset(&mut self.hw);
@@ -271,6 +294,7 @@ impl Beeb {
         self.hw.video.frame_done = false;
         while elapsed < 90_000 {
             elapsed += self.step_once();
+            if !self.deferred.is_empty() { self.release_due(); }
             if self.hw.video.frame_done {
                 if elapsed >= 30_000 { break; }
                 self.hw.video.frame_done = false;
@@ -287,13 +311,50 @@ impl Beeb {
             if down { let s = self.hw.kbd.shift_down(); self.reset(s); }
             return;
         }
-        self.hw.kbd.set(key, down);
+        let now = self.hw.cycles;
+        if down {
+            if let Some(i) = self.deferred.iter().position(|d| d.0 == key) {
+                self.deferred.remove(i);
+                self.hw.kbd.set(key, false);
+            }
+            if !self.held.iter().any(|h| h.0 == key) { self.held.push((key, now)); }
+            self.hw.kbd.set(key, true);
+        } else if let Some(i) = self.held.iter().position(|h| h.0 == key) {
+            let since = self.held[i].1;
+            if now - since < MIN_HOLD {
+                if !self.deferred.iter().any(|d| d.0 == key) { self.deferred.push((key, since + MIN_HOLD)); }
+                return;
+            }
+            self.held.remove(i);
+            self.hw.kbd.set(key, false);
+        } else {
+            self.hw.kbd.set(key, false);
+        }
         self.hw.update_ca2();
+    }
+
+    fn release_due(&mut self) {
+        let now = self.hw.cycles;
+        let mut i = 0;
+        let mut changed = false;
+        while i < self.deferred.len() {
+            if self.deferred[i].1 <= now {
+                let k = self.deferred.remove(i).0;
+                self.held.retain(|h| h.0 != k);
+                self.hw.kbd.set(k, false);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if changed { self.hw.update_ca2(); }
     }
 
     /// Video frames completed since power-on.
     pub fn frames(&self) -> u64 { self.hw.video.frame }
     pub fn disc_log(&self) -> &[String] { &self.hw.disc.log }
+    pub fn trace_enable(&mut self, on: bool) { self.hw.trace_on = on; self.hw.trace.clear(); }
+    pub fn trace(&self) -> &[(u64, u8, u8)] { &self.hw.trace }
     pub fn pc(&self) -> u16 { self.cpu.pc }
     pub fn peek(&self, addr: u16) -> u8 { self.hw.peek(addr) }
 

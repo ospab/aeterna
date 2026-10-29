@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const RGB: [u32; 8] = [0x000000, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF];
-const STD_TOP: i32 = 36;
+const STD_TOP: i32 = 38;
 const TT_TOP: i32 = 27;
 const STD_LEFT_PX: i32 = 176;
 
@@ -64,6 +64,8 @@ impl Video {
 
     pub fn palette_write(&mut self, v: u8) { self.pal[(v >> 4) as usize] = v & 15; }
 
+    pub fn tvline(&self) -> i32 { self.tvline }
+
     fn rows_per_char(&self) -> u32 {
         let r9 = self.crtc[9] as u32;
         if self.crtc[8] & 3 == 3 { (r9 >> 1) + 1 } else { r9 + 1 }
@@ -96,7 +98,7 @@ impl Video {
             if self.ra >= rpr {
                 self.ra = 0;
                 if self.row >= self.crtc[4] as u32 {
-                    let adj = self.crtc[5] as u32 + if self.crtc[8] & 1 != 0 && self.odd { 1 } else { 0 };
+                    let adj = self.crtc[5] as u32;
                     if adj > 0 { self.in_adjust = true; self.adjust = adj; } else { self.new_frame(); }
                 } else {
                     self.row += 1;
