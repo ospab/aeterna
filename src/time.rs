@@ -43,55 +43,65 @@ impl Source {
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-/// Wall time at the moment `BASE_MONO` was taken.
-static mut BASE_NS:   i64 = 0;
-static mut BASE_MONO: u64 = 0;
-static mut SOURCE:    Source = Source::None;
+/// Wall-clock base, behind one lock (class TIME) so a reader never sees a half-updated pair.
+struct Clock {
+    /// Wall time at the moment `mono` was taken.
+    base_ns: i64,
+    base_mono: u64,
+    source: Source,
+    /// RTC - UTC, learned from NTP.
+    rtc_offset_secs: i64,
+}
 
-/// TSC value our monotonic clock counts from (0 = TSC not calibrated, use PIT ticks).
-static mut MONO_TSC0: u64 = 0;
-static mut MONO_MHZ:  u64 = 0;
+static CLOCK: crate::core::sync::IrqSpinLock<Clock> = crate::core::sync::IrqSpinLock::new(
+    "TIME",
+    crate::core::sync::rank::TIME,
+    Clock { base_ns: 0, base_mono: 0, source: Source::None, rtc_offset_secs: 0 },
+);
+
+/// TSC value our monotonic clock counts from, and its MHz (0 = TSC not calibrated, use PIT
+/// ticks). Written once by `init`.
+static MONO_TSC0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static MONO_MHZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Monotonic nanoseconds since `init`. 128-bit math, so it does not wrap after
 /// a few weeks of uptime the way `cycles * 1000` in u64 would.
 pub fn monotonic_ns() -> u64 {
-    unsafe {
-        if MONO_MHZ == 0 {
-            return idt::timer_ticks().saturating_mul(10_000_000); // 100 Hz PIT
-        }
-        let cycles = tsc::read().wrapping_sub(MONO_TSC0) as u128;
-        (cycles * 1000 / MONO_MHZ as u128) as u64
+    let mhz = MONO_MHZ.load(core::sync::atomic::Ordering::Relaxed);
+    if mhz == 0 {
+        return idt::timer_ticks().saturating_mul(10_000_000); // 100 Hz PIT
     }
+    let tsc0 = MONO_TSC0.load(core::sync::atomic::Ordering::Relaxed);
+    let cycles = tsc::read().wrapping_sub(tsc0) as u128;
+    (cycles * 1000 / mhz as u128) as u64
 }
 
 /// Current time, ns since 2012-08-09 00:00:00 UTC.
 pub fn now() -> i64 {
-    unsafe {
-        let elapsed = monotonic_ns().wrapping_sub(BASE_MONO);
-        BASE_NS.saturating_add(elapsed.min(i64::MAX as u64) as i64)
-    }
+    let mono = monotonic_ns();
+    let c = CLOCK.lock();
+    let elapsed = mono.wrapping_sub(c.base_mono);
+    c.base_ns.saturating_add(elapsed.min(i64::MAX as u64) as i64)
 }
 
 /// Whole seconds since the ospab epoch (floor, also for negative times).
 pub fn now_secs() -> i64 { now().div_euclid(NS_PER_SEC) }
 
-pub fn source() -> Source { unsafe { SOURCE } }
+pub fn source() -> Source { CLOCK.lock().source }
 
 /// Set the wall clock.
 pub fn set(ns: i64, src: Source) {
-    unsafe {
-        BASE_MONO = monotonic_ns();
-        BASE_NS   = ns;
-        SOURCE    = src;
-    }
+    let mono = monotonic_ns();
+    let mut c = CLOCK.lock();
+    c.base_mono = mono;
+    c.base_ns = ns;
+    c.source = src;
 }
 
 /// Seed the clock from the CMOS RTC. Call once the TSC is calibrated.
 pub fn init() {
-    unsafe {
-        MONO_MHZ  = tsc::mhz();
-        MONO_TSC0 = tsc::read();
-    }
+    MONO_TSC0.store(tsc::read(), core::sync::atomic::Ordering::Relaxed);
+    MONO_MHZ.store(tsc::mhz(), core::sync::atomic::Ordering::Relaxed);
     let (y, mo, d, h, mi, s) = read_rtc();
     if (1..=12).contains(&mo) && (1..=31).contains(&d) && h < 24 && mi < 60 && s < 61 {
         // RTC_OFFSET_SECS is still 0 here; the saved offset is applied once the VFS is up.
@@ -114,18 +124,15 @@ pub fn init() {
 
 pub const RTC_OFFSET_FILE: &str = "/etc/rtc_offset";
 
-static mut RTC_OFFSET_SECS: i64 = 0;
-
-pub fn rtc_offset() -> i64 { unsafe { RTC_OFFSET_SECS } }
+pub fn rtc_offset() -> i64 { CLOCK.lock().rtc_offset_secs }
 
 /// Set the RTC − UTC offset; a clock still running on the RTC is corrected at once.
 pub fn set_rtc_offset(secs: i64) {
-    unsafe {
-        let delta = secs - RTC_OFFSET_SECS;
-        RTC_OFFSET_SECS = secs;
-        if SOURCE == Source::Rtc {
-            BASE_NS = BASE_NS.saturating_sub(delta.saturating_mul(NS_PER_SEC));
-        }
+    let mut c = CLOCK.lock();
+    let delta = secs - c.rtc_offset_secs;
+    c.rtc_offset_secs = secs;
+    if c.source == Source::Rtc {
+        c.base_ns = c.base_ns.saturating_sub(delta.saturating_mul(NS_PER_SEC));
     }
 }
 
@@ -143,7 +150,7 @@ pub fn learn_rtc_offset() -> Option<i64> {
         return None; // RTC is simply off; not a time-zone offset
     }
     if rounded == rtc_offset() { return None; }
-    unsafe { RTC_OFFSET_SECS = rounded; }
+    CLOCK.lock().rtc_offset_secs = rounded;
     Some(rounded)
 }
 

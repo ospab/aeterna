@@ -39,6 +39,10 @@ static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 /// VMM initialized flag
 static VMM_INIT: AtomicBool = AtomicBool::new(false);
 
+/// Lock class VMM: serializes page-table edits (intermediate tables are allocated and
+/// freed under it). Taken after SCHED/OBJ, before PMM. Interrupt handlers may take it.
+static PT_LOCK: crate::core::sync::IrqSpinLock<()> = crate::core::sync::IrqSpinLock::new("VMM", crate::core::sync::rank::VMM, ());
+
 // ─── Page table entry flags (x86_64) ────────────────────────────────────────
 
 /// Page is present in memory
@@ -279,6 +283,7 @@ fn alloc_table_frame() -> Option<u64> {
 /// Missing intermediate tables (PDPT, PD, PT) are allocated automatically.
 /// Returns true on success, false if a table frame could not be allocated.
 pub fn map_page(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> bool {
+    let _pt = PT_LOCK.lock();
     let flags = flags | FLAG_PRESENT;
 
     let i4 = pml4_index(virt);
@@ -351,6 +356,7 @@ pub fn unmap_page(pml4_phys: u64, virt: u64) -> Option<u64> {
 
 /// Like `unmap_page`, but also returns the flags the mapping had (e.g. `FLAG_OWNED`).
 pub fn unmap_page_entry(pml4_phys: u64, virt: u64) -> Option<(u64, u64)> {
+    let _pt = PT_LOCK.lock();
     let i4 = pml4_index(virt);
     let i3 = pdpt_index(virt);
     let i2 = pd_index(virt);
@@ -394,6 +400,7 @@ pub fn unmap_page_current(virt: u64) -> Option<u64> {
 ///
 /// Handles 4K pages, 2 MiB huge pages, and 1 GiB huge pages.
 pub fn translate(pml4_phys: u64, virt: u64) -> Option<u64> {
+    let _pt = PT_LOCK.lock();
     let i4 = pml4_index(virt);
     let i3 = pdpt_index(virt);
     let i2 = pd_index(virt);
@@ -475,6 +482,7 @@ pub fn map_range_current(virt_start: u64, phys_start: u64, page_count: u64, flag
 /// Lower-half (0..255) is zeroed: clean user address space.
 /// Returns the physical address of the new PML4, or None on OOM.
 pub fn create_address_space() -> Option<u64> {
+    let _pt = PT_LOCK.lock();
     let new_pml4_phys = alloc_table_frame()?;
 
     // Always source from the saved boot kernel PML4, not from whatever
@@ -551,6 +559,7 @@ pub fn nx_flag() -> u64 {
 /// Must not be called on the active CR3 or on the kernel PML4. Returns the number
 /// of owned user frames freed.
 pub fn destroy_address_space(pml4_phys: u64) -> u64 {
+    let _pt = PT_LOCK.lock();
     use crate::mm::physical::free_frame;
     let pml4_phys = pml4_phys & ADDR_MASK;
     let kernel = KERNEL_PML4_PHYS.load(Ordering::Relaxed) & ADDR_MASK;
@@ -600,6 +609,7 @@ pub fn destroy_address_space(pml4_phys: u64) -> u64 {
 }
 
 pub fn sync_kernel_mappings(task_pml4: u64) {
+    let _pt = PT_LOCK.lock();
     let kernel_pml4_phys = KERNEL_PML4_PHYS.load(Ordering::Relaxed);
     if kernel_pml4_phys == 0 || task_pml4 == kernel_pml4_phys {
         return; // nothing to do
@@ -624,6 +634,7 @@ pub unsafe fn switch_address_space(pml4_phys: u64) {
 /// Count how many 4K pages are mapped in the lower half (user space)
 /// of the given address space.
 pub fn count_user_pages(pml4_phys: u64) -> u64 {
+    let _pt = PT_LOCK.lock();
     let mut count: u64 = 0;
     unsafe {
         let pml4 = table_at_phys(pml4_phys);

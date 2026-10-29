@@ -24,7 +24,7 @@ pub const USER_END: u64 = 0x0000_8000_0000_0000;
 /// Set once at boot if CR4.SMAP was enabled; the copy routine then brackets
 /// the access with STAC/CLAC (those instructions #UD without SMAP support).
 #[no_mangle]
-static mut OOS_SMAP_ENABLED: u8 = 0;
+static OOS_SMAP_ENABLED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Copy `len` bytes from `src` to `dst`. Returns the number of bytes NOT copied:
 /// 0 on success, non-zero if a page fault stopped the copy.
@@ -172,7 +172,7 @@ pub fn init() -> (bool, bool) {
         }
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
         if smap {
-            OOS_SMAP_ENABLED = 1;
+            OOS_SMAP_ENABLED.store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
     serial("[USERCOPY] SMEP ");

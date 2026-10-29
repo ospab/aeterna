@@ -52,19 +52,12 @@ impl DhcpLease {
 }
 
 // ─── RX buffer — written by UDP handler, read by dhcp code ───────────────
-static mut DHCP_RX_BUF: [u8; 576] = [0; 576];
-static mut DHCP_RX_LEN: usize = 0;
-static DHCP_RX_READY: AtomicBool = AtomicBool::new(false);
+static DHCP_RX: super::Mailbox<576> = super::Mailbox::new("DHCP.rx");
 
 /// Called from UDP dispatch when dst_port == 68
 pub fn handle_dhcp_udp(data: &[u8]) {
     if data.len() < 240 { return; }
-    let copy = data.len().min(576);
-    unsafe {
-        DHCP_RX_BUF[..copy].copy_from_slice(&data[..copy]);
-        DHCP_RX_LEN = copy;
-    }
-    DHCP_RX_READY.store(true, Ordering::Release);
+    DHCP_RX.put(data, 0);
 }
 
 // ─── Unique transaction ID derived from MAC ──────────────────────────────
@@ -270,14 +263,12 @@ fn send_dhcp_raw(mac: [u8; 6], payload: &[u8], payload_len: usize) {
 
 // ─── Wait for DHCP reply ─────────────────────────────────────────────────
 fn wait_dhcp_reply(xid: u32, timeout_ticks: u64) -> Option<(u8, DhcpLease)> {
-    DHCP_RX_READY.store(false, Ordering::Release);
+    DHCP_RX.clear();
     let start = crate::arch::x86_64::idt::timer_ticks();
     loop {
         super::poll_rx();
-        if DHCP_RX_READY.load(Ordering::Acquire) {
-            DHCP_RX_READY.store(false, Ordering::Release);
-            let len = unsafe { DHCP_RX_LEN };
-            let data = unsafe { &DHCP_RX_BUF[..len] };
+        if let Some(pkt) = DHCP_RX.take() {
+            let data = &pkt[..];
             if let Some(result) = parse_dhcp_reply(data, xid) {
                 return Some(result);
             }

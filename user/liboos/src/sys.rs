@@ -9,6 +9,7 @@ pub mod nr {
     pub const READ: u64 = 2;
     pub const OPEN: u64 = 3;
     pub const CLOSE: u64 = 4;
+    pub const SEEK: u64 = 5;
     pub const YIELD: u64 = 20;
     pub const GETPID: u64 = 22;
     pub const WAITPID: u64 = 32;

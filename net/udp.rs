@@ -7,13 +7,9 @@
  *   - Generic listener (SNTP and future protocols)
  */
 
-use core::sync::atomic::{AtomicBool, Ordering};
 
 // Generic UDP receive buffer (used by SNTP and other one-shot listeners)
-static mut UDP_RX_BUF: [u8; 512] = [0; 512];
-static mut UDP_RX_LEN: usize = 0;
-static mut UDP_RX_PORT: u16 = 0;
-static UDP_RX_READY: AtomicBool = AtomicBool::new(false);
+static UDP_RX: super::Mailbox<512> = super::Mailbox::new("UDP.rx");
 
 /// Handle incoming UDP packet (IPv4 payload)
 pub fn handle_udp(data: &[u8], _src_ip: [u8; 4]) {
@@ -49,14 +45,9 @@ pub fn handle_udp(data: &[u8], _src_ip: [u8; 4]) {
     }
 
     // Generic listener (SNTP, etc.)
-    unsafe {
-        if dst_port == UDP_RX_PORT || UDP_RX_PORT == 0 {
-            let copy_len = payload.len().min(512);
-            UDP_RX_BUF[..copy_len].copy_from_slice(&payload[..copy_len]);
-            UDP_RX_LEN = copy_len;
-            UDP_RX_PORT = dst_port;
-            UDP_RX_READY.store(true, Ordering::Relaxed);
-        }
+    let listen = UDP_RX.port();
+    if dst_port == listen || listen == 0 {
+        UDP_RX.put(payload, dst_port);
     }
 }
 
@@ -90,22 +81,20 @@ pub fn send_udp(dst_ip: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) {
     pkt[8..8 + payload.len()].copy_from_slice(payload);
 
     // Listen for reply on src_port
-    unsafe { UDP_RX_PORT = src_port; }
-    UDP_RX_READY.store(false, Ordering::Relaxed);
+    UDP_RX.set_port(src_port);
+    UDP_RX.clear();
 
     super::ipv4::send_ipv4(17, dst_ip, &pkt[..udp_len]);
 }
 
 /// Wait for a UDP packet on the listening port. Returns payload or None.
-pub fn wait_rx(timeout_ticks: u64) -> Option<&'static [u8]> {
+pub fn wait_rx(timeout_ticks: u64) -> Option<alloc::vec::Vec<u8>> {
     let start = crate::arch::x86_64::idt::timer_ticks();
     loop {
         super::poll_rx();
 
-        if UDP_RX_READY.load(Ordering::Relaxed) {
-            UDP_RX_READY.store(false, Ordering::Relaxed);
-            let len = unsafe { UDP_RX_LEN };
-            return Some(unsafe { &UDP_RX_BUF[..len] });
+        if let Some(pkt) = UDP_RX.take() {
+            return Some(pkt);
         }
 
         let now = crate::arch::x86_64::idt::timer_ticks();

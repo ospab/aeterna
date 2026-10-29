@@ -82,6 +82,26 @@ the receiver's table.
 the CPU halts, and the other side (or the deadline) wakes it. When no handle with `READ` is left on
 a channel, the channel closes and every pending `call` gets `PeerClosed`.
 
+## Files and standard streams
+
+Per-process descriptor table (`core/fd.rs`, see [Kernel internals](kernel.md)). Numbers are
+unchanged:
+
+| No. | Call | Arguments → result |
+|---|---|---|
+| 0 | exit | code |
+| 1 | write | fd, buf*, len → bytes written |
+| 2 | read | fd, buf*, len → bytes read, 0 at end of input |
+| 3 | open | path*, path_len, flags (0 read, 1 write/create, 2 read+write) → fd ≥ 3 |
+| 4 | close | fd → 0 |
+| 5 | seek | fd, offset, whence (0 set, 1 current, 2 end) → new offset |
+
+fd 0, 1 and 2 exist in every process and cannot be closed. Descriptors are private to the
+process and are closed when it exits; at most 64 per process. `read(0)` on the console blocks
+for a typed line (echo, Backspace, Ctrl+D = end of input; Ctrl+C makes the shell kill the
+program). A closed or unknown descriptor returns -1. The filesystem calls need the FsRead and
+FsWrite capabilities.
+
 ## Shared memory (stage 2, item 12)
 
 A **MemoryRegion** is a set of physical pages owned by the kernel object. `mem_create` makes an

@@ -214,7 +214,7 @@ fn screen_write_raw(s: &str, color: u32) {
     for ch in s.chars() {
         if ch == '\t' {
             let (x, _) = framebuffer::cursor_pos();
-            let col = (x / framebuffer::CHAR_WIDTH) as usize;
+            let col = (x / framebuffer::cell_w()) as usize;
             let n = 8 - (col % 8);
             for _ in 0..n {
                 framebuffer::draw_char(' ', color, BG);
@@ -406,6 +406,32 @@ pub fn clear_interrupt() {
 
 // ─── Console line input (read builtin) ──────────────────────────────────────
 
+/// Echo typed text on the console, regardless of where the shell's stdout points.
+pub fn echo(text: &str) {
+    console::draw_string(text, FG, BG);
+}
+
+/// Echo a Ctrl+C.
+pub fn echo_interrupt() {
+    console::draw_string("^C
+", FG_DIM, BG);
+}
+
+/// Erase the character left of the cursor on the console (echo of a backspace).
+pub fn echo_erase() {
+    if screen_hooked() {
+        console::draw_string("\x08", FG, BG);
+    } else {
+        let (x, y) = framebuffer::cursor_pos();
+        if x >= framebuffer::cell_w() {
+            let nx = x - framebuffer::cell_w();
+            framebuffer::set_cursor_pos(nx, y);
+            framebuffer::draw_char(' ', FG, BG);
+            framebuffer::set_cursor_pos(nx, y);
+        }
+    }
+}
+
 /// Read a line from the keyboard with echo.  Returns None on Ctrl+C.
 pub fn read_console_line() -> Option<String> {
     let mut line = String::new();
@@ -426,17 +452,8 @@ pub fn read_console_line() -> Option<String> {
                 return None;
             }
             '\x08' => {
-                let popped = line.pop().is_some();
-                if popped && screen_hooked() {
-                    console::draw_string("\x08", FG, BG);
-                } else if popped {
-                    let (x, y) = framebuffer::cursor_pos();
-                    if x >= framebuffer::CHAR_WIDTH {
-                        let nx = x - framebuffer::CHAR_WIDTH;
-                        framebuffer::set_cursor_pos(nx, y);
-                        framebuffer::draw_char(' ', FG, BG);
-                        framebuffer::set_cursor_pos(nx, y);
-                    }
+                if line.pop().is_some() {
+                    echo_erase();
                 }
             }
             c if (c as u32) >= 0x20 && (c as u32) < 0x7F => {

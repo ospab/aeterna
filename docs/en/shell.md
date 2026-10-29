@@ -36,6 +36,7 @@ one after another, not concurrently.
 - Network: `ip`, `ifconfig`, `ping`, `nslookup`, `curl`, `traceroute`, `netstat`, `ntpdate`,
   `ostp`. See [Networking](networking.md).
 - Apps: `grape` (text editor), `tomato` (packages), `doom`, `soundtest`, `vol`, `clip`.
+- Display: `display` (see below).
 
 `help` lists everything; `help <command>` explains one command.
 
@@ -72,6 +73,22 @@ pasted link never runs a command on its own.
 The console also accepts input from the first serial port. In VMware add a serial port using a
 named pipe (for example `\\.\pipe\ospab`), connect PuTTY to it as a serial line, and paste with a
 right click. In QEMU use `-serial stdio`.
+
+## Display
+
+```
+# display                   current mode, console grid, driver, autofit state
+# display list              modes that can be set (* marks the current one)
+# display set fullhd        also: 1280x720, hd, 2k, 4k, "display set 1920 1080"
+# display auto              follow the VMware window size (display auto off to stop)
+# display scale 2           console font scale: 1, 2 or auto (2 from 2560 px wide)
+```
+
+`display set` switches at once, turns autofit off and saves the mode in `/etc/display.conf`;
+it is applied at the next boot. Changing the mode works only on the VMware SVGA II adapter
+(VMware, QEMU `-vga vmware`); elsewhere `display list` shows the boot mode only. The text on the
+console is redrawn at the new size; lines longer than the new width are cut. See
+[Hardware](hardware.md#display-modes-and-autofit).
 
 ## Time
 

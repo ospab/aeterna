@@ -33,6 +33,7 @@ pub enum SyscallNumber {
     Open = 3,
     /// Close a file descriptor
     Close = 4,
+    Seek = 5,
     /// Send IPC message (target_pid, msg_ptr, msg_len)
     IpcSend = 10,
     /// Receive IPC message (buf_ptr, buf_len) -> (sender_pid, msg_len)
@@ -152,6 +153,7 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (2,  |a| syscall_read(a.arg1, a.arg2, a.arg3)),
     (3,  |a| syscall_open(a.arg1, a.arg2, a.arg3)),
     (4,  |a| syscall_close(a.arg1)),
+    (5,  |a| syscall_seek(a.arg1, a.arg2, a.arg3)),
     (20, |_| syscall_yield()),
     (22, |_| syscall_getpid()),
     (23, |a| syscall_spawn(a.arg1, a.arg2, a.arg3)),
@@ -393,7 +395,7 @@ fn syscall_exit(code: u64) -> i64 {
     // ring 3, based on the frame of the task it resumes.
     unsafe {
         loop {
-            core::arch::asm!("sti; hlt", options(nomem, nostack));
+            core::arch::asm!("sti; hlt", options(nostack));
         }
     }
 }
@@ -475,27 +477,20 @@ fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     let len = (len as usize).min(MAX_IO_CHUNK);
     if fd == 0 && CONSOLE_STDOUT.load(core::sync::atomic::Ordering::Relaxed) && len >= 1 {
         // A program run by the shell reads the shell's stdin: piped / redirected data
-        // (0 bytes = end of input), or, on the console, one typed character (echoed),
-        // sleeping until a key arrives. The shell kills the program on Ctrl+C.
+        // (0 bytes = end of input), or, on the console, a typed line (core/stdin.rs).
+        // The shell kills the program on Ctrl+C.
         if let Some(chunk) = crate::userspace::plum::io::read_stdin_bytes(len) {
             return match crate::mm::usercopy::copy_to_user(buf_ptr, &chunk) {
                 Ok(()) => chunk.len() as i64,
                 Err(e) => SyscallError::from(e) as i64,
             };
         }
-        loop {
-            if let Some(ch) = crate::arch::x86_64::keyboard::poll_key() {
-                let mut tmp = [0u8; 4];
-                let bytes = ch.encode_utf8(&mut tmp).as_bytes();
-                crate::userspace::plum::io::out(core::str::from_utf8(bytes).unwrap_or(""));
-                let n = bytes.len().min(len);
-                return match crate::mm::usercopy::copy_to_user(buf_ptr, &bytes[..n]) {
-                    Ok(()) => n as i64,
-                    Err(e) => SyscallError::from(e) as i64,
-                };
-            }
-            crate::core::scheduler::sys_yield();
-        }
+        // Console: line discipline with echo, see core/stdin.rs. Blocks for a line.
+        let chunk = crate::core::stdin::read_console(len);
+        return match crate::mm::usercopy::copy_to_user(buf_ptr, &chunk) {
+            Ok(()) => chunk.len() as i64,
+            Err(e) => SyscallError::from(e) as i64,
+        };
     }
     if fd == 0 {
         // stdin: read one key from keyboard
@@ -553,6 +548,20 @@ fn syscall_open(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
     match crate::mm::usercopy::read_user_str(path_ptr, path_len as usize, MAX_PATH) {
         Ok(path) => crate::fs::sys_open(&path, flags),
         Err(e) => SyscallError::from(e) as i64,
+    }
+}
+
+/// sys_seek(fd, offset, whence) — whence 0 = SET, 1 = CUR, 2 = END. Returns the new offset.
+fn syscall_seek(fd: u64, offset: u64, whence: u64) -> i64 {
+    if !can_fs_read() {
+        return SyscallError::PermissionDenied as i64;
+    }
+    if whence > 2 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    match crate::fs::sys_seek(fd as usize, offset as i64, whence as i32) {
+        r if r >= 0 => r,
+        _ => SyscallError::InvalidArgument as i64,
     }
 }
 

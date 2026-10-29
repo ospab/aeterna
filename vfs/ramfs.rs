@@ -67,9 +67,8 @@ impl RamFs {
     }
 
     fn lock(&self) {
-        while self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
+        // Task-level lock: a contender yields the CPU (a preempted holder gets to run).
+        crate::core::sync::yield_lock(&self.lock);
     }
 
     fn unlock(&self) {

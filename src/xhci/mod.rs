@@ -333,14 +333,14 @@ fn dma_alloc(pages: u64) -> Option<(u64, u64)> {
 fn irq_save_cli() -> u64 {
     let flags: u64;
     // SAFETY: save RFLAGS and disable interrupts.
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)) };
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options()) };
     flags
 }
 
 fn irq_restore(flags: u64) {
     if flags & (1 << 9) != 0 {
         // SAFETY: interrupts were on before.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("sti", options(nostack)) };
     }
 }
 

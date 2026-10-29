@@ -105,8 +105,8 @@ fn fb_rows() -> usize { framebuffer::screen_rows() as usize }
 
 /// Draw a character at a specific cell (col, row)
 fn draw_at(col: usize, row: usize, ch: char, fg: u32, bg: u32) {
-    let x = (col as u64) * framebuffer::CHAR_WIDTH;
-    let y = (row as u64) * framebuffer::CHAR_HEIGHT;
+    let x = (col as u64) * framebuffer::cell_w();
+    let y = (row as u64) * framebuffer::cell_h();
     framebuffer::draw_char_at(x, y, ch, fg, bg);
 }
 

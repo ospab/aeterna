@@ -6,7 +6,11 @@ Uses linked_list_allocator backed by physical memory from Limine.
 Heap size: 128 MiB (per tech-manifest п.2).
 */
 
-use linked_list_allocator::LockedHeap;
+use crate::core::sync::{IrqSpinLock, OnceCell};
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use linked_list_allocator::Heap;
 
 /// Maximum desired heap size (128 MiB). The allocator will try this first,
 /// then fall back to smaller sizes so the kernel boots on low-memory and
@@ -16,25 +20,37 @@ pub const HEAP_SIZE_MAX: usize = 128 * 1024 * 1024;
 /// Minimum acceptable heap size (4 MiB)
 const HEAP_SIZE_MIN: usize = 4 * 1024 * 1024;
 
-/// Actual heap size chosen at boot (set during init)
-static mut HEAP_ACTUAL: usize = 0;
+/// Actual heap size chosen at boot (set during init).
+static HEAP_ACTUAL: AtomicUsize = AtomicUsize::new(0);
+static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static HEAP_START: OnceCell<u64> = OnceCell::new();
 
-/// Kernel heap start address (virtual).
-static mut HEAP_START: u64 = 0;
-static mut HEAP_INITIALIZED: bool = false;
+/// Global allocator: the heap behind an IRQ-safe spinlock (lock class HEAP, the innermost
+/// lock: nothing may be taken while it is held). Interrupt handlers may allocate and free.
+struct KernelHeap(IrqSpinLock<Heap>);
+
+unsafe impl GlobalAlloc for KernelHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.0.lock().allocate_first_fit(layout).ok().map_or(core::ptr::null_mut(), |p| p.as_ptr())
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if let Some(p) = NonNull::new(ptr) {
+            self.0.lock().deallocate(p, layout);
+        }
+    }
+}
 
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: KernelHeap = KernelHeap(IrqSpinLock::new("HEAP", crate::core::sync::rank::HEAP, Heap::empty()));
 
-/// True while some code holds the heap lock (an interrupt handler must not allocate or
-/// free then: it would wait for itself).
+/// True while some context holds the heap lock (diagnostics only).
 pub fn is_locked() -> bool {
-    ALLOCATOR.is_locked()
+    ALLOCATOR.0.is_locked()
 }
 
 /// Get the actual heap size that was allocated
 pub fn heap_size() -> usize {
-    unsafe { HEAP_ACTUAL }
+    HEAP_ACTUAL.load(Ordering::Relaxed)
 }
 
 /// Initialize the kernel heap.
@@ -51,12 +67,11 @@ pub fn init() {
         let frames = (try_size as u64) / crate::mm::physical::FRAME_SIZE;
         if let Some(phys) = crate::mm::physical::alloc_frames(frames) {
             let virt_base = phys + hhdm_offset;
-            unsafe {
-                HEAP_START = virt_base;
-                HEAP_ACTUAL = try_size;
-                ALLOCATOR.lock().init(virt_base as *mut u8, try_size);
-                HEAP_INITIALIZED = true;
-            }
+            let _ = HEAP_START.set(virt_base);
+            HEAP_ACTUAL.store(try_size, Ordering::Relaxed);
+            // SAFETY: the range was just allocated from the frame allocator and is mapped by the HHDM.
+            unsafe { ALLOCATOR.0.lock().init(virt_base as *mut u8, try_size) };
+            HEAP_INITIALIZED.store(true, Ordering::Release);
             serial("[MM] Heap initialized: ");
             // Print size in MiB
             let mib = try_size / (1024 * 1024);
@@ -93,12 +108,12 @@ fn fmt_u32(mut v: u32, buf: &mut [u8; 4]) -> &str {
 
 /// Check if heap is initialized
 pub fn is_initialized() -> bool {
-    unsafe { HEAP_INITIALIZED }
+    HEAP_INITIALIZED.load(Ordering::Acquire)
 }
 
 /// Get heap usage statistics
 pub fn stats() -> (usize, usize) {
-    let allocator = ALLOCATOR.lock();
+    let allocator = ALLOCATOR.0.lock();
     let free = allocator.free();
     let total = heap_size();
     let used = if total > free { total - free } else { 0 };

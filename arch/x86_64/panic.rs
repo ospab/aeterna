@@ -106,6 +106,7 @@ pub fn render_panic_screen(
     }
     // A panic can hit while the terminal pager is active; never page here.
     framebuffer::pager_end();
+    framebuffer::reset_scale_for_panic();
     framebuffer::clear(COLOR_BG);
 
     let width = framebuffer::info().map(|f| f.width).unwrap_or(640);

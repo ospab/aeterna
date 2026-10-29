@@ -425,6 +425,11 @@ pub fn deferred_tick() {
     sync_filesystem();
 }
 
+/// The raw pointer is an HHDM address of frames owned by this slot.
+unsafe impl Send for MedToken {}
+
+static MED_BUF: crate::core::sync::Mutex<Option<MedToken>> = crate::core::sync::Mutex::new(None);
+
 /// Scratch buffer token for lock-free serialization (Deterministic Memory Fabric).
 #[derive(Copy, Clone)]
 struct MedToken {
@@ -475,13 +480,15 @@ pub fn sync_filesystem() -> bool {
     let frames_needed = ((total_bytes + 4095) / 4096) as u64;
 
     // Deterministic Memory Fabric: allocate/retain a dedicated MED token for serialization.
-    static mut MED_BUF: Option<MedToken> = None;
-    let med = unsafe {
-        match &MED_BUF {
+    // The slot is a task-level mutex: it also serializes concurrent syncs (shell `sync`
+    // against the deferred flush) over the one buffer and the disk.
+    let mut med_slot = MED_BUF.lock();
+    let med = {
+        match &*med_slot {
             Some(tok) if tok.capacity >= total_bytes => MedToken { phys: tok.phys, virt: tok.virt, capacity: tok.capacity },
             _ => {
                 // Growing: give the old buffer back before taking a bigger one.
-                if let Some(old) = MED_BUF.take() {
+                if let Some(old) = med_slot.take() {
                     crate::mm::physical::free_frames(old.phys, (old.capacity / 4096) as u64);
                 }
                 if let Some(p) = crate::mm::physical::alloc_frames(frames_needed) {
@@ -489,7 +496,7 @@ pub fn sync_filesystem() -> bool {
                     let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0xFFFF_8000_0000_0000);
                     let virt = (p + hhdm) as *mut u8;
                     let tok = MedToken { phys: p, virt, capacity: cap };
-                    MED_BUF = Some(tok);
+                    *med_slot = Some(tok);
                     tok
                 } else {
                     return false;

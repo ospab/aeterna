@@ -63,7 +63,71 @@ pub const NIC_RTL8169: u8 = 3;
 pub const NIC_PCNET: u8 = 4;
 pub const NIC_VMXNET3: u8 = 5;
 pub const NIC_NONE: u8 = 0xFF;
-static mut ACTIVE_NIC: u8 = NIC_NONE;
+static ACTIVE_NIC_ID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(NIC_NONE);
+
+/// The NIC driver in use (one of the NIC_* constants). Set once by `init`.
+pub fn active_nic() -> u8 {
+    ACTIVE_NIC_ID.load(Ordering::Relaxed)
+}
+
+/// A one-slot receive mailbox for a UDP-based protocol: the packet path (NIC interrupt or
+/// a polling task) puts a datagram in, the waiting task takes a copy out. Lock class DEV,
+/// IRQ-safe; nothing is returned by reference.
+pub struct Mailbox<const N: usize> {
+    inner: crate::core::sync::IrqSpinLock<MailboxInner<N>>,
+}
+
+struct MailboxInner<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+    port: u16,
+    ready: bool,
+}
+
+impl<const N: usize> Mailbox<N> {
+    pub const fn new(name: &'static str) -> Self {
+        Mailbox {
+            inner: crate::core::sync::IrqSpinLock::new(
+                name,
+                crate::core::sync::rank::DEV,
+                MailboxInner { buf: [0; N], len: 0, port: 0, ready: false },
+            ),
+        }
+    }
+
+    /// Store a datagram (truncated to N bytes), replacing an unread one.
+    pub fn put(&self, data: &[u8], port: u16) {
+        let mut m = self.inner.lock();
+        let n = data.len().min(N);
+        m.buf[..n].copy_from_slice(&data[..n]);
+        m.len = n;
+        m.port = port;
+        m.ready = true;
+    }
+
+    /// Take the datagram out, if one arrived.
+    pub fn take(&self) -> Option<alloc::vec::Vec<u8>> {
+        let mut m = self.inner.lock();
+        if !m.ready {
+            return None;
+        }
+        m.ready = false;
+        Some(m.buf[..m.len].to_vec())
+    }
+
+    /// Forget an unread datagram.
+    pub fn clear(&self) {
+        self.inner.lock().ready = false;
+    }
+
+    pub fn port(&self) -> u16 {
+        self.inner.lock().port
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.inner.lock().port = port;
+    }
+}
 // Packet counters
 static RX_PKTS: AtomicU64 = AtomicU64::new(0);
 static TX_PKTS: AtomicU64 = AtomicU64::new(0);
@@ -80,7 +144,7 @@ pub fn tx_bytes() -> u64 { TX_BYTES.load(Ordering::Relaxed) }
 /// Check actual hardware link state from the active NIC.
 pub fn link_up() -> bool {
     if !is_up() { return false; }
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => virtio_net::link_up(),
         NIC_RTL8139 => rtl8139::link_up(),
         NIC_E1000   => e1000::link_up(),
@@ -156,7 +220,7 @@ pub fn init() -> bool {
     };
 
     // Store which NIC is active so poll_rx / send_raw know which to call
-    unsafe { ACTIVE_NIC = nic; }
+    ACTIVE_NIC_ID.store(nic, Ordering::Relaxed);
     s("[NET] Using NIC driver: ");
     s(nic_model());
     s("\r\n");
@@ -288,7 +352,7 @@ fn poll_rx_inner() {
             }
         }
     }
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => drain(virtio_net::receive_packet),
         NIC_RTL8139 => drain(rtl8139::receive_packet),
         NIC_E1000   => drain(e1000::receive_packet),
@@ -304,7 +368,7 @@ pub fn send_raw(buf: &[u8], len: usize) {
     NET_BUSY.fetch_add(1, Ordering::Acquire);
     TX_PKTS.fetch_add(1, Ordering::Relaxed);
     TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => virtio_net::send_packet(buf, len),
         NIC_RTL8139 => rtl8139::send_packet(buf, len),
         NIC_E1000   => e1000::send_packet(buf, len),
@@ -325,7 +389,7 @@ pub fn send_raw(buf: &[u8], len: usize) {
 /// All network paths also work purely by polling, so a NIC whose IRQ is not
 /// routed (e.g. IRQ line > 15 behind a bridge) still works.
 pub fn handle_net_irq() {
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => virtio_net::handle_irq(),
         NIC_RTL8139 => rtl8139::handle_irq(),
         NIC_E1000   => e1000::handle_irq(),
@@ -343,7 +407,7 @@ pub fn handle_net_irq() {
 /// For e1000: (STATUS, ICR, RDH, RDT)
 /// For RTL8139: (ISR as u32, CMD as u32, CBR as u32, CAPR as u32)
 pub fn diag() -> (u32, u32, u32, u32) {
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_RTL8139 => {
             let (isr, cmd, cbr, capr) = rtl8139::diag();
             (isr as u32, cmd as u32, cbr as u32, capr as u32)
@@ -355,7 +419,7 @@ pub fn diag() -> (u32, u32, u32, u32) {
 
 /// Short name of the active NIC driver (for ifconfig / ip / netstat).
 pub fn nic_name() -> &'static str {
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => "VirtIO-Net",
         NIC_RTL8139 => "RTL8139",
         NIC_E1000   => "Intel e1000",
@@ -368,7 +432,7 @@ pub fn nic_name() -> &'static str {
 
 /// Descriptive model string of the active NIC, including PCI vendor:device.
 pub fn nic_model() -> &'static str {
-    match unsafe { ACTIVE_NIC } {
+    match active_nic() {
         NIC_VIRTIO  => "virtio-net (1af4:1000, legacy I/O)",
         NIC_RTL8139 => "Realtek RTL8139 (10ec:8139)",
         NIC_E1000   => "Intel e1000 family (8086:xxxx)",

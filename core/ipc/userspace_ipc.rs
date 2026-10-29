@@ -73,8 +73,17 @@ impl SmrChannel {
 }
 
 /// Global channel table
-static mut CHANNELS: [Option<SmrChannel>; MAX_CHANNELS] = [const { None }; MAX_CHANNELS];
-static mut NEXT_CHANNEL_ID: u32 = 1;
+struct ChanTable {
+    chans: [Option<SmrChannel>; MAX_CHANNELS],
+    next_id: u32,
+}
+
+/// Lock class DEV (leaf: nothing else is taken while it is held).
+static CHAN: crate::core::sync::IrqSpinLock<ChanTable> = crate::core::sync::IrqSpinLock::new(
+    "SMR.chan",
+    crate::core::sync::rank::DEV,
+    ChanTable { chans: [const { None }; MAX_CHANNELS], next_id: 1 },
+);
 
 /// Size of one SMR region: header (64 bytes) + descriptors
 const SMR_REGION_SIZE: u64 = 64 + (core::mem::size_of::<SmrDescriptor>() as u64) * (SMR_CAPACITY as u64);
@@ -106,13 +115,14 @@ pub fn create_channel(owner_pid: u32) -> u32 {
     }
 
     // Find a free slot
+    let mut tbl = CHAN.lock();
     unsafe {
         for i in 0..MAX_CHANNELS {
-            if CHANNELS[i].is_none() {
-                let id = NEXT_CHANNEL_ID;
-                NEXT_CHANNEL_ID += 1;
+            if tbl.chans[i].is_none() {
+                let id = tbl.next_id;
+                tbl.next_id += 1;
 
-                CHANNELS[i] = Some(SmrChannel {
+                tbl.chans[i] = Some(SmrChannel {
                     state: ChannelState::Active,
                     owner_pid,
                     ring_phys: phys,
@@ -147,9 +157,10 @@ pub fn grant_channel_access(channel_id: u32, target_pid: u32) -> bool {
         crate::core::scheduler::Capability::System,
     );
 
+    let mut tbl = CHAN.lock();
     unsafe {
         for i in 0..MAX_CHANNELS {
-            if let Some(ref mut ch) = CHANNELS[i] {
+            if let Some(ref mut ch) = tbl.chans[i] {
                 let header = ch.ring_virt as *mut SmrHeader;
                 if (*header).channel_id == channel_id && ch.state == ChannelState::Active {
                     // Only owner or System-capability holder can grant access
@@ -182,9 +193,10 @@ pub fn grant_channel_access(channel_id: u32, target_pid: u32) -> bool {
 pub fn send_to_channel(channel_id: u32, phys_addr: u64, length: u64) -> i64 {
     let caller_pid = crate::core::scheduler::current_pid();
 
+    let mut tbl = CHAN.lock();
     unsafe {
         for i in 0..MAX_CHANNELS {
-            if let Some(ref ch) = CHANNELS[i] {
+            if let Some(ref ch) = tbl.chans[i] {
                 let header = ch.ring_virt as *mut SmrHeader;
                 if (*header).channel_id == channel_id && ch.state == ChannelState::Active {
                     // Access control check
@@ -218,9 +230,10 @@ pub fn send_to_channel(channel_id: u32, phys_addr: u64, length: u64) -> i64 {
 pub fn recv_from_channel(channel_id: u32) -> (u64, u64) {
     let caller_pid = crate::core::scheduler::current_pid();
 
+    let mut tbl = CHAN.lock();
     unsafe {
         for i in 0..MAX_CHANNELS {
-            if let Some(ref ch) = CHANNELS[i] {
+            if let Some(ref ch) = tbl.chans[i] {
                 let header = ch.ring_virt as *mut SmrHeader;
                 if (*header).channel_id == channel_id && ch.state == ChannelState::Active {
                     // Access control check

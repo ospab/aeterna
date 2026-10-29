@@ -32,6 +32,26 @@ pub fn write(fd: u64, bytes: &[u8]) -> i64 {
     unsafe { sys::syscall3(sys::nr::WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }
 }
 
+/// Open a file (flags: 0 read, 1 write, 2 read+write). Returns a descriptor >= 3 or a negative error.
+pub fn open(path: &str, flags: u64) -> i64 {
+    unsafe { sys::syscall3(sys::nr::OPEN, path.as_ptr() as u64, path.len() as u64, flags) }
+}
+
+/// Read from a descriptor (0 = stdin). Returns bytes read or a negative error.
+pub fn read(fd: u64, buf: &mut [u8]) -> i64 {
+    unsafe { sys::syscall3(sys::nr::READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Close a file descriptor (>= 3).
+pub fn close(fd: u64) -> i64 {
+    unsafe { sys::syscall1(sys::nr::CLOSE, fd) }
+}
+
+/// Move the offset of a file descriptor (whence: 0 set, 1 current, 2 end). Returns the new offset.
+pub fn seek(fd: u64, offset: i64, whence: u64) -> i64 {
+    unsafe { sys::syscall3(sys::nr::SEEK, fd, offset as u64, whence) }
+}
+
 /// Terminate the calling process with `code`.
 pub fn exit(code: i32) -> ! {
     unsafe {

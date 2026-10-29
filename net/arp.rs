@@ -15,21 +15,31 @@ const CACHE_SIZE: usize = 16;
 const ARP_TTL_TICKS: u64 = 3000;
 
 // (valid, ip, mac, timestamp)
-static mut ARP_CACHE: [(bool, [u8; 4], [u8; 6], u64); CACHE_SIZE] =
-    [(false, [0; 4], [0; 6], 0); CACHE_SIZE];
-static mut CACHE_NEXT: usize = 0;
+struct ArpState {
+    cache: [(bool, [u8; 4], [u8; 6], u64); CACHE_SIZE],
+    next: usize,
+}
+
+/// Shared between the packet path (may run in the NIC IRQ) and tasks that resolve addresses.
+static ARP: crate::core::sync::IrqSpinLock<ArpState> = crate::core::sync::IrqSpinLock::new(
+    "ARP",
+    crate::core::sync::rank::DEV,
+    ArpState { cache: [(false, [0; 4], [0; 6], 0); CACHE_SIZE], next: 0 },
+);
 
 /// Look up a MAC from the ARP cache. Returns Some(mac) if found and entry is fresh.
 pub fn cache_lookup(ip: [u8; 4]) -> Option<[u8; 6]> {
     let now = crate::arch::x86_64::idt::timer_ticks();
-    unsafe {
+    {
+        let mut g = ARP.lock();
+        let st = &mut *g;
         for i in 0..CACHE_SIZE {
-            if ARP_CACHE[i].0 && ARP_CACHE[i].1 == ip {
-                if now.wrapping_sub(ARP_CACHE[i].3) < ARP_TTL_TICKS {
-                    return Some(ARP_CACHE[i].2);
+            if st.cache[i].0 && st.cache[i].1 == ip {
+                if now.wrapping_sub(st.cache[i].3) < ARP_TTL_TICKS {
+                    return Some(st.cache[i].2);
                 } else {
                     // Expired — invalidate the entry
-                    ARP_CACHE[i].0 = false;
+                    st.cache[i].0 = false;
                 }
             }
         }
@@ -40,19 +50,21 @@ pub fn cache_lookup(ip: [u8; 4]) -> Option<[u8; 6]> {
 /// Insert or update a cache entry, resetting its TTL.
 pub fn cache_update(ip: [u8; 4], mac: [u8; 6]) {
     let now = crate::arch::x86_64::idt::timer_ticks();
-    unsafe {
+    {
+        let mut g = ARP.lock();
+        let st = &mut *g;
         // Update existing entry if present
         for i in 0..CACHE_SIZE {
-            if ARP_CACHE[i].0 && ARP_CACHE[i].1 == ip {
-                ARP_CACHE[i].2 = mac;
-                ARP_CACHE[i].3 = now;
+            if st.cache[i].0 && st.cache[i].1 == ip {
+                st.cache[i].2 = mac;
+                st.cache[i].3 = now;
                 return;
             }
         }
         // Insert into next free slot (circular)
-        let slot = CACHE_NEXT % CACHE_SIZE;
-        ARP_CACHE[slot] = (true, ip, mac, now);
-        CACHE_NEXT += 1;
+        let slot = st.next % CACHE_SIZE;
+        st.cache[slot] = (true, ip, mac, now);
+        st.next += 1;
     }
 }
 
@@ -61,16 +73,18 @@ pub fn cache_dump() {
     let s = crate::arch::x86_64::serial::write_str;
     let now = crate::arch::x86_64::idt::timer_ticks();
     s("[ARP] Cache:\r\n");
-    unsafe {
+    {
+        let mut g = ARP.lock();
+        let st = &mut *g;
         let mut any = false;
         for i in 0..CACHE_SIZE {
-            if ARP_CACHE[i].0 {
-                let age = now.wrapping_sub(ARP_CACHE[i].3);
+            if st.cache[i].0 {
+                let age = now.wrapping_sub(st.cache[i].3);
                 if age < ARP_TTL_TICKS {
                     s("  ");
-                    serial_ip(ARP_CACHE[i].1);
+                    serial_ip(st.cache[i].1);
                     s(" -> ");
-                    serial_mac(ARP_CACHE[i].2);
+                    serial_mac(st.cache[i].2);
                     s("\r\n");
                     any = true;
                 }
@@ -84,10 +98,12 @@ pub fn cache_dump() {
 pub fn cache_entries(out: &mut [([u8;4],[u8;6]); 16]) -> usize {
     let now = crate::arch::x86_64::idt::timer_ticks();
     let mut n = 0;
-    unsafe {
+    {
+        let mut g = ARP.lock();
+        let st = &mut *g;
         for i in 0..CACHE_SIZE {
-            if ARP_CACHE[i].0 && n < 16 && now.wrapping_sub(ARP_CACHE[i].3) < ARP_TTL_TICKS {
-                out[n] = (ARP_CACHE[i].1, ARP_CACHE[i].2);
+            if st.cache[i].0 && n < 16 && now.wrapping_sub(st.cache[i].3) < ARP_TTL_TICKS {
+                out[n] = (st.cache[i].1, st.cache[i].2);
                 n += 1;
             }
         }

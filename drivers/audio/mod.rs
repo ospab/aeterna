@@ -97,7 +97,7 @@ fn interrupts_enabled() -> bool {
 /// Sleep roughly one timer tick (or spin when interrupts are off).
 fn short_wait() {
     if interrupts_enabled() {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        unsafe { core::arch::asm!("hlt", options(nostack)); }
     } else {
         for _ in 0..20_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
     }

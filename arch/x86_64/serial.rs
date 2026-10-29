@@ -41,14 +41,11 @@ pub fn write_byte(b: u8) {
 /// Write a whole string with interrupts held off, so a message is never split by
 /// output from an interrupt handler or a task that preempts the writer.
 pub fn write_str(s: &str) {
-    let rflags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) rflags, options(nomem)); }
-    for b in s.bytes() {
-        write_byte(b);
-    }
-    if rflags & (1 << 9) != 0 {
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-    }
+    crate::core::sync::without_interrupts(|| {
+        for b in s.bytes() {
+            write_byte(b);
+        }
+    });
 }
 
 pub struct SerialWriter;

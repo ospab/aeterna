@@ -2,7 +2,12 @@
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 Preemptive Task Scheduler for AETERNA microkernel.
+
+Locking: the task table is behind the IRQ-safe spinlock SCHED (lock order and rules:
+docs/en/kernel.md). Nothing under SCHED may take OBJ or sleep. The reaper runs without
+SCHED: a dead task's control block is removed under the lock, then torn down.
 */
+use crate::core::sync::IrqSpinLock;
 
 /// Task state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +113,10 @@ pub struct TaskControlBlock {
     /// I/O permission bitmap (bit set = denied) for the ports this process enabled through
     /// IoPortRange handles; loaded into the TSS when it is switched in. Empty = no ports.
     pub io_bitmap: alloc::vec::Vec<u8>,
+    /// Open files (fd 3 and up); closed when the task is reaped (see core/fd.rs).
+    pub fds: crate::core::fd::FdTable,
+    /// The address space was created for this task (not the kernel's): free it on reaping.
+    pub own_cr3: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -124,10 +133,58 @@ pub struct TaskSnapshot {
 
 static EMPTY_NAME: [u8; 24] = [0; 24];
 
-static mut TASKS: [Option<TaskControlBlock>; MAX_TASKS] = [const { None }; MAX_TASKS];
-static mut CURRENT_SLOT: usize = 0;
-static mut NEXT_PID: TaskId = 1;
-static mut SCHEDULER_INITIALIZED: bool = false;
+/// Everything the scheduler owns, behind one lock.
+struct SchedState {
+    tasks: [Option<TaskControlBlock>; MAX_TASKS],
+    current: usize,
+    next_pid: TaskId,
+    /// Exit codes of recently finished tasks, so `wait_pid` can report them after the
+    /// TCB has been reaped. Small ring; oldest entries are overwritten.
+    exit_log: [(TaskId, i64); EXIT_LOG_LEN],
+    exit_log_next: usize,
+}
+
+const EXIT_LOG_LEN: usize = 32;
+
+static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new("SCHED", crate::core::sync::rank::SCHED, SchedState {
+    tasks: [const { None }; MAX_TASKS],
+    current: 0,
+    next_pid: 1,
+    exit_log: [(0, 0); EXIT_LOG_LEN],
+    exit_log_next: 0,
+});
+static SCHEDULER_INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+impl SchedState {
+    fn cur(&mut self) -> Option<&mut TaskControlBlock> {
+        let c = self.current;
+        self.tasks[c].as_mut()
+    }
+
+    fn find(&mut self, pid: TaskId) -> Option<&mut TaskControlBlock> {
+        self.tasks.iter_mut().flatten().find(|t| t.pid == pid)
+    }
+
+    fn record_exit(&mut self, pid: TaskId, code: i64) {
+        let n = self.exit_log_next;
+        self.exit_log[n] = (pid, code);
+        self.exit_log_next = (n + 1) % EXIT_LOG_LEN;
+    }
+
+    /// Put `tcb` in a free slot (never slot 0) and give it a pid. On failure hands it back.
+    fn insert(&mut self, mut tcb: TaskControlBlock) -> Result<TaskId, TaskControlBlock> {
+        for i in 1..MAX_TASKS {
+            if self.tasks[i].is_none() {
+                let pid = self.next_pid;
+                self.next_pid = self.next_pid.wrapping_add(1).max(1);
+                tcb.pid = pid;
+                self.tasks[i] = Some(tcb);
+                return Ok(pid);
+            }
+        }
+        Err(tcb)
+    }
+}
 
 fn current_cr3() -> u64 {
     let value: u64;
@@ -139,7 +196,7 @@ fn current_cr3() -> u64 {
 
 fn write_cr3(value: u64) {
     unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) value, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags));
     }
 }
 
@@ -152,52 +209,63 @@ fn fill_name(dst: &mut [u8; 24], src: &str) -> u8 {
     n as u8
 }
 
-pub fn init() {
-    unsafe {
-        let mut idle_name = EMPTY_NAME;
-        let idle_len = fill_name(&mut idle_name, "idle");
-
-        TASKS[0] = Some(TaskControlBlock {
-            pid: 0,
-            priority: Priority::Idle,
-            state: TaskState::Running,
-            cr3: current_cr3(),
-            cpu_ticks: 0,
-            memory_bytes: 0,
-            stack_pointer: 0,
-            instruction_pointer: 0,
-            frame: [0; FRAME_WORDS],
-            has_frame: false,
-            name: idle_name,
-            name_len: idle_len,
-            capabilities: alloc::vec![Capability::Serial, Capability::System],
-            preemption_disabled: false,
-            med_id: None,
-            fx: FxArea::initial(),
-            kstack_phys: 0,
-            kstack_top: 0,
-            mmap_next: 0,
-            handles: crate::core::object::HandleTable::new(),
-            ipc_wait: 0,
-            wake_at: 0,
-            io_bitmap: alloc::vec::Vec::new(),
-        });
-        CURRENT_SLOT = 0;
-        NEXT_PID = 1;
-        SCHEDULER_INITIALIZED = true;
+/// A control block with defaults; callers fill in what differs.
+fn new_tcb(name: &str, priority: Priority) -> TaskControlBlock {
+    let mut task_name = EMPTY_NAME;
+    let name_len = fill_name(&mut task_name, name);
+    TaskControlBlock {
+        pid: 0,
+        priority,
+        state: TaskState::Ready,
+        cr3: 0,
+        cpu_ticks: 0,
+        memory_bytes: 0,
+        stack_pointer: 0,
+        instruction_pointer: 0,
+        frame: [0; FRAME_WORDS],
+        has_frame: false,
+        name: task_name,
+        name_len,
+        capabilities: alloc::vec::Vec::new(),
+        preemption_disabled: false,
+        med_id: None,
+        fx: FxArea::initial(),
+        kstack_phys: 0,
+        kstack_top: 0,
+        mmap_next: 0,
+        handles: crate::core::object::HandleTable::new(),
+        ipc_wait: 0,
+        wake_at: 0,
+        io_bitmap: alloc::vec::Vec::new(),
+        fds: crate::core::fd::FdTable::new(),
+        own_cr3: false,
     }
+}
+
+pub fn init() {
+    let mut idle = new_tcb("idle", Priority::Idle);
+    idle.state = TaskState::Running;
+    idle.cr3 = current_cr3();
+    idle.capabilities = alloc::vec![Capability::Serial, Capability::System];
+    {
+        let mut s = SCHED.lock();
+        s.tasks[0] = Some(idle);
+        s.current = 0;
+        s.next_pid = 1;
+    }
+    SCHEDULER_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
     crate::arch::x86_64::serial::write_str("[SCHED] TCB scheduler initialized\r\n");
 }
 
 pub fn is_initialized() -> bool {
-    unsafe { SCHEDULER_INITIALIZED }
+    SCHEDULER_INITIALIZED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 pub fn create_task(priority: Priority, entry_point: u64, stack_pointer: u64) -> Option<TaskId> {
     spawn_named("task", priority, entry_point, stack_pointer, 0, &[])
 }
 
-/// Spawn a new task with an explicit capability manifest.
+/// Spawn a new kernel thread with an explicit capability manifest.
 ///
 /// **Least-privilege enforcement**: the new task receives only those
 /// capabilities that appear in BOTH `manifest` AND the parent task's
@@ -215,94 +283,56 @@ pub fn spawn_named(
     manifest: &[Capability],
 ) -> Option<TaskId> {
     use crate::arch::x86_64::gdt_simple;
-    unsafe {
-        if !SCHEDULER_INITIALIZED {
-            return None;
+    if !is_initialized() {
+        return None;
+    }
+    // Everything that allocates is prepared before the table lock is taken, and the
+    // control block is complete before it becomes visible to the timer interrupt.
+    let mut tcb = new_tcb(name, priority);
+    tcb.frame[16] = entry_point; // RIP
+    tcb.frame[18] = 0x202; // RFLAGS (IF=1)
+    tcb.frame[19] = stack_pointer; // RSP
+    // Always a kernel thread: ring-3 tasks are created only by spawn_user_task.
+    tcb.frame[17] = gdt_simple::KERNEL_CS as u64;
+    tcb.frame[20] = gdt_simple::KERNEL_DS as u64;
+    tcb.memory_bytes = memory_bytes;
+    tcb.stack_pointer = stack_pointer;
+    tcb.instruction_pointer = entry_point;
+    tcb.has_frame = entry_point != 0 && stack_pointer != 0;
+    tcb.capabilities.push(Capability::Serial);
+
+    let own = if crate::mm::r#virtual::is_initialized() {
+        crate::mm::r#virtual::create_address_space()
+    } else {
+        None
+    };
+    tcb.cr3 = own.unwrap_or_else(current_cr3);
+    tcb.own_cr3 = own.is_some();
+
+    let mut s = SCHED.lock();
+    // Capability manifest enforcement (least-privilege intersection). An empty manifest
+    // means minimal rights (Serial only).
+    for &requested in manifest {
+        if requested == Capability::Serial || tcb.capabilities.contains(&requested) {
+            continue;
         }
-
-        for i in 1..MAX_TASKS {
-            if TASKS[i].is_none() {
-                let pid = NEXT_PID;
-                NEXT_PID = NEXT_PID.wrapping_add(1);
-
-                let mut task_name = EMPTY_NAME;
-                let name_len = fill_name(&mut task_name, name);
-
-                // Initialize task stack frame for iretq
-                let mut frame = [0u64; FRAME_WORDS];
-                frame[16] = entry_point;                   // RIP
-                frame[18] = 0x202;                         // RFLAGS (IF=1)
-                frame[19] = stack_pointer;                 // RSP
-
-                // Always a kernel thread: ring-3 tasks are created only by spawn_user_task.
-                frame[17] = gdt_simple::KERNEL_CS as u64; // CS
-                frame[20] = gdt_simple::KERNEL_DS as u64; // SS
-
-                // Capability manifest enforcement (least-privilege intersection).
-                // Base: every task gets Serial for debug output.
-                let mut caps = alloc::vec![Capability::Serial];
-
-                if manifest.is_empty() {
-                    // Empty manifest = minimal rights (Serial only).
-                    // This is the backwards-compatible path for placeholder tasks.
-                } else {
-                    // Intersection: grant only caps that are in manifest AND
-                    // possessed by the current (parent) task.
-                    let parent_caps = TASKS[CURRENT_SLOT]
-                        .as_ref()
-                        .map(|t| t.capabilities.as_slice())
-                        .unwrap_or(&[]);
-
-                    for &requested_cap in manifest {
-                        // Skip Serial — already granted above.
-                        if requested_cap == Capability::Serial { continue; }
-                        // Parent must possess the cap (or System which grants all).
-                        let parent_has = parent_caps.contains(&requested_cap)
-                            || parent_caps.contains(&Capability::System);
-                        if parent_has && !caps.contains(&requested_cap) {
-                            caps.push(requested_cap);
-                        }
-                    }
-                }
-
-                // Allocate a fresh address space for this task.
-                let task_cr3 = if crate::mm::r#virtual::is_initialized() {
-                    crate::mm::r#virtual::create_address_space()
-                        .unwrap_or_else(|| current_cr3())
-                } else {
-                    current_cr3()
-                };
-
-                TASKS[i] = Some(TaskControlBlock {
-                    pid,
-                    priority,
-                    state: TaskState::Ready,
-                    cr3: task_cr3,
-                    cpu_ticks: 0,
-                    memory_bytes,
-                    stack_pointer,
-                    instruction_pointer: entry_point,
-                    frame,
-                    has_frame: entry_point != 0 && stack_pointer != 0,
-                    name: task_name,
-                    name_len,
-                    capabilities: caps,
-                    preemption_disabled: false,
-                    med_id: None,
-                    fx: FxArea::initial(),
-                    kstack_phys: 0,
-                    kstack_top: 0,
-                    mmap_next: 0,
-                    handles: crate::core::object::HandleTable::new(),
-                    ipc_wait: 0,
-                    wake_at: 0,
-                    io_bitmap: alloc::vec::Vec::new(),
-                });
-                return Some(pid);
-            }
+        let parent_has = s.cur().map_or(false, |p| {
+            p.capabilities.contains(&requested) || p.capabilities.contains(&Capability::System)
+        });
+        if parent_has {
+            tcb.capabilities.push(requested);
         }
     }
-    None
+    match s.insert(tcb) {
+        Ok(pid) => Some(pid),
+        Err(tcb) => {
+            drop(s);
+            if tcb.own_cr3 {
+                crate::mm::r#virtual::destroy_address_space(tcb.cr3);
+            }
+            None
+        }
+    }
 }
 
 /// Spawn a Ring 3 user task from a *pre-built* address space.
@@ -324,174 +354,113 @@ pub fn spawn_user_task(
     capabilities: alloc::vec::Vec<Capability>,
 ) -> Option<TaskId> {
     use crate::arch::x86_64::gdt_simple;
-    unsafe {
-        if !SCHEDULER_INITIALIZED {
-            return None;
-        }
-        // Own kernel stack: syscalls and interrupts from ring 3 land here, so this task
-        // can block inside the kernel without trampling anyone else's stack.
-        let kstack_phys = crate::mm::physical::alloc_frames(KSTACK_FRAMES)?;
-        let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0);
-        let kstack_top = kstack_phys + hhdm + KSTACK_FRAMES * crate::mm::physical::FRAME_SIZE;
-        for i in 1..MAX_TASKS {
-            if TASKS[i].is_none() {
-                let pid = NEXT_PID;
-                NEXT_PID = NEXT_PID.wrapping_add(1);
-
-                let mut task_name = EMPTY_NAME;
-                let name_len = fill_name(&mut task_name, name);
-
-                // Build the iretq frame the scheduler restores on first switch-in.
-                // Frame layout: [0..14]=r15..rax, 15=err, 16=rip, 17=cs,
-                // 18=rflags, 19=rsp, 20=ss.
-                let mut frame = [0u64; FRAME_WORDS];
-                frame[16] = entry;                       // RIP → user entry
-                frame[17] = gdt_simple::USER_CS as u64;  // CS  (RPL 3 → ring 3)
-                frame[18] = 0x202;                       // RFLAGS (IF=1)
-                frame[19] = user_stack;                  // RSP → user stack
-                frame[20] = gdt_simple::USER_DS as u64;  // SS  (RPL 3)
-
-                TASKS[i] = Some(TaskControlBlock {
-                    pid,
-                    priority,
-                    state: TaskState::Ready,
-                    cr3,
-                    cpu_ticks: 0,
-                    memory_bytes: 0,
-                    stack_pointer: user_stack,
-                    instruction_pointer: entry,
-                    frame,
-                    has_frame: true,
-                    name: task_name,
-                    name_len,
-                    capabilities,
-                    preemption_disabled: false,
-                    med_id: None,
-                    fx: FxArea::initial(),
-                    kstack_phys,
-                    kstack_top,
-                    mmap_next: 0,
-                    handles: crate::core::object::HandleTable::new(),
-                    ipc_wait: 0,
-                    wake_at: 0,
-                    io_bitmap: alloc::vec::Vec::new(),
-                });
-                return Some(pid);
-            }
-        }
-        crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
+    if !is_initialized() {
+        return None;
     }
-    None
+    // Own kernel stack: syscalls and interrupts from ring 3 land here, so this task
+    // can block inside the kernel without trampling anyone else's stack.
+    let kstack_phys = crate::mm::physical::alloc_frames(KSTACK_FRAMES)?;
+    let hhdm = crate::arch::x86_64::boot::hhdm_offset().unwrap_or(0);
+    let kstack_top = kstack_phys + hhdm + KSTACK_FRAMES * crate::mm::physical::FRAME_SIZE;
+
+    let mut tcb = new_tcb(name, priority);
+    // Frame layout: [0..14]=r15..rax, 15=err, 16=rip, 17=cs, 18=rflags, 19=rsp, 20=ss.
+    tcb.frame[16] = entry;
+    tcb.frame[17] = gdt_simple::USER_CS as u64;
+    tcb.frame[18] = 0x202; // RFLAGS (IF=1)
+    tcb.frame[19] = user_stack;
+    tcb.frame[20] = gdt_simple::USER_DS as u64;
+    tcb.cr3 = cr3;
+    tcb.stack_pointer = user_stack;
+    tcb.instruction_pointer = entry;
+    tcb.has_frame = true;
+    tcb.capabilities = capabilities;
+    tcb.kstack_phys = kstack_phys;
+    tcb.kstack_top = kstack_top;
+
+    let r = SCHED.lock().insert(tcb);
+    match r {
+        Ok(pid) => Some(pid),
+        Err(_) => {
+            crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
+            None
+        }
+    }
 }
 
 pub fn has_capability(cap: Capability) -> bool {
-    unsafe {
-        if let Some(ref tcb) = TASKS[CURRENT_SLOT] {
-            return tcb.capabilities.contains(&cap);
-        }
-    }
-    false
+    SCHED.lock().cur().map_or(false, |t| t.capabilities.contains(&cap))
 }
 
 /// Grant a capability to a task by PID. (Privileged operation)
 pub fn grant_capability(pid: TaskId, cap: Capability) -> bool {
-    if !has_capability(Capability::System) {
+    let mut s = SCHED.lock();
+    let allowed = s.cur().map_or(false, |t| t.capabilities.contains(&Capability::System));
+    if !allowed {
         return false;
     }
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if let Some(ref mut tcb) = TASKS[i] {
-                if tcb.pid == pid {
-                    if !tcb.capabilities.contains(&cap) {
-                        tcb.capabilities.push(cap);
-                    }
-                    return true;
-                }
+    match s.find(pid) {
+        Some(t) => {
+            if !t.capabilities.contains(&cap) {
+                t.capabilities.push(cap);
             }
+            true
         }
+        None => false,
     }
-    false
 }
 
 pub fn add_memory_usage(pid: TaskId, bytes: u64) {
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if let Some(ref mut tcb) = TASKS[i] {
-                if tcb.pid == pid {
-                    tcb.memory_bytes = tcb.memory_bytes.saturating_add(bytes);
-                    break;
-                }
-            }
-        }
+    if let Some(t) = SCHED.lock().find(pid) {
+        t.memory_bytes = t.memory_bytes.saturating_add(bytes);
     }
 }
 
 pub fn sub_memory_usage(pid: TaskId, bytes: u64) {
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if let Some(ref mut tcb) = TASKS[i] {
-                if tcb.pid == pid {
-                    tcb.memory_bytes = tcb.memory_bytes.saturating_sub(bytes);
-                    break;
-                }
-            }
-        }
+    if let Some(t) = SCHED.lock().find(pid) {
+        t.memory_bytes = t.memory_bytes.saturating_sub(bytes);
     }
 }
 
 /// Exit code recorded for a task killed by the kernel (fault, signal) rather than exit().
 pub const EXIT_KILLED: i64 = -1;
 
-/// Exit codes of recently finished tasks, so `wait_pid` can report them after the
-/// TCB has been reaped. Small ring; oldest entries are overwritten.
-const EXIT_LOG_LEN: usize = 32;
-static mut EXIT_LOG: [(TaskId, i64); EXIT_LOG_LEN] = [(0, 0); EXIT_LOG_LEN];
-static mut EXIT_LOG_NEXT: usize = 0;
-
-fn record_exit(pid: TaskId, code: i64) {
-    unsafe {
-        EXIT_LOG[EXIT_LOG_NEXT] = (pid, code);
-        EXIT_LOG_NEXT = (EXIT_LOG_NEXT + 1) % EXIT_LOG_LEN;
-    }
-}
-
 /// Exit code of a finished task, if it is still remembered.
 pub fn exit_code(pid: TaskId) -> Option<i64> {
-    unsafe {
-        // Newest first, so a recycled pid reports its latest run.
-        (0..EXIT_LOG_LEN)
-            .map(|k| EXIT_LOG[(EXIT_LOG_NEXT + EXIT_LOG_LEN - 1 - k) % EXIT_LOG_LEN])
-            .find(|&(p, _)| p == pid && pid != 0)
-            .map(|(_, c)| c)
-    }
+    let s = SCHED.lock();
+    // Newest first, so a recycled pid reports its latest run.
+    (0..EXIT_LOG_LEN)
+        .map(|k| s.exit_log[(s.exit_log_next + EXIT_LOG_LEN - 1 - k) % EXIT_LOG_LEN])
+        .find(|&(p, _)| p == pid && pid != 0)
+        .map(|(_, c)| c)
 }
 
 pub fn exit_current(code: u64) {
-    unsafe {
-        if let Some(ref mut tcb) = TASKS[CURRENT_SLOT] {
-            if tcb.state != TaskState::Dead {
-                record_exit(tcb.pid, code as i64);
-            }
-            tcb.state = TaskState::Dead;
+    let mut s = SCHED.lock();
+    let c = s.current;
+    if let Some(t) = s.tasks[c].as_mut() {
+        let (pid, was_dead) = (t.pid, t.state == TaskState::Dead);
+        t.state = TaskState::Dead;
+        if !was_dead {
+            s.record_exit(pid, code as i64);
         }
     }
 }
 
 pub fn exit_pid(pid: TaskId) -> bool {
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if let Some(ref mut tcb) = TASKS[i] {
-                if tcb.pid == pid {
-                    if tcb.state != TaskState::Dead {
-                        record_exit(pid, EXIT_KILLED);
-                    }
-                    tcb.state = TaskState::Dead;
-                    return true;
-                }
-            }
+    let mut s = SCHED.lock();
+    let was_dead = match s.find(pid) {
+        Some(t) => {
+            let d = t.state == TaskState::Dead;
+            t.state = TaskState::Dead;
+            d
         }
+        None => return false,
+    };
+    if !was_dead {
+        s.record_exit(pid, EXIT_KILLED);
     }
-    false
+    true
 }
 
 /// Block until the task with the given PID exits (its state becomes Dead or it
@@ -499,10 +468,7 @@ pub fn exit_pid(pid: TaskId) -> bool {
 /// Returns its exit code (`EXIT_KILLED` if the kernel killed it), or None if unknown.
 pub fn wait_pid(pid: TaskId) -> Option<i64> {
     loop {
-        let alive = unsafe {
-            TASKS.iter().flatten().any(|t| t.pid == pid && t.state != TaskState::Dead)
-        };
-        if !alive {
+        if !task_alive(pid) {
             return exit_code(pid);
         }
         sys_yield();
@@ -510,7 +476,7 @@ pub fn wait_pid(pid: TaskId) -> Option<i64> {
 }
 
 pub fn current_task_id() -> TaskId {
-    unsafe { TASKS[CURRENT_SLOT].as_ref().map(|t| t.pid).unwrap_or(0) }
+    SCHED.lock().cur().map_or(0, |t| t.pid)
 }
 
 pub fn current_pid() -> TaskId {
@@ -518,288 +484,278 @@ pub fn current_pid() -> TaskId {
 }
 
 pub fn task_count() -> usize {
-    unsafe {
-        TASKS
-            .iter()
-            .filter(|t| t.as_ref().map(|x| x.state != TaskState::Dead).unwrap_or(false))
-            .count()
-    }
+    SCHED.lock().tasks.iter().filter(|t| t.as_ref().map_or(false, |x| x.state != TaskState::Dead)).count()
 }
 
 pub fn thread_count() -> usize {
     task_count()
 }
 
-// Static buffer for task names (since we can't return refs to local data)
-static mut NAME_BUFFER: [u8; 64] = [0u8; 64];
-
-pub fn thread_name(slot: usize) -> &'static str {
-    unsafe {
-        match TASKS.get(slot) {
-            Some(Some(task)) => {
-                let len = task.name_len as usize;
-                if len > 0 && len < 63 {
-                    core::ptr::copy_nonoverlapping(
-                        task.name.as_ptr(),
-                        NAME_BUFFER.as_mut_ptr(),
-                        len,
-                    );
-                    NAME_BUFFER[len] = 0;
-                    core::str::from_utf8_unchecked(&NAME_BUFFER[..len])
-                } else if len == 0 {
-                    "[task]"
-                } else {
-                    "[toolong]"
-                }
-            }
-            _ => "[unknown]",
+/// Name of the task in table slot `slot`.
+pub fn thread_name(slot: usize) -> alloc::string::String {
+    let s = SCHED.lock();
+    match s.tasks.get(slot) {
+        Some(Some(t)) if t.name_len > 0 => {
+            alloc::string::String::from_utf8_lossy(&t.name[..t.name_len as usize]).into_owned()
         }
+        Some(Some(_)) => alloc::string::String::from("[task]"),
+        _ => alloc::string::String::from("[unknown]"),
+    }
+}
+
+fn apply_signal(task: &mut TaskControlBlock, signal: u32) {
+    match signal {
+        18 => {
+            // SIGCONT: resume a stopped task
+            if task.state == TaskState::Waiting {
+                task.state = TaskState::Ready;
+            }
+        }
+        19 => task.state = TaskState::Waiting, // SIGSTOP: suspend the task
+        _ => task.state = TaskState::Dead,     // SIGKILL (9), SIGTERM (15), and all others
     }
 }
 
 pub fn signal_thread(slot: usize, signal: u32) {
-    unsafe {
-        if let Some(Some(task)) = TASKS.get_mut(slot) {
-            if task.pid > 1 {
-                match signal {
-                    18 => { // SIGCONT: resume a stopped task
-                        if task.state == TaskState::Waiting {
-                            task.state = TaskState::Ready;
-                        }
-                    }
-                    19 => { // SIGSTOP: suspend the task
-                        task.state = TaskState::Waiting;
-                    }
-                    _ => { // SIGKILL (9), SIGTERM (15), and all others: terminate
-                        task.state = TaskState::Dead;
-                    }
-                }
-            }
+    let mut s = SCHED.lock();
+    if let Some(Some(task)) = s.tasks.get_mut(slot) {
+        if task.pid > 1 {
+            apply_signal(task, signal);
         }
     }
 }
 
 pub fn signal_pid(pid: TaskId, signal: u32) -> bool {
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if let Some(ref mut tcb) = TASKS[i] {
-                if tcb.pid == pid && pid > 1 {
-                    match signal {
-                        18 => { // SIGCONT: resume a stopped task
-                            if tcb.state == TaskState::Waiting {
-                                tcb.state = TaskState::Ready;
-                            }
-                        }
-                        19 => { // SIGSTOP: suspend the task
-                            tcb.state = TaskState::Waiting;
-                        }
-                        _ => { // SIGKILL (9), SIGTERM (15), and all others: terminate
-                            tcb.state = TaskState::Dead;
-                        }
-                    }
-                    return true;
-                }
-            }
-        }
+    if pid <= 1 {
+        return false;
     }
-    false
+    let mut s = SCHED.lock();
+    let newly_dead = match s.find(pid) {
+        Some(t) => {
+            let was_dead = t.state == TaskState::Dead;
+            apply_signal(t, signal);
+            !was_dead && t.state == TaskState::Dead
+        }
+        None => return false,
+    };
+    // A signal that kills records the exit like exit_pid does, so wait_pid reports it.
+    if newly_dead {
+        s.record_exit(pid, EXIT_KILLED);
+    }
+    true
 }
 
-fn next_ready_slot() -> Option<usize> {
-    unsafe {
-        let mut best: Option<usize> = None;
-        let mut best_prio = Priority::Idle;
+/// Remove one dead task (not the running one, never the idle task) from the table.
+fn take_dead_task() -> Option<TaskControlBlock> {
+    let mut s = SCHED.try_lock()?;
+    let cur = s.current;
+    for idx in 1..MAX_TASKS {
+        if idx != cur && s.tasks[idx].as_ref().map_or(false, |t| t.state == TaskState::Dead) {
+            return s.tasks[idx].take();
+        }
+    }
+    None
+}
 
-        for offset in 1..=MAX_TASKS {
-            let idx = (CURRENT_SLOT + offset) % MAX_TASKS;
-            if let Some(ref task) = TASKS[idx] {
-                // Reap dead tasks (except kernel idle task at idx 0, and not the currently running slot)
-                if task.state == TaskState::Dead {
-                    if idx != 0 && idx != CURRENT_SLOT {
-                        // Freeing may take the heap lock; if the interrupted code holds it,
-                        // try again on the next tick instead of deadlocking.
-                        if crate::mm::heap::is_locked() {
-                            continue;
-                        }
-                        let (pid, kstack_phys, cr3) = (task.pid, task.kstack_phys, task.cr3);
-                        let (handles, ipc_wait) = match TASKS[idx].as_mut() {
-                            Some(t) => (core::mem::take(&mut t.handles), t.ipc_wait),
-                            None => continue,
-                        };
-                        // Safe to free the kernel stack: only the current task's stack is in use.
-                        if kstack_phys != 0 {
-                            crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
-                            // Ring-3 tasks own their address space: page tables and owned
-                            // pages go back to the allocator (the CR3 is no longer active).
-                            crate::mm::r#virtual::destroy_address_space(cr3);
-                        }
-                        TASKS[idx] = None;
-                        // Close its handles (frees its kernel objects) and wake waiters.
-                        crate::core::object::task_reaped(pid, handles, ipc_wait);
-                    }
-                    continue;
-                }
+/// Free everything a reaped task owned. Runs without the SCHED lock (it takes PMM, VMM,
+/// OBJ and HEAP). Safe because the task is off the table and was not the running one: its
+/// kernel stack and address space are not in use.
+fn teardown(t: TaskControlBlock) {
+    let TaskControlBlock { pid, kstack_phys, cr3, own_cr3, handles, ipc_wait, .. } = t;
+    if kstack_phys != 0 {
+        crate::mm::physical::free_frames(kstack_phys, KSTACK_FRAMES);
+    }
+    // Ring-3 tasks and kernel threads with a private space: page tables and owned pages go
+    // back to the allocator (the CR3 is no longer active).
+    if kstack_phys != 0 || own_cr3 {
+        crate::mm::r#virtual::destroy_address_space(cr3);
+    }
+    // Close its handles (frees its kernel objects) and wake waiters. The rest of the block
+    // (open files, FPU image, ...) is dropped on return.
+    crate::core::object::task_reaped(pid, handles, ipc_wait);
+}
 
-                // Skip "phantom" bookkeeping tasks: ones that have never run
-                // (`!has_frame`) and carry no entry point (`instruction_pointer == 0`),
-                // such as the seed service placeholders. They have no code to
-                // execute, so switching to them is a no-op that would instead
-                // resume whatever context was last interrupted — breaking a clean
-                // return to the kernel after a real task exits. They remain in the
-                // table for `ps`/IPC bookkeeping; we just never schedule them.
-                if !task.has_frame && task.instruction_pointer == 0 {
-                    continue;
-                }
+/// Reap up to a few dead tasks. Called at the start of every preemption pass.
+fn reap_dead() {
+    for _ in 0..4 {
+        match take_dead_task() {
+            Some(t) => teardown(t),
+            None => break,
+        }
+    }
+}
 
-                if task.state == TaskState::Ready || task.state == TaskState::Running {
-                    // Strictly greater: among equal priorities the first one after the
-                    // current slot wins, which gives round-robin. (With >= the current
-                    // task, scanned last, always won ties and nothing else ever ran.)
-                    if best.is_none() || task.priority > best_prio {
-                        best_prio = task.priority;
-                        best = Some(idx);
-                    }
+fn next_ready_slot(s: &SchedState) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut best_prio = Priority::Idle;
+
+    for offset in 1..=MAX_TASKS {
+        let idx = (s.current + offset) % MAX_TASKS;
+        if let Some(ref task) = s.tasks[idx] {
+            if task.state == TaskState::Dead {
+                continue;
+            }
+
+            // Skip "phantom" bookkeeping tasks: ones that have never run
+            // (`!has_frame`) and carry no entry point (`instruction_pointer == 0`),
+            // such as the seed service placeholders. They have no code to
+            // execute, so switching to them would resume whatever context was last
+            // interrupted. They stay in the table for `ps`/IPC bookkeeping.
+            if !task.has_frame && task.instruction_pointer == 0 {
+                continue;
+            }
+
+            if task.state == TaskState::Ready || task.state == TaskState::Running {
+                // Strictly greater: among equal priorities the first one after the
+                // current slot wins, which gives round-robin.
+                if best.is_none() || task.priority > best_prio {
+                    best_prio = task.priority;
+                    best = Some(idx);
                 }
             }
         }
-        best
     }
+    best
 }
 
 pub fn schedule_next() -> Option<usize> {
-    next_ready_slot()
+    let s = SCHED.lock();
+    next_ready_slot(&s)
 }
 
 pub fn tick() {
-    unsafe {
-        if !SCHEDULER_INITIALIZED {
-            return;
-        }
-        if let Some(ref mut current) = TASKS[CURRENT_SLOT] {
-            current.cpu_ticks = current.cpu_ticks.saturating_add(1);
-        }
+    if !is_initialized() {
+        return;
+    }
+    if let Some(c) = SCHED.lock().cur() {
+        c.cpu_ticks = c.cpu_ticks.saturating_add(1);
     }
 }
 
 /// Cooperative yield: sets current task to Ready and sleeps until next interrupt.
 /// Call from polling loops (ping wait, keyboard read) to avoid busy-spinning.
+/// Interrupts are enabled when it returns. No spinlock may be held (checked).
 pub fn sys_yield() {
-    unsafe {
-        if SCHEDULER_INITIALIZED {
-            if let Some(ref mut task) = TASKS[CURRENT_SLOT] {
-                if task.state == TaskState::Running {
-                    task.state = TaskState::Ready;
-                }
+    crate::core::sync::assert_no_locks("sys_yield");
+    if is_initialized() {
+        if let Some(task) = SCHED.lock().cur() {
+            if task.state == TaskState::Running {
+                task.state = TaskState::Ready;
             }
         }
-        // Sleep until next interrupt (timer, NIC, keyboard, etc.)
-        core::arch::asm!("sti; hlt");
     }
+    // Sleep until next interrupt (timer, NIC, keyboard, etc.). Not `nomem`: the interrupt
+    // that ends the HLT reads and writes memory this function touched.
+    unsafe { core::arch::asm!("sti; hlt", options(nostack)) };
 }
 
 // ─── Blocking primitives for kernel objects (core/object.rs) ─────────────────────────
 
 /// Run `f` with interrupts disabled, restoring the previous interrupt state afterwards.
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags) };
-    let r = f();
-    if flags & 0x200 != 0 {
-        unsafe { core::arch::asm!("sti", options(nostack)) };
-    }
-    r
+    crate::core::sync::without_interrupts(f)
 }
 
 /// Put the current task to sleep until `wake(pid)`, a timer deadline (`deadline`, in
 /// `timer_ticks`; 0 = none) or any interrupt that ends HLT. Callers loop on their condition.
-/// Interrupts must be off on entry and are off again on return.
+/// Interrupts must be off on entry and are off again on return. No lock may be held
+/// (release it with `IrqSpinLockGuard::unlock_keep_irq_off` and take it again afterwards).
 pub fn park(deadline: u64) {
-    unsafe {
-        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
+    crate::core::sync::assert_no_locks("park");
+    {
+        let mut s = SCHED.lock();
+        if let Some(t) = s.cur() {
             t.state = TaskState::Waiting;
             t.wake_at = deadline;
         }
-        // The timer interrupt that follows switches to another task; this one resumes here
-        // once it is Ready again.
-        // No `nomem`: this asm is a compiler barrier. The timer interrupt that ends the HLT
-        // reads and writes the task table, so the state stores above must not be delayed
-        // past it and the loads below must not be hoisted before it.
-        core::arch::asm!("sti; hlt; cli", options(nostack));
-        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
-            t.wake_at = 0;
-            if t.state == TaskState::Waiting {
-                t.state = TaskState::Running;
-            }
+    }
+    // The timer interrupt that follows switches to another task; this one resumes here
+    // once it is Ready again. No `nomem`: the interrupt that ends the HLT reads and writes
+    // the task table, so the state stores above must not be delayed past it and the loads
+    // below must not be hoisted before it.
+    unsafe { core::arch::asm!("sti; hlt; cli", options(nostack)) };
+    let mut s = SCHED.lock();
+    if let Some(t) = s.cur() {
+        t.wake_at = 0;
+        if t.state == TaskState::Waiting {
+            t.state = TaskState::Running;
         }
     }
 }
 
 /// Make a Waiting task runnable again.
 pub fn wake(pid: TaskId) {
-    unsafe {
-        for t in TASKS.iter_mut().flatten() {
-            if t.pid == pid {
-                if t.state == TaskState::Waiting {
-                    t.state = TaskState::Ready;
-                    t.wake_at = 0;
-                }
-                return;
-            }
+    if let Some(t) = SCHED.lock().find(pid) {
+        if t.state == TaskState::Waiting {
+            t.state = TaskState::Ready;
+            t.wake_at = 0;
         }
     }
 }
 
 /// Wake tasks whose park deadline has passed. Called from the timer interrupt.
-fn wake_expired() {
+fn wake_expired(s: &mut SchedState) {
     let now = crate::arch::x86_64::idt::timer_ticks();
-    unsafe {
-        for t in TASKS.iter_mut().flatten() {
-            if t.state == TaskState::Waiting && t.wake_at != 0 && now >= t.wake_at {
-                t.state = TaskState::Ready;
-                t.wake_at = 0;
-            }
+    for t in s.tasks.iter_mut().flatten() {
+        if t.state == TaskState::Waiting && t.wake_at != 0 && now >= t.wake_at {
+            t.state = TaskState::Ready;
+            t.wake_at = 0;
         }
     }
 }
 
 /// Does a task with this pid exist and not yet exited?
 pub fn task_alive(pid: TaskId) -> bool {
-    unsafe { TASKS.iter().flatten().any(|t| t.pid == pid && t.state != TaskState::Dead) }
+    SCHED.lock().tasks.iter().flatten().any(|t| t.pid == pid && t.state != TaskState::Dead)
 }
 
 /// Scheduler state of a task, if it exists.
 pub fn task_state(pid: TaskId) -> Option<TaskState> {
-    unsafe { TASKS.iter().flatten().find(|t| t.pid == pid).map(|t| t.state) }
+    SCHED.lock().tasks.iter().flatten().find(|t| t.pid == pid).map(|t| t.state)
 }
 
 /// Handle table of the running task.
+///
+/// The reference outlives the SCHED lock. It is valid because the running task's control
+/// block cannot be reaped, and the table is only touched under the OBJ lock (core/object.rs).
 pub fn current_handles() -> &'static mut crate::core::object::HandleTable {
-    unsafe { &mut TASKS[CURRENT_SLOT].as_mut().expect("current task").handles }
+    let mut s = SCHED.lock();
+    let t = s.cur().expect("current task");
+    // SAFETY: see above; the slot is a fixed address inside the static table.
+    unsafe { &mut *(&mut t.handles as *mut crate::core::object::HandleTable) }
 }
 
-/// Handle table of task `pid`, if it exists.
+/// Handle table of task `pid`, if it exists. Same rules as `current_handles`.
 pub fn handles_of(pid: TaskId) -> Option<&'static mut crate::core::object::HandleTable> {
-    unsafe { TASKS.iter_mut().flatten().find(|t| t.pid == pid).map(|t| &mut t.handles) }
+    let mut s = SCHED.lock();
+    let t = s.find(pid)?;
+    // SAFETY: as in `current_handles`; the caller holds OBJ and the task is not being reaped
+    // (reaping needs SCHED and OBJ, and the table is taken out before OBJ is used).
+    Some(unsafe { &mut *(&mut t.handles as *mut crate::core::object::HandleTable) })
+}
+
+/// Run `f` on the running task's file descriptor table. SCHED is held and interrupts are
+/// off: `f` must only touch the table (no I/O, no other locks).
+pub fn with_current_fds<R>(f: impl FnOnce(&mut crate::core::fd::FdTable) -> R) -> R {
+    let mut s = SCHED.lock();
+    let t = s.cur().expect("current task");
+    f(&mut t.fds)
 }
 
 /// Record the Reply object (+1) the running task is blocked on (0 = none), so the reaper
 /// can release it if the task dies while waiting.
 pub fn set_ipc_wait(v: u32) {
-    unsafe {
-        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
-            t.ipc_wait = v;
-        }
+    if let Some(t) = SCHED.lock().cur() {
+        t.ipc_wait = v;
     }
 }
 
 /// Replace the running task's I/O permission bitmap and load it into the TSS now.
-/// Interrupts must be off (syscall path).
 pub fn set_current_io_bitmap(bm: alloc::vec::Vec<u8>) {
-    unsafe {
-        if let Some(ref mut t) = TASKS[CURRENT_SLOT] {
-            t.io_bitmap = bm;
-            crate::arch::x86_64::gdt_simple::load_io_bitmap(t.pid, &t.io_bitmap, true);
-        }
+    let mut s = SCHED.lock();
+    if let Some(t) = s.cur() {
+        t.io_bitmap = bm;
+        crate::arch::x86_64::gdt_simple::load_io_bitmap(t.pid, &t.io_bitmap, true);
     }
 }
 
@@ -825,95 +781,111 @@ pub fn wait_pid_timeout(pid: TaskId, ticks: u64) -> Option<i64> {
 /// XSAVE/FXSAVE image the ISR stub will restore on return, or is null when the stub does not
 /// save FPU state (the exception path), in which case the next task's state is loaded here.
 pub fn on_timer_irq(saved_state: *mut u8, fx_area: *mut u8) {
-    unsafe {
-        if !SCHEDULER_INITIALIZED {
+    if !is_initialized() {
+        return;
+    }
+
+    // Dead tasks are torn down before the table lock is taken (teardown takes other locks).
+    reap_dead();
+
+    // A holder of SCHED always has interrupts off, so this only fails when a kernel fault
+    // path comes here with the lock held: skip the pass instead of deadlocking.
+    let mut guard = match SCHED.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+    let s = &mut *guard;
+
+    wake_expired(s);
+    let cur_slot = s.current;
+    if let Some(cur) = s.tasks[cur_slot].as_mut() {
+        cur.cpu_ticks = cur.cpu_ticks.saturating_add(1);
+
+        // Jitter Elimination: Compute tasks are not preempted by timer
+        // unless they've exceeded their massive quantum (1000 ticks)
+        let is_compute = cur.priority == Priority::Compute;
+        let quantum_exceeded = (cur.cpu_ticks % 1000) == 0;
+        let force_preempt = !is_compute || quantum_exceeded;
+
+        if !force_preempt || cur.preemption_disabled {
+            // Skip context switch: just return and continue execution
             return;
         }
 
-        wake_expired();
-        let cur_slot = CURRENT_SLOT;
-        if let Some(ref mut cur) = TASKS[cur_slot] {
-            cur.cpu_ticks = cur.cpu_ticks.saturating_add(1);
-            
-            // Jitter Elimination: Compute tasks are not preempted by timer
-            // unless they've exceeded their massive quantum (1000 ticks)
-            let is_compute = cur.priority == Priority::Compute;
-            let quantum_exceeded = (cur.cpu_ticks % 1000) == 0;
-            let force_preempt = !is_compute || quantum_exceeded;
-            
-            if !force_preempt || cur.preemption_disabled {
-                // Skip context switch: just return and continue execution
-                return;
-            }
-
-            cur.stack_pointer = saved_state as u64;
-            let src = saved_state as *const u64;
-            for i in 0..FRAME_WORDS {
-                cur.frame[i] = *src.add(i);
-            }
-            cur.has_frame = true;
-            if !fx_area.is_null() {
+        cur.stack_pointer = saved_state as u64;
+        let src = saved_state as *const u64;
+        for i in 0..FRAME_WORDS {
+            // SAFETY: the ISR stub saved FRAME_WORDS words at saved_state.
+            cur.frame[i] = unsafe { *src.add(i) };
+        }
+        cur.has_frame = true;
+        if !fx_area.is_null() {
+            // SAFETY: fx_area is the XSAVE image the stub saved; fx is large enough.
+            unsafe {
                 core::ptr::copy_nonoverlapping(fx_area, cur.fx.0.as_mut_ptr(), crate::arch::x86_64::init::xsave_area_size());
             }
-            if cur.state == TaskState::Running {
-                cur.state = TaskState::Ready;
-            }
         }
+        if cur.state == TaskState::Running {
+            cur.state = TaskState::Ready;
+        }
+    }
 
-        let next_slot = match next_ready_slot() {
-            Some(n) => n,
-            None => {
-                if let Some(ref mut cur) = TASKS[cur_slot] {
-                    cur.state = TaskState::Running;
-                }
-                return;
-            }
-        };
-
-        if next_slot == cur_slot {
-            if let Some(ref mut cur) = TASKS[cur_slot] {
+    let next_slot = match next_ready_slot(s) {
+        Some(n) => n,
+        None => {
+            if let Some(cur) = s.tasks[cur_slot].as_mut() {
                 cur.state = TaskState::Running;
             }
             return;
         }
+    };
 
-        let from_user = TASKS[cur_slot].as_ref().map_or(false, |t| t.kstack_phys != 0);
-        if let Some(ref mut next) = TASKS[next_slot] {
-            if from_user && next.kstack_phys != 0 {
-                USER_TO_USER_SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if next_slot == cur_slot {
+        if let Some(cur) = s.tasks[cur_slot].as_mut() {
+            cur.state = TaskState::Running;
+        }
+        return;
+    }
+
+    let from_user = s.tasks[cur_slot].as_ref().map_or(false, |t| t.kstack_phys != 0);
+    s.current = next_slot;
+    if let Some(next) = s.tasks[next_slot].as_mut() {
+        if from_user && next.kstack_phys != 0 {
+            USER_TO_USER_SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        next.state = TaskState::Running;
+
+        if next.cr3 != 0 && next.cr3 != current_cr3() {
+            // Refresh kernel upper-half entries in the target PML4 so that any dynamic
+            // kernel mappings added after this task was spawned are visible immediately.
+            // Without this, a stale PML4 causes #PF 0x0 (not-present, kernel).
+            if crate::mm::r#virtual::is_initialized() {
+                crate::mm::r#virtual::sync_kernel_mappings(next.cr3);
             }
-            next.state = TaskState::Running;
-            CURRENT_SLOT = next_slot;
+            write_cr3(next.cr3);
+        }
 
-            if next.cr3 != 0 && next.cr3 != current_cr3() {
-                // Refresh kernel upper-half entries in the target PML4 so that
-                // any dynamic kernel mappings (heap growth, new VFS pages, etc.)
-                // added after this task was spawned are visible immediately.
-                // Without this, a stale PML4 causes #PF 0x0 (not-present, kernel).
-                if crate::mm::r#virtual::is_initialized() {
-                    crate::mm::r#virtual::sync_kernel_mappings(next.cr3);
-                }
-                write_cr3(next.cr3);
+        if next.has_frame {
+            let dst = saved_state as *mut u64;
+            for i in 0..FRAME_WORDS {
+                // SAFETY: same frame the stub will pop on return.
+                unsafe { *dst.add(i) = next.frame[i] };
             }
+        }
 
-            if next.has_frame {
-                let dst = saved_state as *mut u64;
-                for i in 0..FRAME_WORDS {
-                    *dst.add(i) = next.frame[i];
-                }
-            }
+        if next.kstack_top != 0 {
+            crate::arch::x86_64::gdt_simple::set_tss_rsp0(next.kstack_top);
+            crate::core::syscall::set_kernel_stack(next.kstack_top);
+            // Ring-3 task: its own I/O permissions (none for most tasks).
+            crate::arch::x86_64::gdt_simple::load_io_bitmap(next.pid, &next.io_bitmap, false);
+        }
 
-            if next.kstack_top != 0 {
-                crate::arch::x86_64::gdt_simple::set_tss_rsp0(next.kstack_top);
-                crate::core::syscall::set_kernel_stack(next.kstack_top);
-                // Ring-3 task: its own I/O permissions (none for most tasks).
-                crate::arch::x86_64::gdt_simple::load_io_bitmap(next.pid, &next.io_bitmap, false);
-            }
-
-            if fx_area.is_null() {
-                // The exception stub does no restore on the way out: load the state now.
-                crate::arch::x86_64::init::restore_fpu_state(next.fx.0.as_ptr());
-            } else {
+        if fx_area.is_null() {
+            // The exception stub does no restore on the way out: load the state now.
+            unsafe { crate::arch::x86_64::init::restore_fpu_state(next.fx.0.as_ptr()) };
+        } else {
+            // SAFETY: the stub restores this image on return.
+            unsafe {
                 core::ptr::copy_nonoverlapping(next.fx.0.as_ptr(), fx_area, crate::arch::x86_64::init::xsave_area_size());
             }
         }
@@ -927,40 +899,32 @@ const MMAP_LIMIT: u64 = 0x0000_7000_0000_0000;
 
 /// The current task's address space, if it is a ring-3 task with its own one.
 pub fn current_user_cr3() -> Option<u64> {
-    unsafe {
-        TASKS[CURRENT_SLOT]
-            .as_ref()
-            .filter(|t| t.kstack_phys != 0)
-            .map(|t| t.cr3)
-    }
+    SCHED.lock().cur().filter(|t| t.kstack_phys != 0).map(|t| t.cr3)
 }
 
 /// Reserve `pages` pages of virtual address space for mmap in the current ring-3 task.
 /// Leaves an unmapped guard page after each reservation.
 pub fn reserve_user_range(pages: u64) -> Option<u64> {
-    unsafe {
-        let t = TASKS[CURRENT_SLOT].as_mut().filter(|t| t.kstack_phys != 0)?;
-        if t.mmap_next == 0 {
-            t.mmap_next = MMAP_BASE;
-        }
-        let start = t.mmap_next;
-        let end = start.checked_add((pages + 1) * crate::mm::physical::FRAME_SIZE)?;
-        if end > MMAP_LIMIT {
-            return None;
-        }
-        t.mmap_next = end;
-        Some(start)
+    let mut s = SCHED.lock();
+    let t = s.cur().filter(|t| t.kstack_phys != 0)?;
+    if t.mmap_next == 0 {
+        t.mmap_next = MMAP_BASE;
     }
+    let start = t.mmap_next;
+    let end = start.checked_add((pages + 1) * crate::mm::physical::FRAME_SIZE)?;
+    if end > MMAP_LIMIT {
+        return None;
+    }
+    t.mmap_next = end;
+    Some(start)
 }
 
 /// Context switches directly between two ring-3 tasks (for diagnostics and tests).
 pub static USER_TO_USER_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn set_preemption_disabled(disabled: bool) {
-    unsafe {
-        if let Some(ref mut task) = TASKS[CURRENT_SLOT] {
-            task.preemption_disabled = disabled;
-        }
+    if let Some(t) = SCHED.lock().cur() {
+        t.preemption_disabled = disabled;
     }
 }
 
@@ -970,37 +934,32 @@ pub fn set_is_vfs_server(is_server: bool) {
 }
 
 pub fn set_med_id(med_id: u64) {
-    unsafe {
-        if let Some(ref mut task) = TASKS[CURRENT_SLOT] {
-            task.med_id = Some(med_id);
-        }
+    if let Some(t) = SCHED.lock().cur() {
+        t.med_id = Some(med_id);
     }
 }
 
 pub fn get_tasks(out: &mut [TaskSnapshot]) -> usize {
+    let s = SCHED.lock();
     let mut n = 0usize;
-    unsafe {
-        for i in 0..MAX_TASKS {
-            if n >= out.len() {
-                break;
-            }
-            if let Some(ref task) = TASKS[i] {
-                if task.state == TaskState::Dead {
-                    continue;
-                }
-                out[n] = TaskSnapshot {
-                    pid: task.pid,
-                    priority: task.priority,
-                    state: task.state,
-                    cr3: task.cr3,
-                    cpu_ticks: task.cpu_ticks,
-                    memory_bytes: task.memory_bytes,
-                    name: task.name,
-                    name_len: task.name_len,
-                };
-                n += 1;
-            }
+    for task in s.tasks.iter().flatten() {
+        if n >= out.len() {
+            break;
         }
+        if task.state == TaskState::Dead {
+            continue;
+        }
+        out[n] = TaskSnapshot {
+            pid: task.pid,
+            priority: task.priority,
+            state: task.state,
+            cr3: task.cr3,
+            cpu_ticks: task.cpu_ticks,
+            memory_bytes: task.memory_bytes,
+            name: task.name,
+            name_len: task.name_len,
+        };
+        n += 1;
     }
     n
 }

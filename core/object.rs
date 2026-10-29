@@ -51,6 +51,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::core::scheduler;
+use crate::core::sync::{IrqSpinLock, IrqSpinLockGuard};
+use core::sync::atomic::Ordering;
 use crate::core::syscall::SyscallError as E;
 
 pub type Handle = u32;
@@ -240,14 +242,54 @@ struct Object {
     kind: Kind,
 }
 
-static mut OBJECTS: Vec<Option<Object>> = Vec::new();
-static mut LIVE_OBJECTS: usize = 0;
-/// (waiter pid, pid being waited for)
-static mut PROC_WAITERS: Vec<(u32, u32)> = Vec::new();
+/// All kernel-object state, behind the OBJ lock (rank OBJ, the outermost lock).
+/// Every public function of this module takes the lock; the helpers below run under it.
+struct ObjState {
+    objects: Vec<Option<Object>>,
+    live: usize,
+    /// (waiter pid, pid being waited for)
+    proc_waiters: Vec<(u32, u32)>,
+    /// IRQ line -> owning Interrupt object + 1 (0 = not owned by a driver).
+    irq_owner: [u32; 16],
+}
+
+static OBJ: IrqSpinLock<ObjState> = IrqSpinLock::new("OBJ", crate::core::sync::rank::OBJ, ObjState {
+    objects: Vec::new(),
+    live: 0,
+    proc_waiters: Vec::new(),
+    irq_owner: [0; 16],
+});
+
+/// Lines currently owned by an Interrupt object (bit n = line n): lets the IRQ path skip
+/// the lock for every other interrupt.
+static IRQ_OWNED_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The protected state. The reference must not outlive the guard of OBJ held further up the
+/// call chain (the compiler cannot check that). Panics if the lock is not held.
+fn st() -> &'static mut ObjState {
+    assert!(OBJ.is_locked(), "object state used without the OBJ lock");
+    // SAFETY: the lock is held by this CPU's current call chain.
+    unsafe { &mut *OBJ.data_ptr() }
+}
+
+type ObjGuard = IrqSpinLockGuard<'static, ObjState>;
+
+/// Sleep until woken or `deadline`, with OBJ released while asleep. Callers re-check their
+/// condition afterwards.
+fn park_unlocked(g: ObjGuard, deadline: u64) -> ObjGuard {
+    let (lock, flags) = g.unlock_keep_irq_off();
+    scheduler::park(deadline);
+    lock.relock_with(flags)
+}
+
+/// Run `f` under the OBJ lock.
+fn locked<R>(f: impl FnOnce() -> R) -> R {
+    let _g = OBJ.lock();
+    f()
+}
 
 fn objects() -> &'static mut Vec<Option<Object>> {
-    // SAFETY: single CPU, callers run with interrupts disabled.
-    unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) }
+    &mut st().objects
 }
 
 fn obj(id: ObjId) -> &'static mut Object {
@@ -271,7 +313,7 @@ fn obj_type(o: &Object) -> ObjType {
 
 /// Number of live kernel objects (for leak checks).
 pub fn live_objects() -> usize {
-    unsafe { LIVE_OBJECTS }
+    OBJ.lock().live
 }
 
 /// Create an object with no references yet; the caller installs a handle or calls
@@ -289,7 +331,7 @@ fn new_object(kind: Kind) -> Res<ObjId> {
         }
     };
     v[slot] = Some(Object { refs: 0, kind });
-    unsafe { LIVE_OBJECTS += 1 };
+    st().live += 1;
     Ok(slot as ObjId)
 }
 
@@ -315,19 +357,25 @@ fn free_object(id: ObjId) {
     }
 }
 
-/// IRQ line -> owning Interrupt object + 1 (0 = not owned by a driver).
-static mut IRQ_OWNER: [u32; 16] = [0; 16];
-
 fn irq_owner() -> &'static mut [u32; 16] {
-    // SAFETY: single CPU; touched with interrupts disabled (object code and the IRQ path).
-    unsafe { &mut *core::ptr::addr_of_mut!(IRQ_OWNER) }
+    &mut st().irq_owner
+}
+
+/// Record that `line` is (not) owned; keeps the lock-free mask in step.
+fn set_irq_owner(line: u8, owner_plus_1: u32) {
+    st().irq_owner[line as usize] = owner_plus_1;
+    if owner_plus_1 != 0 {
+        IRQ_OWNED_MASK.fetch_or(1 << line, Ordering::Relaxed);
+    } else {
+        IRQ_OWNED_MASK.fetch_and(!(1 << line), Ordering::Relaxed);
+    }
 }
 
 /// Remove object `id` from the table and release what it owns. References it held on
 /// other objects are pushed to `work` for the caller to drop.
 fn take_object(id: ObjId, work: &mut Vec<(ObjId, u32)>) {
     let old = objects()[id as usize].take();
-    unsafe { LIVE_OBJECTS -= 1 };
+    st().live -= 1;
     let kind = match old {
         Some(o) => o.kind,
         None => return,
@@ -350,7 +398,7 @@ fn take_object(id: ObjId, work: &mut Vec<(ObjId, u32)>) {
         },
         Kind::Interrupt(i) => {
             crate::arch::x86_64::pic::disable_irq(i.line);
-            irq_owner()[i.line as usize] = 0;
+            set_irq_owner(i.line, 0);
             if let Some((n, _)) = i.target {
                 work.push((n, 0));
             }
@@ -544,12 +592,14 @@ fn lookup(h: Handle, ty: ObjType, need: u32) -> Res<(ObjId, u32)> {
 // ─── Handle syscalls ─────────────────────────────────────────────────────────────────
 
 pub fn handle_close(h: Handle) -> Res<()> {
+    let _g = OBJ.lock();
     let e = cur_table().take(h)?;
     unref(e.obj, e.rights);
     Ok(())
 }
 
 pub fn handle_dup(h: Handle, new_rights: u32) -> Res<Handle> {
+    let _g = OBJ.lock();
     let e = cur_table().get(h)?;
     if e.rights & DUP == 0 {
         return Err(E::PermissionDenied as i64);
@@ -565,26 +615,31 @@ pub fn handle_dup(h: Handle, new_rights: u32) -> Res<Handle> {
 
 /// (object type, rights) of a handle.
 pub fn handle_info(h: Handle) -> Res<(ObjType, u32)> {
+    let _g = OBJ.lock();
     let e = cur_table().get(h)?;
     Ok((obj_type(obj(e.obj)), e.rights))
 }
 
 pub fn channel_create() -> Res<Handle> {
+    let _g = OBJ.lock();
     let id = new_channel_obj()?;
     install_current(id, READ | WRITE | DUP | TRANSFER)
 }
 
 pub fn notification_create() -> Res<Handle> {
+    let _g = OBJ.lock();
     let id = new_notification_obj()?;
     install_current(id, READ | WRITE | DUP | TRANSFER)
 }
 
 pub fn process_self() -> Res<Handle> {
+    let _g = OBJ.lock();
     let id = new_object(Kind::Process(scheduler::current_pid()))?;
     install_current(id, READ | WRITE | DUP | TRANSFER)
 }
 
 pub fn thread_self() -> Res<Handle> {
+    let _g = OBJ.lock();
     let id = new_object(Kind::Thread(scheduler::current_pid()))?;
     install_current(id, READ | WRITE | DUP | TRANSFER)
 }
@@ -684,6 +739,7 @@ fn check_sendable(chan: ObjId) -> Res<()> {
 
 /// One-way send: queue the message, never block.
 pub fn ipc_send(ch: Handle, um: &UserMessage) -> Res<()> {
+    let _g = OBJ.lock();
     let (chan, _) = lookup(ch, ObjType::Channel, WRITE)?;
     check_sendable(chan)?;
     let p = pack(um)?;
@@ -693,6 +749,7 @@ pub fn ipc_send(ch: Handle, um: &UserMessage) -> Res<()> {
 
 /// Synchronous call: send a request, sleep until the receiver replies, return the reply.
 pub fn ipc_call(ch: Handle, um: &UserMessage) -> Res<UserMessage> {
+    let mut g = OBJ.lock();
     let (chan, _) = lookup(ch, ObjType::Channel, WRITE)?;
     check_sendable(chan)?;
     let p = pack(um)?;
@@ -716,7 +773,7 @@ pub fn ipc_call(ch: Handle, um: &UserMessage) -> Res<UserMessage> {
         if done {
             break;
         }
-        scheduler::park(0);
+        g = park_unlocked(g, 0);
     }
 
     // Collect the outcome and release the object if the receiver side is already gone.
@@ -747,6 +804,7 @@ pub fn ipc_call(ch: Handle, um: &UserMessage) -> Res<UserMessage> {
 /// Receive the next request. Blocks while the queue is empty (`timeout_ticks` 0 = forever).
 /// Returns the message and a handle (WRITE) to answer it with, or 0 for a one-way message.
 pub fn ipc_recv(ch: Handle, timeout_ticks: u64) -> Res<(UserMessage, Handle)> {
+    let mut g = OBJ.lock();
     let (chan, _) = lookup(ch, ObjType::Channel, READ)?;
     let me = scheduler::current_pid();
     let deadline = if timeout_ticks == 0 { 0 } else { now() + timeout_ticks };
@@ -789,7 +847,7 @@ pub fn ipc_recv(ch: Handle, timeout_ticks: u64) -> Res<(UserMessage, Handle)> {
         if !c.receivers.contains(&me) {
             c.receivers.push(me);
         }
-        scheduler::park(deadline);
+        g = park_unlocked(g, deadline);
     }
 }
 
@@ -807,6 +865,7 @@ fn fail_reply(rid: ObjId, err: i64) {
 /// Answer a request. Consumes the reply handle once the caller got the answer or is gone;
 /// a malformed message leaves the handle in place so the server can retry.
 pub fn ipc_reply(rh: Handle, um: &UserMessage) -> Res<()> {
+    let _g = OBJ.lock();
     let (rid, _) = lookup(rh, ObjType::Reply, WRITE)?;
     let alive = matches!(&obj(rid).kind, Kind::Reply(rp) if rp.caller.is_some());
     let result = if !alive {
@@ -829,6 +888,7 @@ pub fn ipc_reply(rh: Handle, um: &UserMessage) -> Res<()> {
 // ─── Notifications ───────────────────────────────────────────────────────────────────
 
 pub fn notify_signal(h: Handle, bits: u32) -> Res<()> {
+    let _g = OBJ.lock();
     let (id, _) = lookup(h, ObjType::Notification, WRITE)?;
     signal_obj(id, bits);
     Ok(())
@@ -847,6 +907,7 @@ fn signal_obj(id: ObjId, bits: u32) {
 
 /// Wait until any bit is set, then return and clear them all.
 pub fn notify_wait(h: Handle, timeout_ticks: u64) -> Res<u32> {
+    let mut g = OBJ.lock();
     let (id, _) = lookup(h, ObjType::Notification, READ)?;
     let me = scheduler::current_pid();
     let deadline = if timeout_ticks == 0 { 0 } else { now() + timeout_ticks };
@@ -862,7 +923,7 @@ pub fn notify_wait(h: Handle, timeout_ticks: u64) -> Res<u32> {
                 n.waiters.push(me);
             }
         }
-        scheduler::park(deadline);
+        g = park_unlocked(g, deadline);
     }
 }
 
@@ -903,6 +964,7 @@ fn new_anon_region(pages: u64) -> Res<ObjId> {
 
 /// mem_create(size): a shareable anonymous region, rounded up to whole pages.
 pub fn mem_create(size: u64) -> Res<Handle> {
+    let _g = OBJ.lock();
     let pages = pages_for(size, MEM_MAX_BYTES)?;
     let id = new_anon_region(pages)?;
     install_current(id, READ | WRITE | MAP | DUP | TRANSFER)
@@ -911,6 +973,7 @@ pub fn mem_create(size: u64) -> Res<Handle> {
 /// mem_create_contig(resource, size): physically contiguous region for DMA. Needs a
 /// Resource handle of kind DMA with WRITE; the new handle also carries PHYS.
 pub fn mem_create_contig(res: Handle, size: u64) -> Res<Handle> {
+    let _g = OBJ.lock();
     let (rid, _) = lookup(res, ObjType::Resource, WRITE)?;
     if !matches!(obj(rid).kind, Kind::Resource(k) if k & resource::DMA != 0) {
         return Err(E::PermissionDenied as i64);
@@ -948,12 +1011,14 @@ fn mem_of(id: ObjId) -> &'static MemRegion {
 
 /// mem_size(h): size in bytes (any rights).
 pub fn mem_size(h: Handle) -> Res<u64> {
+    let _g = OBJ.lock();
     let (id, _) = lookup_mem(h, 0)?;
     Ok(mem_of(id).pages * PAGE)
 }
 
 /// mem_phys(h): physical address of a contiguous or device region. Needs PHYS.
 pub fn mem_phys(h: Handle) -> Res<u64> {
+    let _g = OBJ.lock();
     let (id, _) = lookup_mem(h, PHYS)?;
     match mem_of(id).backing {
         Backing::Contig(b) | Backing::Device(b) => Ok(b),
@@ -966,6 +1031,7 @@ pub fn mem_phys(h: Handle) -> Res<u64> {
 /// executable at once is refused (W^X); without EXEC the pages are no-execute. Device
 /// regions are mapped uncached. `hint` is reserved (pass 0): the kernel picks the address.
 pub fn mem_map(h: Handle, _hint: u64, p: u32) -> Res<u64> {
+    let _g = OBJ.lock();
     use crate::mm::r#virtual as vmm;
     if p & !(prot::READ | prot::WRITE | prot::EXEC) != 0
         || p & prot::READ == 0
@@ -1018,6 +1084,7 @@ pub fn mem_map(h: Handle, _hint: u64, p: u32) -> Res<u64> {
 
 /// mem_unmap(addr): remove a mapping made by mem_map; `addr` is the address it returned.
 pub fn mem_unmap(addr: u64) -> Res<()> {
+    let _g = OBJ.lock();
     use crate::mm::r#virtual as vmm;
     let t = cur_table();
     let i = t.maps.iter().position(|m| m.va == addr).ok_or(E::InvalidArgument as i64)?;
@@ -1043,6 +1110,7 @@ pub fn mem_unmap(addr: u64) -> Res<()> {
 /// notification. Needs READ on the Interrupt and WRITE on the Notification. Replaces an
 /// earlier binding. The line stays masked until irq_ack.
 pub fn irq_bind(irq: Handle, notif: Handle, bits: u32) -> Res<()> {
+    let _g = OBJ.lock();
     let (iid, _) = lookup(irq, ObjType::Interrupt, READ)?;
     let (nid, _) = lookup(notif, ObjType::Notification, WRITE)?;
     if bits == 0 {
@@ -1061,6 +1129,7 @@ pub fn irq_bind(irq: Handle, notif: Handle, bits: u32) -> Res<()> {
 
 /// irq_ack(irq): the driver has handled the device; unmask the line. Needs WRITE.
 pub fn irq_ack(irq: Handle) -> Res<()> {
+    let _g = OBJ.lock();
     let (iid, _) = lookup(irq, ObjType::Interrupt, WRITE)?;
     if let Kind::Interrupt(i) = &obj(iid).kind {
         crate::arch::x86_64::pic::enable_irq(i.line);
@@ -1072,6 +1141,10 @@ pub fn irq_ack(irq: Handle) -> Res<()> {
 /// If a driver owns the line: mask it, signal the bound notification, return true
 /// (the caller sends EOI). No allocation here.
 pub fn irq_fire(line: u8) -> bool {
+    if line >= 16 || IRQ_OWNED_MASK.load(Ordering::Relaxed) & (1 << line) == 0 {
+        return false;
+    }
+    let _g = OBJ.lock();
     let owner = match irq_owner().get(line as usize) {
         Some(&o) if o != 0 => o - 1,
         _ => return false,
@@ -1115,6 +1188,7 @@ fn io_bitmap(t: &HandleTable) -> Vec<u8> {
 /// ioport_enable(h): allow the caller's IN/OUT on the range. Needs READ and WRITE (the
 /// hardware bitmap cannot split them). Lasts until ioport_disable or exit.
 pub fn ioport_enable(h: Handle) -> Res<()> {
+    let _g = OBJ.lock();
     let (id, _) = lookup(h, ObjType::IoPortRange, READ | WRITE)?;
     let t = cur_table();
     if !t.io.contains(&id) {
@@ -1128,6 +1202,7 @@ pub fn ioport_enable(h: Handle) -> Res<()> {
 
 /// ioport_disable(h): withdraw the access ioport_enable granted.
 pub fn ioport_disable(h: Handle) -> Res<()> {
+    let _g = OBJ.lock();
     let (id, _) = lookup(h, ObjType::IoPortRange, 0)?;
     let t = cur_table();
     let i = t.io.iter().position(|&o| o == id).ok_or(E::InvalidArgument as i64)?;
@@ -1153,6 +1228,7 @@ fn task_of(h: Handle, need: u32) -> Res<u32> {
 
 /// Block until the process exits; returns its exit code.
 pub fn process_wait(h: Handle, timeout_ticks: u64) -> Res<i64> {
+    let mut g = OBJ.lock();
     let pid = task_of(h, READ)?;
     let me = scheduler::current_pid();
     let deadline = if timeout_ticks == 0 { 0 } else { now() + timeout_ticks };
@@ -1163,16 +1239,16 @@ pub fn process_wait(h: Handle, timeout_ticks: u64) -> Res<i64> {
         if deadline != 0 && now() >= deadline {
             return Err(E::Timeout as i64);
         }
-        // SAFETY: interrupts are off.
-        let w = unsafe { &mut *core::ptr::addr_of_mut!(PROC_WAITERS) };
+        let w = &mut st().proc_waiters;
         if !w.contains(&(me, pid)) {
             w.push((me, pid));
         }
-        scheduler::park(deadline);
+        g = park_unlocked(g, deadline);
     }
 }
 
 pub fn process_kill(h: Handle) -> Res<()> {
+    let _g = OBJ.lock();
     let pid = task_of(h, WRITE)?;
     if pid <= 1 || pid == scheduler::current_pid() {
         return Err(E::InvalidArgument as i64);
@@ -1189,6 +1265,7 @@ fn now() -> u64 {
 /// A task has been reaped: close its handles and wake whoever waited for it.
 /// `ipc_wait` is the Reply object (+1) it was blocked on in `call`, if any.
 pub fn task_reaped(pid: u32, mut handles: HandleTable, ipc_wait: u32) {
+    let _g = OBJ.lock();
     if ipc_wait != 0 {
         let rid = ipc_wait - 1;
         if let Kind::Reply(rp) = &mut obj(rid).kind {
@@ -1196,16 +1273,15 @@ pub fn task_reaped(pid: u32, mut handles: HandleTable, ipc_wait: u32) {
         }
         if obj(rid).refs == 0 {
             // The receiver side is gone already; nobody else will free it.
-            let st = objects()[rid as usize].take();
-            if let Some(Object { kind: Kind::Reply(Reply { state: ReplyState::Done(p), .. }), .. }) = st {
+            let old = objects()[rid as usize].take();
+            if let Some(Object { kind: Kind::Reply(Reply { state: ReplyState::Done(p), .. }), .. }) = old {
                 drop_parcel(&p);
             }
-            unsafe { LIVE_OBJECTS -= 1 };
+            st().live -= 1;
         }
     }
     handles.close_all();
-    // SAFETY: interrupts are off in the reaper.
-    let w = unsafe { &mut *core::ptr::addr_of_mut!(PROC_WAITERS) };
+    let w = &mut st().proc_waiters;
     w.retain(|&(waiter, target)| {
         if target == pid {
             scheduler::wake(waiter);
@@ -1220,22 +1296,22 @@ pub fn task_reaped(pid: u32, mut handles: HandleTable, ipc_wait: u32) {
 
 /// A new channel with no handles yet.
 pub fn kernel_new_channel() -> Option<ObjId> {
-    scheduler::without_interrupts(|| new_channel_obj().ok())
+    locked(|| new_channel_obj().ok())
 }
 
 pub fn kernel_new_notification() -> Option<ObjId> {
-    scheduler::without_interrupts(|| new_notification_obj().ok())
+    locked(|| new_notification_obj().ok())
 }
 
 /// An anonymous memory region of `size` bytes (rounded up to pages).
 pub fn kernel_new_memory(size: u64) -> Option<ObjId> {
-    scheduler::without_interrupts(|| new_anon_region(pages_for(size, MEM_MAX_BYTES).ok()?).ok())
+    locked(|| new_anon_region(pages_for(size, MEM_MAX_BYTES).ok()?).ok())
 }
 
 /// HHDM address of page `page` of a memory region (kernel-side access for tests and
 /// servers set up by the kernel). None for device regions or out-of-range pages.
 pub fn kernel_memory_page(id: ObjId, page: u64) -> Option<*mut u8> {
-    scheduler::without_interrupts(|| {
+    locked(|| {
         if !exists(id) {
             return None;
         }
@@ -1261,7 +1337,7 @@ pub fn kernel_new_mmio(phys: u64, size: u64) -> Option<ObjId> {
     if in_ram {
         return None;
     }
-    scheduler::without_interrupts(|| {
+    locked(|| {
         new_object(Kind::Memory(MemRegion { pages, backing: Backing::Device(phys) })).ok()
     })
 }
@@ -1272,20 +1348,20 @@ pub fn kernel_new_interrupt(line: u8) -> Option<ObjId> {
     if !IRQ_ASSIGNABLE.contains(&line) || crate::acpi::is_sci_irq(line) {
         return None;
     }
-    scheduler::without_interrupts(|| {
+    locked(|| {
         if irq_owner()[line as usize] != 0 {
             return None;
         }
         let id = new_object(Kind::Interrupt(Interrupt { line, target: None, count: 0 })).ok()?;
         crate::arch::x86_64::pic::disable_irq(line);
-        irq_owner()[line as usize] = id + 1;
+        set_irq_owner(line, id + 1);
         Some(id)
     })
 }
 
 /// Interrupts delivered so far through the Interrupt object `id` (diagnostics).
 pub fn kernel_interrupt_count(id: ObjId) -> Option<u64> {
-    scheduler::without_interrupts(|| match objects().get(id as usize) {
+    locked(|| match objects().get(id as usize) {
         Some(Some(Object { kind: Kind::Interrupt(i), .. })) => Some(i.count),
         _ => None,
     })
@@ -1296,23 +1372,23 @@ pub fn kernel_new_ioports(base: u16, count: u32) -> Option<ObjId> {
     if count == 0 || base as u32 + count > 0x1_0000 {
         return None;
     }
-    scheduler::without_interrupts(|| new_object(Kind::IoPorts { base, count }).ok())
+    locked(|| new_object(Kind::IoPorts { base, count }).ok())
 }
 
 /// A Resource object of the given kinds (`resource::DMA`, ...).
 pub fn kernel_new_resource(kinds: u32) -> Option<ObjId> {
-    scheduler::without_interrupts(|| new_object(Kind::Resource(kinds)).ok())
+    locked(|| new_object(Kind::Resource(kinds)).ok())
 }
 
 /// A Process object for `pid`.
 pub fn kernel_new_process(pid: u32) -> Option<ObjId> {
-    scheduler::without_interrupts(|| new_object(Kind::Process(pid)).ok())
+    locked(|| new_object(Kind::Process(pid)).ok())
 }
 
 /// Give process `pid` a handle to `id`. Handles installed before a program starts get the
 /// values 1, 2, 3... in the order of installation.
 pub fn kernel_install(pid: u32, id: ObjId, r: u32) -> Option<Handle> {
-    scheduler::without_interrupts(|| {
+    locked(|| {
         if !exists(id) {
             return None;
         }
@@ -1325,7 +1401,7 @@ pub fn kernel_install(pid: u32, id: ObjId, r: u32) -> Option<Handle> {
 
 /// Drop the kernel's claim on an object it created; frees it if no handle took it.
 pub fn kernel_release(id: ObjId) {
-    scheduler::without_interrupts(|| {
+    locked(|| {
         if exists(id) {
             release_unused(id)
         }

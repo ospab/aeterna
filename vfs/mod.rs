@@ -36,25 +36,27 @@ use alloc::boxed::Box;
 
 /// The filesystem instance that should be synced to disk.
 /// Set during boot to the primary RamFS (or the Upper layer of CowFS).
-static mut SYNCABLE_FS: Option<&'static ramfs::RamFs> = None;
+static SYNCABLE_FS: crate::core::sync::IrqSpinLock<Option<&'static ramfs::RamFs>> =
+    crate::core::sync::IrqSpinLock::new("VFS.syncable", crate::core::sync::rank::VFS, None);
+
+/// The registered filesystem. Copied out so no lock is held while it is used.
+fn syncable() -> Option<&'static ramfs::RamFs> {
+    *SYNCABLE_FS.lock()
+}
 
 /// Register a RamFS instance as the primary one for disk persistence.
 pub fn set_syncable_fs(fs: &'static ramfs::RamFs) {
-    unsafe { SYNCABLE_FS = Some(fs); }
+    *SYNCABLE_FS.lock() = Some(fs);
 }
 
 /// Helper for disk_sync: find the registered syncable RamFS and get a copy of its tree.
 pub fn get_tree_copy() -> Option<alloc::collections::BTreeMap<String, RamNode>> {
-    unsafe {
-        SYNCABLE_FS.map(|fs| fs.get_tree_copy())
-    }
+    syncable().map(|fs| fs.get_tree_copy())
 }
 
 /// Helper for disk_sync: check if the registered syncable FS is dirty.
 pub fn is_syncable_dirty() -> bool {
-    unsafe {
-        SYNCABLE_FS.map(|fs| fs.is_dirty.load(core::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
-    }
+    syncable().map(|fs| fs.is_dirty.load(core::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
 }
 
 /// Force a disk sync of the registered syncable FS.
@@ -64,18 +66,14 @@ pub fn sync_now() {
 
 /// Reset the dirty flag on the syncable FS.
 pub fn clear_syncable_dirty() {
-    unsafe {
-        if let Some(fs) = SYNCABLE_FS {
-            fs.is_dirty.store(false, core::sync::atomic::Ordering::Relaxed);
-        }
+    if let Some(fs) = syncable() {
+        fs.is_dirty.store(false, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// Get the node count of the registered syncable RamFS.
 pub fn node_count() -> usize {
-    unsafe {
-        SYNCABLE_FS.map(|fs| fs.node_count()).unwrap_or(0)
-    }
+    syncable().map(|fs| fs.node_count()).unwrap_or(0)
 }
 
 use alloc::string::String;
@@ -219,60 +217,24 @@ struct MountPoint {
 /// Maximum number of mount points
 const MAX_MOUNTS: usize = 16;
 
-/// Global mount table (sorted by path length descending for longest-prefix match)
-static mut MOUNTS: Option<Vec<MountPoint>> = None;
-static mut VFS_INIT: bool = false;
-
-/// Maximum open file descriptors
-const MAX_FDS: usize = 64;
-
-/// An open file descriptor
-struct OpenFile {
-    /// Full VFS path
-    path: String,
-    /// Current seek position
-    offset: usize,
-    /// Is this slot in use?
-    active: bool,
-    /// Read mode
-    readable: bool,
-    /// Write mode
-    writable: bool,
-    /// True if data was written through this FD (needs disk sync on close)
-    dirty: bool,
-}
-
-/// Global file descriptor table
-/// fd 0 = stdin, 1 = stdout, 2 = stderr (reserved)
-static mut FD_TABLE: Option<Vec<OpenFile>> = None;
+/// Global mount table (sorted by path length descending for longest-prefix match).
+/// Lock class VFS: held only for the lookup, never across filesystem calls.
+static MOUNTS: crate::core::sync::IrqSpinLock<Vec<MountPoint>> =
+    crate::core::sync::IrqSpinLock::new("VFS.mounts", crate::core::sync::rank::VFS, Vec::new());
+static VFS_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 /// Initialize the VFS. Call after heap is ready.
 pub fn init() {
-    unsafe {
-        MOUNTS = Some(Vec::with_capacity(MAX_MOUNTS));
-        // Pre-allocate FD table with reserved entries for stdin/stdout/stderr
-        let mut fds = Vec::with_capacity(MAX_FDS);
-        for i in 0..3 {
-            fds.push(OpenFile {
-                path: String::new(),
-                offset: 0,
-                active: true, // reserved
-                readable: i == 0,   // stdin
-                writable: i >= 1,   // stdout, stderr
-                dirty: false,
-            });
-        }
-        FD_TABLE = Some(fds);
-        VFS_INIT = true;
-    }
+    MOUNTS.lock().reserve(MAX_MOUNTS);
+    VFS_INIT.store(true, core::sync::atomic::Ordering::Release);
     crate::arch::x86_64::serial::write_str("[VFS] Initialized\r\n");
 }
 
 /// Check if VFS is initialized
 pub fn is_initialized() -> bool {
-    unsafe { VFS_INIT }
+    VFS_INIT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 // ─── Mount / Unmount ────────────────────────────────────────────────────────
@@ -280,41 +242,33 @@ pub fn is_initialized() -> bool {
 /// Mount a filesystem at the given path.
 /// The path must start with "/". Duplicate mounts at the same path are not allowed.
 pub fn mount(path: &str, fs: &'static dyn FileSystem) -> bool {
-    unsafe {
-        let mounts = match MOUNTS.as_mut() {
-            Some(m) => m,
-            None => return false,
-        };
-
-        // Check for duplicate
-        for m in mounts.iter() {
-            if m.path == path {
-                crate::arch::x86_64::serial::write_str("[VFS] Mount point already exists: ");
-                crate::arch::x86_64::serial::write_str(path);
-                crate::arch::x86_64::serial::write_str("\r\n");
-                return false;
-            }
-        }
-
-        if mounts.len() >= MAX_MOUNTS {
+    if !is_initialized() {
+        return false;
+    }
+    let duplicate = {
+        let mut mounts = MOUNTS.lock();
+        if mounts.iter().any(|m| m.path == path) {
+            true
+        } else if mounts.len() >= MAX_MOUNTS {
             return false;
+        } else {
+            mounts.push(MountPoint { path: String::from(path), fs });
+            // Sort by path length descending for longest-prefix matching
+            mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+            false
         }
-
-        mounts.push(MountPoint {
-            path: String::from(path),
-            fs,
-        });
-
-        // Sort by path length descending for longest-prefix matching
-        mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
-
-        crate::arch::x86_64::serial::write_str("[VFS] Mounted ");
-        crate::arch::x86_64::serial::write_str(fs.name());
-        crate::arch::x86_64::serial::write_str(" at ");
+    };
+    if duplicate {
+        crate::arch::x86_64::serial::write_str("[VFS] Mount point already exists: ");
         crate::arch::x86_64::serial::write_str(path);
         crate::arch::x86_64::serial::write_str("\r\n");
+        return false;
     }
-
+    crate::arch::x86_64::serial::write_str("[VFS] Mounted ");
+    crate::arch::x86_64::serial::write_str(fs.name());
+    crate::arch::x86_64::serial::write_str(" at ");
+    crate::arch::x86_64::serial::write_str(path);
+    crate::arch::x86_64::serial::write_str("\r\n");
     true
 }
 
@@ -336,27 +290,25 @@ pub fn register_userspace_fs(path: &str, server_pid: u32, channel_id: u32) -> bo
 /// Returns (filesystem ref, relative path within that FS).
 /// Uses longest-prefix matching.
 fn resolve(path: &str) -> Option<(&'static dyn FileSystem, String)> {
-    unsafe {
-        let mounts = MOUNTS.as_ref()?;
-        for m in mounts.iter() {
-            if path == m.path {
-                // Exact match: relative path is "/"
-                return Some((m.fs, String::from("/")));
-            }
-            if m.path == "/" {
-                // Root mount matches everything
-                return Some((m.fs, String::from(path)));
-            }
-            if path.starts_with(m.path.as_str()) {
-                let rest = &path[m.path.len()..];
-                if rest.is_empty() || rest.starts_with('/') {
-                    let rel = if rest.is_empty() { String::from("/") } else { String::from(rest) };
-                    return Some((m.fs, rel));
-                }
+    let mounts = MOUNTS.lock();
+    for m in mounts.iter() {
+        if path == m.path {
+            // Exact match: relative path is "/"
+            return Some((m.fs, String::from("/")));
+        }
+        if m.path == "/" {
+            // Root mount matches everything
+            return Some((m.fs, String::from(path)));
+        }
+        if path.starts_with(m.path.as_str()) {
+            let rest = &path[m.path.len()..];
+            if rest.is_empty() || rest.starts_with('/') {
+                let rel = if rest.is_empty() { String::from("/") } else { String::from(rest) };
+                return Some((m.fs, rel));
             }
         }
-        None
     }
+    None
 }
 
 // ─── Public VFS operations ──────────────────────────────────────────────────
@@ -449,8 +401,15 @@ pub fn rename(from: &str, to: &str) -> bool {
 }
 
 // ─── File descriptor operations ─────────────────────────────────────────────
+//
+// The table belongs to the calling task (core/fd.rs, in its control block). fd 0, 1, 2 are
+// the standard streams and are handled by the syscall layer; files start at fd 3. The table
+// is touched only briefly under the scheduler lock; the file I/O itself runs without a lock.
 
-/// Open a file, returning a file descriptor number.
+use crate::core::fd::OpenFile;
+use crate::core::scheduler::with_current_fds;
+
+/// Open a file for the current task, returning a file descriptor number.
 /// flags: 0 = read, 1 = write, 2 = read+write
 /// Returns -1 on error.
 pub fn sys_open(path: &str, flags: u64) -> i64 {
@@ -469,192 +428,121 @@ pub fn sys_open(path: &str, flags: u64) -> i64 {
         }
     }
 
-    unsafe {
-        let fds = match FD_TABLE.as_mut() {
-            Some(f) => f,
-            None => return -1,
-        };
-
-        // Find a free slot (skip 0,1,2 reserved)
-        for i in 3..fds.len() {
-            if !fds[i].active {
-                fds[i] = OpenFile {
-                    path: String::from(path),
-                    offset: 0,
-                    active: true,
-                    readable,
-                    writable,
-                    dirty: false,
-                };
-                return i as i64;
-            }
-        }
-
-        // No free slot — allocate one
-        if fds.len() < MAX_FDS {
-            let fd = fds.len();
-            fds.push(OpenFile {
-                path: String::from(path),
-                offset: 0,
-                active: true,
-                readable,
-                writable,
-                dirty: false,
-            });
-            return fd as i64;
-        }
-
-        -1 // No FDs available
+    let file = OpenFile { path: String::from(path), offset: 0, readable, writable, dirty: false };
+    match with_current_fds(|t| t.alloc(file)) {
+        Some(fd) => fd as i64,
+        None => -1, // No FDs available
     }
 }
 
 /// Read from a file descriptor into a buffer. Returns bytes read.
 pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
-    unsafe {
-        let fds = match FD_TABLE.as_ref() {
-            Some(f) => f,
-            None => return -1,
-        };
-        if fd >= fds.len() || !fds[fd].active || !fds[fd].readable {
-            return -1;
-        }
+    let (path, offset) = match with_current_fds(|t| {
+        t.get(fd).filter(|f| f.readable).map(|f| (f.path.clone(), f.offset))
+    }) {
+        Some(x) => x,
+        None => return -1,
+    };
 
-        let path = &fds[fd].path;
-        let offset = fds[fd].offset;
+    // Resolve absolute VFS path to (filesystem, RelativePath)
+    let (fs, rel_path) = match resolve(&path) {
+        Some(res) => res,
+        None => return -1,
+    };
 
-        // Resolve absolute VFS path to (filesystem, RelativePath)
-        let (fs, rel_path) = match resolve(path) {
-            Some(res) => res,
-            None => return -1,
-        };
-
-        match fs.read_at(&rel_path, offset, buf) {
-            Some(bytes_read) => {
-                // Update offset (need mutable access)
-                if let Some(fds_mut) = FD_TABLE.as_mut() {
-                    fds_mut[fd].offset += bytes_read;
+    match fs.read_at(&rel_path, offset, buf) {
+        Some(n) => {
+            with_current_fds(|t| {
+                if let Some(f) = t.get_mut(fd) {
+                    f.offset = offset + n;
                 }
-                bytes_read as i64
-            }
-            None => -1,
+            });
+            n as i64
         }
+        None => -1,
     }
 }
 
 /// Write to a file descriptor. Returns bytes written.
 pub fn sys_write(fd: usize, data: &[u8]) -> i64 {
-    unsafe {
-        let fds = match FD_TABLE.as_ref() {
-            Some(f) => f,
-            None => return -1,
-        };
+    // fd 1 = stdout, fd 2 = stderr → serial (kernel callers; ring-3 programs are
+    // routed by the syscall layer)
+    if fd == 1 || fd == 2 {
+        for &b in data {
+            crate::arch::x86_64::serial::write_byte(b);
+        }
+        return data.len() as i64;
+    }
 
-        // fd 1 = stdout, fd 2 = stderr → write to serial + framebuffer
-        if fd == 1 || fd == 2 {
-            for &b in data {
-                crate::arch::x86_64::serial::write_byte(b);
+    let (path, offset) = match with_current_fds(|t| {
+        t.get(fd).filter(|f| f.writable).map(|f| (f.path.clone(), f.offset))
+    }) {
+        Some(x) => x,
+        None => return -1,
+    };
+
+    // Resolve absolute VFS path to (filesystem, RelativePath)
+    let (fs, rel_path) = match resolve(&path) {
+        Some(res) => res,
+        None => return -1,
+    };
+
+    if fs.write_at(&rel_path, offset, data) {
+        with_current_fds(|t| {
+            if let Some(f) = t.get_mut(fd) {
+                f.offset = offset + data.len();
+                f.dirty = true;
             }
-            return data.len() as i64;
-        }
-
-        if fd >= fds.len() || !fds[fd].active || !fds[fd].writable {
-            return -1;
-        }
-
-        let path = fds[fd].path.clone();
-        let offset = fds[fd].offset;
-
-        // Resolve absolute VFS path to (filesystem, RelativePath)
-        let (fs, rel_path) = match resolve(&path) {
-            Some(res) => res,
-            None => return -1,
-        };
-
-        if fs.write_at(&rel_path, offset, data) {
-            if let Some(fds_mut) = FD_TABLE.as_mut() {
-                fds_mut[fd].offset += data.len();
-                fds_mut[fd].dirty = true;
-            }
-            data.len() as i64
-        } else {
-            -1
-        }
+        });
+        data.len() as i64
+    } else {
+        -1
     }
 }
 
-/// Close all open VFS file descriptors (fd ≥ 3).
+/// Close all open VFS file descriptors (fd >= 3) of the current task.
 /// Call at the start of each DOOM session to clean up zombie FDs left open
 /// when the previous session exited via longjmp (bypassing fclose).
-/// Triggers a disk sync if any dirty FDs are found.
 pub fn close_all_vfs_fds() {
-    unsafe {
-        let fds = match FD_TABLE.as_mut() {
-            Some(f) => f,
-            None => return,
-        };
-        for i in 3..fds.len() {
-            if fds[i].active {
-                fds[i].active = false;
-                fds[i].dirty = false;
-                fds[i].path.clear();
-                fds[i].offset = 0;
-            }
-        }
-        // No forced sync here — deferred_tick() will flush within ~10 s.
-    }
+    // No forced sync here — deferred_tick() will flush within ~10 s.
+    with_current_fds(|t| t.close_files());
 }
 
-/// Close a file descriptor.
+/// Close a file descriptor of the current task.
 pub fn sys_close(fd: usize) -> i64 {
-    unsafe {
-        let fds = match FD_TABLE.as_mut() {
-            Some(f) => f,
-            None => return -1,
-        };
-        if fd < 3 || fd >= fds.len() || !fds[fd].active {
-            return -1;
-        }
-        let was_dirty = fds[fd].dirty;
-        fds[fd].active = false;
-        fds[fd].dirty = false;
-        fds[fd].path.clear();
-        fds[fd].offset = 0;
-
-        // FD is closed. The deferred timer in the terminal idle loop will
-        // flush to disk ~10 s after the last write. No blocking sync here.
-        let _ = was_dirty;
-        0
-    }
+    // The deferred timer in the terminal idle loop flushes to disk ~10 s after the last
+    // write. No blocking sync here.
+    if with_current_fds(|t| t.close(fd)) { 0 } else { -1 }
 }
 
 /// Seek within a file descriptor.
 /// whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END.
 /// Returns new offset or -1 on error.
 pub fn sys_seek(fd: usize, offset: i64, whence: i32) -> i64 {
-    unsafe {
-        let fds = match FD_TABLE.as_mut() {
-            Some(f) => f,
-            None => return -1,
-        };
-        if fd < 3 || fd >= fds.len() || !fds[fd].active {
-            return -1;
+    let (path, cur) = match with_current_fds(|t| t.get(fd).map(|f| (f.path.clone(), f.offset))) {
+        Some(x) => x,
+        None => return -1,
+    };
+
+    // File size for SEEK_END
+    let file_size = if whence == 2 {
+        stat(&path).map_or(0i64, |e| e.size as i64)
+    } else {
+        0
+    };
+
+    let new_pos = match whence {
+        0 => offset,                // SEEK_SET
+        1 => cur as i64 + offset,   // SEEK_CUR
+        2 => file_size + offset,    // SEEK_END
+        _ => return -1,
+    };
+
+    if new_pos < 0 { return -1; }
+    with_current_fds(|t| {
+        if let Some(f) = t.get_mut(fd) {
+            f.offset = new_pos as usize;
         }
-
-        // Get file size for SEEK_END
-        let file_size = match read_file(&fds[fd].path) {
-            Some(data) => data.len() as i64,
-            None => 0i64,
-        };
-
-        let new_pos = match whence {
-            0 => offset,                           // SEEK_SET
-            1 => fds[fd].offset as i64 + offset,   // SEEK_CUR
-            2 => file_size + offset,                // SEEK_END
-            _ => return -1,
-        };
-
-        if new_pos < 0 { return -1; }
-        fds[fd].offset = new_pos as usize;
-        new_pos
-    }
+    });
+    new_pos
 }

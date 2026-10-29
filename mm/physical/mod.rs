@@ -11,7 +11,7 @@ Every frame handed out is zeroed, so a frame freed by one process never leaks
 its contents to the next owner.
 */
 
-use spin::Mutex;
+use crate::core::sync::{IrqSpinLock, OnceCell};
 
 /// Physical page frame size (4 KiB)
 pub const FRAME_SIZE: u64 = 4096;
@@ -180,25 +180,22 @@ impl FrameBitmap {
     }
 }
 
-static BITMAP: Mutex<FrameBitmap> = Mutex::new(FrameBitmap::empty());
+/// Lock class PMM (innermost but HEAP): the frame bitmap. Interrupt handlers may take it.
+static BITMAP: IrqSpinLock<FrameBitmap> = IrqSpinLock::new("PMM", crate::core::sync::rank::PMM, FrameBitmap::empty());
 
-static mut REGIONS: [PhysRegion; MAX_REGIONS] = [PhysRegion { base: 0, length: 0 }; MAX_REGIONS];
-static mut REGION_COUNT: usize = 0;
-static mut TOTAL_MEMORY: u64 = 0;
-static mut USABLE_MEMORY: u64 = 0;
+/// Memory map summary, written once by init().
+struct MemInfo {
+    regions: [PhysRegion; MAX_REGIONS],
+    count: usize,
+    total: u64,
+    usable: u64,
+}
 
-/// Run `f` with the bitmap locked and interrupts disabled, so an interrupt
-/// handler that allocates can never deadlock against the code it interrupted.
+static MEMINFO: OnceCell<MemInfo> = OnceCell::new();
+
+/// Run `f` with the bitmap locked (the lock also disables interrupts).
 fn with_bitmap<R>(f: impl FnOnce(&mut FrameBitmap) -> R) -> R {
-    let rflags: u64;
-    // SAFETY: reading RFLAGS and clearing IF has no memory effects.
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) rflags, options(nomem)) };
-    let result = f(&mut BITMAP.lock());
-    if rflags & (1 << 9) != 0 {
-        // SAFETY: restore interrupts only if they were enabled before.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
-    }
-    result
+    f(&mut BITMAP.lock())
 }
 
 /// Initialize the physical memory manager from the bootloader memory map.
@@ -217,6 +214,7 @@ pub fn init() {
     let mut usable: u64 = 0;
     let mut count: usize = 0;
     let mut highest: u64 = 0;
+    let mut region_buf = [PhysRegion { base: 0, length: 0 }; MAX_REGIONS];
 
     for entry in memmap {
         total += entry.length;
@@ -224,8 +222,7 @@ pub fn init() {
             usable += entry.length;
             highest = highest.max(entry.base + entry.length);
             if count < MAX_REGIONS {
-                // SAFETY: single-threaded early boot.
-                unsafe { REGIONS[count] = PhysRegion { base: entry.base, length: entry.length } };
+                region_buf[count] = PhysRegion { base: entry.base, length: entry.length };
                 count += 1;
             } else {
                 serial("[MM] WARN: too many memory regions, ignoring the rest\r\n");
@@ -233,13 +230,8 @@ pub fn init() {
         }
     }
 
-    // SAFETY: single-threaded early boot.
-    let regions = unsafe {
-        REGION_COUNT = count;
-        TOTAL_MEMORY = total;
-        USABLE_MEMORY = usable;
-        &REGIONS[..count]
-    };
+    let _ = MEMINFO.set(MemInfo { regions: region_buf, count, total, usable });
+    let regions = &MEMINFO.get().unwrap().regions[..count];
 
     let frame_count = highest / FRAME_SIZE;
     let word_count = ((frame_count + 63) / 64) as usize;
@@ -364,14 +356,14 @@ pub fn free_frames(phys: u64, count: u64) {
 
 /// Get memory statistics
 pub fn stats() -> PhysMemStats {
-    // SAFETY: written once during init.
-    unsafe {
-        PhysMemStats {
-            total_bytes: TOTAL_MEMORY,
-            usable_bytes: USABLE_MEMORY,
-            reserved_bytes: TOTAL_MEMORY - USABLE_MEMORY,
-            region_count: REGION_COUNT,
-        }
+    match MEMINFO.get() {
+        Some(m) => PhysMemStats {
+            total_bytes: m.total,
+            usable_bytes: m.usable,
+            reserved_bytes: m.total - m.usable,
+            region_count: m.count,
+        },
+        None => PhysMemStats { total_bytes: 0, usable_bytes: 0, reserved_bytes: 0, region_count: 0 },
     }
 }
 
@@ -387,14 +379,12 @@ pub fn frames_free() -> u64 {
 
 /// Get usable memory in bytes
 pub fn usable_memory() -> u64 {
-    // SAFETY: written once during init.
-    unsafe { USABLE_MEMORY }
+    MEMINFO.get().map_or(0, |m| m.usable)
 }
 
 /// Get total memory in bytes
 pub fn total_memory() -> u64 {
-    // SAFETY: written once during init.
-    unsafe { TOTAL_MEMORY }
+    MEMINFO.get().map_or(0, |m| m.total)
 }
 
 /// Allocate and free a few frames and check the accounting and zeroing.
@@ -465,6 +455,5 @@ fn log_dec(mut val: u64) {
 }
 
 pub fn get_usable_regions() -> &'static [PhysRegion] {
-    // SAFETY: written once during init.
-    unsafe { &REGIONS[..REGION_COUNT] }
+    MEMINFO.get().map_or(&[], |m| &m.regions[..m.count])
 }

@@ -107,14 +107,14 @@ fn emit(ext: bool, code: u8, release: bool) {
     let code = if release { code | 0x80 } else { code };
     let flags: u64;
     // SAFETY: save RFLAGS and disable interrupts for the two buffer writes.
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options()); }
     if ext {
         idt::kb_buffer_write(0xE0);
     }
     idt::kb_buffer_write(code);
     if flags & (1 << 9) != 0 {
         // SAFETY: interrupts were enabled on entry.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+        unsafe { core::arch::asm!("sti", options(nostack)); }
     }
 }
 

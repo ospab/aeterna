@@ -16,18 +16,11 @@
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 // ─── DNS RX buffer — written by UDP handler, read by dns code ────────────
-static mut DNS_RX_BUF: [u8; 512] = [0; 512];
-static mut DNS_RX_LEN: usize = 0;
-static DNS_RX_READY: AtomicBool = AtomicBool::new(false);
+static DNS_RX: super::Mailbox<512> = super::Mailbox::new("DNS.rx");
 
 /// Called from UDP dispatch when dst_port matches our ephemeral DNS source port.
 pub fn handle_dns_udp(data: &[u8]) {
-    let copy = data.len().min(512);
-    unsafe {
-        DNS_RX_BUF[..copy].copy_from_slice(&data[..copy]);
-        DNS_RX_LEN = copy;
-    }
-    DNS_RX_READY.store(true, Ordering::Release);
+    DNS_RX.put(data, 0);
 }
 
 // ─── Cache ───────────────────────────────────────────────────────────────
@@ -48,17 +41,22 @@ impl CacheEntry {
     }
 }
 
-static mut DNS_CACHE: [CacheEntry; CACHE_SIZE] = {
-    const EMPTY: CacheEntry = CacheEntry::empty();
-    [EMPTY; CACHE_SIZE]
-};
-static mut CACHE_NEXT: usize = 0;
+struct DnsCache {
+    entries: [CacheEntry; CACHE_SIZE],
+    next: usize,
+}
+
+static DNS_CACHE: crate::core::sync::IrqSpinLock<DnsCache> = crate::core::sync::IrqSpinLock::new(
+    "DNS",
+    crate::core::sync::rank::DEV,
+    DnsCache { entries: [const { CacheEntry::empty() }; CACHE_SIZE], next: 0 },
+);
 
 fn cache_lookup(name: &str) -> Option<[u8; 4]> {
     let now = crate::arch::x86_64::idt::timer_ticks();
     let nb = name.as_bytes();
-    unsafe {
-        for e in DNS_CACHE.iter_mut() {
+    {
+        for e in DNS_CACHE.lock().entries.iter_mut() {
             if e.valid && e.name_len as usize == nb.len()
                 && &e.name[..e.name_len as usize] == nb
             {
@@ -77,14 +75,16 @@ fn cache_insert(name: &str, ip: [u8; 4]) {
     let now = crate::arch::x86_64::idt::timer_ticks();
     let nb = name.as_bytes();
     if nb.len() > 64 { return; }
-    unsafe {
-        let slot = CACHE_NEXT % CACHE_SIZE;
-        DNS_CACHE[slot].name[..nb.len()].copy_from_slice(nb);
-        DNS_CACHE[slot].name_len = nb.len() as u8;
-        DNS_CACHE[slot].ip = ip;
-        DNS_CACHE[slot].stamp = now;
-        DNS_CACHE[slot].valid = true;
-        CACHE_NEXT += 1;
+    {
+        let mut g = DNS_CACHE.lock();
+        let st = &mut *g;
+        let slot = st.next % CACHE_SIZE;
+        st.entries[slot].name[..nb.len()].copy_from_slice(nb);
+        st.entries[slot].name_len = nb.len() as u8;
+        st.entries[slot].ip = ip;
+        st.entries[slot].stamp = now;
+        st.entries[slot].valid = true;
+        st.next += 1;
     }
 }
 
@@ -346,17 +346,15 @@ pub fn query(name: &str) -> Result<DnsAnswer, DnsError> {
             if qlen == 0 { return Err(DnsError::BadName); }
 
             DNS_SRC_PORT.store(src_port, Ordering::Relaxed);
-            DNS_RX_READY.store(false, Ordering::Release);
+            DNS_RX.clear();
             super::udp::send_udp(dns_ip, src_port, 53, &qbuf[..qlen]);
 
             let start = crate::arch::x86_64::idt::timer_ticks();
             let mut server_failed = false;
             loop {
                 super::poll_rx();
-                if DNS_RX_READY.load(Ordering::Acquire) {
-                    DNS_RX_READY.store(false, Ordering::Release);
-                    let len = unsafe { DNS_RX_LEN };
-                    let data = unsafe { &DNS_RX_BUF[..len] };
+                if let Some(pkt) = DNS_RX.take() {
+                    let data = &pkt[..];
                     match parse_response(data, query_id) {
                         Some(Parsed::Addr(ip)) => {
                             DNS_SRC_PORT.store(0, Ordering::Relaxed);
@@ -377,7 +375,7 @@ pub fn query(name: &str) -> Result<DnsAnswer, DnsError> {
                 }
                 let now = crate::arch::x86_64::idt::timer_ticks();
                 if now.saturating_sub(start) >= timeout { break; }
-                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+                unsafe { core::arch::asm!("sti; hlt", options(nostack)); }
             }
             if server_failed { break; } // next server
         }

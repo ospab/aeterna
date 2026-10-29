@@ -493,13 +493,14 @@ extern "C" fn apic_timer_dispatch(saved_state: *mut u8, fx_area: *mut u8) {
 
     // No PIT on this machine: keep the 100 Hz tick counter going from here.
     if !PIT_ALIVE.load(core::sync::atomic::Ordering::Relaxed) {
-        unsafe {
-            APIC_SUBTICKS += 1;
-            if APIC_SUBTICKS >= 10 {
-                APIC_SUBTICKS = 0;
-                TIMER_TICKS += 1;
-                crate::drivers::audio::timer_tick();
-            }
+        // Only the timer interrupt writes these, so load + store is enough.
+        let sub = APIC_SUBTICKS.load(core::sync::atomic::Ordering::Relaxed) + 1;
+        if sub >= 10 {
+            APIC_SUBTICKS.store(0, core::sync::atomic::Ordering::Relaxed);
+            TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::drivers::audio::timer_tick();
+        } else {
+            APIC_SUBTICKS.store(sub, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -682,25 +683,20 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
     match irq {
         0 => {
             // Timer interrupt - tick counter
-            unsafe {
-                TIMER_TICKS += 1;
-            }
+            TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // Audio: wipe played ring data / keep DMA alive (try-lock, cheap)
             crate::drivers::audio::timer_tick();
             crate::core::scheduler::on_timer_irq(saved_state as *mut u8, fx_area);
         }
         1 => {
             // Keyboard interrupt - read scancode and buffer it
-            unsafe {
-                let scancode: u8;
-                asm!("in al, dx", in("dx") 0x60u16, out("al") scancode, options(nomem, nostack));
-                crate::arch::x86_64::keyboard::irq_scancode(scancode); // Ctrl+C flag
+            let scancode: u8;
+            // SAFETY: reads the PS/2 data port, which acknowledges the byte.
+            unsafe { asm!("in al, dx", in("dx") 0x60u16, out("al") scancode, options(nomem, nostack)) };
+            crate::arch::x86_64::keyboard::irq_scancode(scancode); // Ctrl+C flag
 
-                // Store in ring buffer for keyboard driver to pick up
-                let write_idx = KB_BUFFER_WRITE & (KB_BUFFER_SIZE - 1);
-                KB_BUFFER[write_idx] = scancode;
-                KB_BUFFER_WRITE = KB_BUFFER_WRITE.wrapping_add(1);
-            }
+            // Store in ring buffer for keyboard driver to pick up
+            kb_push(scancode);
         }
         5 => {
             // IRQ 5: AC97 (QEMU default) or ES1371 (VMware default)
@@ -714,7 +710,7 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
         9 | 10 | 11 => {
             // Network IRQ — dispatch to the active NIC driver
             crate::userspace::net::handle_net_irq();
-            unsafe { NET_IRQ_PENDING = true; }
+            NET_IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
             // Also dispatch to audio if the ES1371 was assigned one of these IRQs
             crate::drivers::audio::handle_es1371_irq();
         }
@@ -748,32 +744,28 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
 // Timer
 // ============================================================================
 
-static mut TIMER_TICKS: u64 = 0;
+static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// False when TSC calibration saw no PIT interrupts; the 1 ms APIC timer then also
 /// advances the 100 Hz tick counter (every 10th interrupt), so timeouts keep working.
 pub static PIT_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
-static mut APIC_SUBTICKS: u32 = 0;
+static APIC_SUBTICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Get current timer tick count
 pub fn timer_ticks() -> u64 {
-    unsafe { TIMER_TICKS }
+    TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ============================================================================
 // Network IRQ flag
 // ============================================================================
 
-static mut NET_IRQ_PENDING: bool = false;
+static NET_IRQ_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Check and clear network IRQ pending flag.
 /// Returns `true` if at least one NIC IRQ arrived since the last call.
 pub fn net_irq_pending() -> bool {
-    unsafe {
-        let p = NET_IRQ_PENDING;
-        NET_IRQ_PENDING = false;
-        p
-    }
+    NET_IRQ_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel)
 }
 
 /// Alias consumed by the network wait loops — see `net::icmp::wait_reply()`.
@@ -785,21 +777,38 @@ pub fn take_net_irq() -> bool { net_irq_pending() }
 // ============================================================================
 
 const KB_BUFFER_SIZE: usize = 256; // must be power of 2
-static mut KB_BUFFER: [u8; KB_BUFFER_SIZE] = [0; KB_BUFFER_SIZE];
-static mut KB_BUFFER_WRITE: usize = 0;
-static mut KB_BUFFER_READ: usize = 0;
+
+/// Scancode ring. Written by the keyboard IRQ and by the USB HID path (task context),
+/// read by the console: lock class DEV, IRQ-safe.
+struct KbRing {
+    buf: [u8; KB_BUFFER_SIZE],
+    write: usize,
+    read: usize,
+}
+
+static KB_RING: crate::core::sync::IrqSpinLock<KbRing> = crate::core::sync::IrqSpinLock::new(
+    "KB",
+    crate::core::sync::rank::DEV,
+    KbRing { buf: [0; KB_BUFFER_SIZE], write: 0, read: 0 },
+);
+
+fn kb_push(scancode: u8) {
+    let mut r = KB_RING.lock();
+    let w = r.write & (KB_BUFFER_SIZE - 1);
+    r.buf[w] = scancode;
+    r.write = r.write.wrapping_add(1);
+}
 
 /// Read a scancode from the IRQ keyboard buffer (non-blocking)
 pub fn kb_irq_read() -> Option<u8> {
-    unsafe {
-        if KB_BUFFER_READ == KB_BUFFER_WRITE {
-            None
-        } else {
-            let idx = KB_BUFFER_READ & (KB_BUFFER_SIZE - 1);
-            let sc = KB_BUFFER[idx];
-            KB_BUFFER_READ = KB_BUFFER_READ.wrapping_add(1);
-            Some(sc)
-        }
+    let mut r = KB_RING.lock();
+    if r.read == r.write {
+        None
+    } else {
+        let idx = r.read & (KB_BUFFER_SIZE - 1);
+        let sc = r.buf[idx];
+        r.read = r.read.wrapping_add(1);
+        Some(sc)
     }
 }
 
@@ -808,11 +817,7 @@ pub fn kb_irq_read() -> Option<u8> {
 /// pipeline used by the PS/2 keyboard IRQ handler.
 pub fn kb_buffer_write(scancode: u8) {
     crate::arch::x86_64::keyboard::irq_scancode(scancode); // Ctrl+C flag
-    unsafe {
-        let write_idx = KB_BUFFER_WRITE & (KB_BUFFER_SIZE - 1);
-        KB_BUFFER[write_idx] = scancode;
-        KB_BUFFER_WRITE = KB_BUFFER_WRITE.wrapping_add(1);
-    }
+    kb_push(scancode);
 }
 
 // ============================================================================

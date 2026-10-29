@@ -175,7 +175,7 @@ pub fn sync_time(server_ip: [u8; 4]) -> Result<u64, SntpError> {
     super::udp::send_udp(server_ip, 12345, 123, &pkt.0);
 
     let resp = super::udp::wait_rx(300).ok_or(SntpError::Timeout)?;
-    let ts   = parse_ntp_response(resp)?;
+    let ts   = parse_ntp_response(&resp)?;
 
     let frac  = u32::from_be_bytes([resp[44], resp[45], resp[46], resp[47]]);
     let nanos = ((frac as u64 * 1_000_000_000) >> 32) as u32;

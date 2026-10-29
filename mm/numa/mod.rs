@@ -5,7 +5,7 @@
  * domains (MEDs) to minimize cross-node latency and jitter.
  */
 
-use spin::Mutex;
+use crate::core::sync::IrqSpinLock;
 use alloc::vec::Vec;
 use crate::mm::physical::{PhysRegion, FRAME_SIZE};
 
@@ -29,7 +29,7 @@ struct NumaState {
     initialized: bool,
 }
 
-static NUMA_STATE: Mutex<NumaState> = Mutex::new(NumaState {
+static NUMA_STATE: IrqSpinLock<NumaState> = IrqSpinLock::new("NUMA", crate::core::sync::rank::NUMA, NumaState {
     domains: Vec::new(),
     initialized: false,
 });

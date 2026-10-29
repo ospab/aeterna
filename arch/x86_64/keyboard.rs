@@ -31,11 +31,11 @@ pub const KEY_F9: char    = '\u{0090}';
 pub const KEY_F10: char   = '\u{0091}';
 
 // Modifier key state
-static mut LEFT_SHIFT: bool = false;
-static mut RIGHT_SHIFT: bool = false;
-static mut CTRL_PRESSED: bool = false;
-static mut CAPS_LOCK: bool = false;
-static mut EXTENDED: bool = false; // 0xE0 prefix seen
+static LEFT_SHIFT: AtomicBool = AtomicBool::new(false);
+static RIGHT_SHIFT: AtomicBool = AtomicBool::new(false);
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
+static EXTENDED: AtomicBool = AtomicBool::new(false); // 0xE0 prefix seen
 
 // ─── Ctrl+C as an interrupt (seen at IRQ time) ──────────────────────────────
 //
@@ -103,32 +103,46 @@ pub fn poll_key() -> Option<char> {
 // serial line (PuTTY on a VMware named pipe, QEMU -serial stdio) can paste anywhere.
 
 const PASTE_CAP: usize = 4096;
-static mut PASTE_BUF: [u8; PASTE_CAP] = [0; PASTE_CAP];
-static mut PASTE_HEAD: usize = 0;
-static mut PASTE_LEN: usize = 0;
+
+/// Ring of pasted bytes, lock class DEV.
+struct Paste {
+    buf: [u8; PASTE_CAP],
+    head: usize,
+    len: usize,
+}
+
+static PASTE: crate::core::sync::IrqSpinLock<Paste> = crate::core::sync::IrqSpinLock::new(
+    "PASTE",
+    crate::core::sync::rank::DEV,
+    Paste { buf: [0; PASTE_CAP], head: 0, len: 0 },
+);
 
 /// Queue text to be read as if typed. Line breaks become spaces and trailing
 /// whitespace is dropped, so a pasted link never runs a command by itself.
 pub fn inject_text(text: &str) {
     let text = text.trim_end();
-    unsafe {
-        for &b in text.as_bytes() {
-            if PASTE_LEN >= PASTE_CAP { break; }
-            let b = match b { b'\r' | b'\n' | b'\t' => b' ', b => b };
-            PASTE_BUF[(PASTE_HEAD + PASTE_LEN) % PASTE_CAP] = b;
-            PASTE_LEN += 1;
-        }
+    let mut p = PASTE.lock();
+    for &b in text.as_bytes() {
+        if p.len >= PASTE_CAP { break; }
+        let b = match b { b'\r' | b'\n' | b'\t' => b' ', b => b };
+        let at = (p.head + p.len) % PASTE_CAP;
+        p.buf[at] = b;
+        p.len += 1;
     }
 }
 
 fn pop_pasted() -> Option<char> {
-    unsafe {
-        if PASTE_LEN == 0 { return None; }
-        let b = PASTE_BUF[PASTE_HEAD];
-        PASTE_HEAD = (PASTE_HEAD + 1) % PASTE_CAP;
-        PASTE_LEN -= 1;
+    loop {
+        let b = {
+            let mut p = PASTE.lock();
+            if p.len == 0 { return None; }
+            let b = p.buf[p.head];
+            p.head = (p.head + 1) % PASTE_CAP;
+            p.len -= 1;
+            b
+        };
         // Non-ASCII bytes of UTF-8 text are dropped: the console line editor is ASCII.
-        if b.is_ascii() { Some(b as char) } else { pop_pasted() }
+        if b.is_ascii() { return Some(b as char); }
     }
 }
 
@@ -150,16 +164,16 @@ pub fn try_read_key() -> Option<char> {
 
     // Extended scancode prefix
     if scancode == 0xE0 {
-        unsafe { EXTENDED = true; }
+        unsafe { EXTENDED.store(true, Ordering::Relaxed); }
         return None;
     }
 
-    let is_extended = unsafe { EXTENDED };
-    unsafe { EXTENDED = false; }
+    let is_extended = EXTENDED.load(Ordering::Relaxed);
+    unsafe { EXTENDED.store(false, Ordering::Relaxed); }
 
     // Right Ctrl (E0 1D / E0 9D) acts like Left Ctrl
     if is_extended && (scancode == 0x1D || scancode == 0x9D) {
-        unsafe { CTRL_PRESSED = scancode == 0x1D; }
+        unsafe { CTRL_PRESSED.store(scancode == 0x1D, Ordering::Relaxed); }
         return None;
     }
 
@@ -189,13 +203,13 @@ pub fn try_read_key() -> Option<char> {
     // Standard modifier handling
     unsafe {
         match scancode {
-            0x2A => { LEFT_SHIFT = true; return None; }
-            0xAA => { LEFT_SHIFT = false; return None; }
-            0x36 => { RIGHT_SHIFT = true; return None; }
-            0xB6 => { RIGHT_SHIFT = false; return None; }
-            0x1D => { CTRL_PRESSED = true; return None; }
-            0x9D => { CTRL_PRESSED = false; return None; }
-            0x3A => { CAPS_LOCK = !CAPS_LOCK; return None; }
+            0x2A => { LEFT_SHIFT.store(true, Ordering::Relaxed); return None; }
+            0xAA => { LEFT_SHIFT.store(false, Ordering::Relaxed); return None; }
+            0x36 => { RIGHT_SHIFT.store(true, Ordering::Relaxed); return None; }
+            0xB6 => { RIGHT_SHIFT.store(false, Ordering::Relaxed); return None; }
+            0x1D => { CTRL_PRESSED.store(true, Ordering::Relaxed); return None; }
+            0x9D => { CTRL_PRESSED.store(false, Ordering::Relaxed); return None; }
+            0x3A => { CAPS_LOCK.fetch_xor(true, Ordering::Relaxed); return None; }
             _ => {}
         }
     }
@@ -207,7 +221,7 @@ pub fn try_read_key() -> Option<char> {
 
     // Ctrl combos
     unsafe {
-        if CTRL_PRESSED {
+        if CTRL_PRESSED.load(Ordering::Relaxed) {
             return match scancode {
                 0x1E => Some('\x01'), // Ctrl+A
                 0x30 => Some('\x02'), // Ctrl+B
@@ -240,8 +254,8 @@ pub fn try_read_key() -> Option<char> {
         }
     }
 
-    let shift_active = unsafe { LEFT_SHIFT || RIGHT_SHIFT };
-    let caps_active = unsafe { CAPS_LOCK };
+    let shift_active = (LEFT_SHIFT.load(Ordering::Relaxed) || RIGHT_SHIFT.load(Ordering::Relaxed));
+    let caps_active = CAPS_LOCK.load(Ordering::Relaxed);
 
     let base = match scancode {
         0x01 => Some('\x1B'), // Escape

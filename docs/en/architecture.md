@@ -5,14 +5,14 @@ system as it is now and marks what is still to move. The plan is in [ROADMAP.md]
 
 ## Boot flow
 
-1. **Firmware → loader.** Either Limine (ISO, BIOS and UEFI) or **ospab-boot** (installed disks,
-   disk images, the test entry on the ISO). ospab-boot reads its config `ospab.cfg`, shows a menu,
-   loads the kernel ELF and modules from FAT or ISO9660, sets up page tables, takes the memory map
-   and framebuffer from UEFI and jumps to the kernel.
-2. **Boot contract.** The kernel accepts both loaders. ospab-boot passes a `BootInfo` structure
-   (`arch/x86_64/boot/ospab_proto.rs`: physical addresses only, no UEFI types) with the magic
-   `OSPABOOT` in RSI; Limine passes zeroed registers and its own request structures.
-   `arch/x86_64/boot/mod.rs` hides the difference from the rest of the kernel.
+1. **Firmware → loader.** **ospab-boot** is the only loader, with a BIOS and a UEFI front-end
+   (`boot/bios`, `boot/uefi`; shared code in `boot/common`). It reads its config `ospab.cfg`, shows a
+   menu, loads the kernel ELF and modules from FAT or ISO9660, sets up page tables, takes the memory
+   map and framebuffer (GOP or VBE) from the firmware and jumps to the kernel. See [Boot](boot.md).
+2. **Boot contract.** Both front-ends pass a `BootInfo` structure
+   (`arch/x86_64/boot/ospab_proto.rs`: physical addresses only, no firmware types) with the magic
+   `OSPABOOT` in RSI. The kernel boots only this way. `arch/x86_64/boot/` turns it into the types
+   the rest of the kernel uses (`types.rs`).
 3. **Kernel start** (`src/main.rs`): CPU tables, interrupts, timers and the clock; memory
    (frames, heap, paging); ACPI; PCI; scheduler and system calls; filesystem; storage and
    persistence; USB, GPU, audio, NVMe; network; shell; ring-3 self-test; console.

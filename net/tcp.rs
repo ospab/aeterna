@@ -688,7 +688,7 @@ unsafe fn handle_conn_segment(
 // ─── Public API ───────────────────────────────────────────────────────────
 
 fn wait_tick() {
-    unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+    unsafe { core::arch::asm!("sti; hlt", options(nostack)); }
 }
 
 /// Active open: connect to dst_ip:dst_port. Blocks until established or timeout.

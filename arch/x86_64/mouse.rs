@@ -11,13 +11,21 @@ const PS2_STATUS: u16 = 0x64;
 const PS2_COMMAND: u16 = 0x64;
 const PS2_DATA: u16 = 0x60;
 
-static mut MOUSE_CYCLE: u8 = 0;
-static mut MOUSE_PACKET: [u8; 3] = [0; 3];
+/// Packet assembly state and the deltas accumulated since the last poll. Written by the
+/// IRQ 12 handler and by USB HID injection, read by the GUI: lock class DEV.
+struct MouseState {
+    cycle: u8,
+    packet: [u8; 3],
+    dx: i32,
+    dy: i32,
+    btns: u8,
+}
 
-// Accumulated deltas since last poll
-static mut MOUSE_DX: i32 = 0;
-static mut MOUSE_DY: i32 = 0;
-static mut MOUSE_BTNS: u8 = 0;
+static MOUSE: crate::core::sync::IrqSpinLock<MouseState> = crate::core::sync::IrqSpinLock::new(
+    "MOUSE",
+    crate::core::sync::rank::DEV,
+    MouseState { cycle: 0, packet: [0; 3], dx: 0, dy: 0, btns: 0 },
+);
 
 /// Initialize PS/2 mouse
 pub fn init() {
@@ -103,61 +111,53 @@ pub fn handle_irq() {
     }
 }
 
-unsafe fn process_byte(b: u8) {
-    match MOUSE_CYCLE {
+fn process_byte(b: u8) {
+    let mut m = MOUSE.lock();
+    match m.cycle {
         0 => {
             if (b & 0x08) != 0 {
-                MOUSE_PACKET[0] = b;
-                MOUSE_CYCLE = 1;
+                m.packet[0] = b;
+                m.cycle = 1;
             }
         }
         1 => {
-            MOUSE_PACKET[1] = b;
-            MOUSE_CYCLE = 2;
+            m.packet[1] = b;
+            m.cycle = 2;
         }
         2 => {
-            MOUSE_PACKET[2] = b;
-            MOUSE_CYCLE = 0;
-            
-            let flags = MOUSE_PACKET[0];
-            let mut dx = MOUSE_PACKET[1] as i32;
-            let mut dy = MOUSE_PACKET[2] as i32;
-            
+            m.packet[2] = b;
+            m.cycle = 0;
+
+            let flags = m.packet[0];
+            let mut dx = m.packet[1] as i32;
+            let mut dy = m.packet[2] as i32;
+
             if (flags & 0x10) != 0 { dx |= !0xFF; }
             if (flags & 0x20) != 0 { dy |= !0xFF; }
-            
-            MOUSE_DX += dx;
-            MOUSE_DY += dy;
-            MOUSE_BTNS = flags & 0x07;
+
+            m.dx += dx;
+            m.dy += dy;
+            m.btns = flags & 0x07;
         }
-        _ => MOUSE_CYCLE = 0,
+        _ => m.cycle = 0,
     }
 }
 
 /// Add a movement from another source (USB HID mouse). `dy` follows the PS/2
 /// convention (positive = up). Buttons: bit0 left, bit1 right, bit2 middle.
 pub fn inject(dx: i32, dy: i32, btns: u8) {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem));
-        MOUSE_DX += dx;
-        MOUSE_DY += dy;
-        MOUSE_BTNS = btns & 0x07;
-        if flags & (1 << 9) != 0 {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-    }
+    let mut m = MOUSE.lock();
+    m.dx += dx;
+    m.dy += dy;
+    m.btns = btns & 0x07;
 }
 
 /// Consume accumulated deltas
 pub fn poll() -> (i32, i32, u8) {
     crate::xhci::poll(false); // USB mice have no IRQ: service them on every poll
-    unsafe {
-        let dx = MOUSE_DX;
-        let dy = MOUSE_DY;
-        let btns = MOUSE_BTNS;
-        MOUSE_DX = 0;
-        MOUSE_DY = 0;
-        (dx, dy, btns)
-    }
+    let mut m = MOUSE.lock();
+    let r = (m.dx, m.dy, m.btns);
+    m.dx = 0;
+    m.dy = 0;
+    r
 }

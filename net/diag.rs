@@ -234,7 +234,7 @@ pub fn dump_active_nic() {
     use crate::userspace::net as n;
     s("  Model: "); s(n::nic_model()); nl();
     s("  Link (driver report): "); s(if n::link_up() { "up" } else { "DOWN" }); nl();
-    match unsafe { n::ACTIVE_NIC } {
+    match n::active_nic() {
         n::NIC_RTL8139 => dump_rtl8139_regs(),
         n::NIC_E1000   => dump_e1000_regs(),
         n::NIC_RTL8169 => dump_rtl8169_regs(),
