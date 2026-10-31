@@ -51,6 +51,14 @@ if [ -z "${OSPAB_BUILD:-}" ]; then
 fi
 export OSPAB_BUILD
 
+# Rust toolchain. On Windows without Visual C++ Build Tools the msvc toolchain cannot link the
+# host-side build scripts (build.rs), so the GNU nightly is used when it is installed.
+NIGHTLY="${NIGHTLY:-nightly}"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        rustc +nightly-x86_64-pc-windows-gnu -V >/dev/null 2>&1 && NIGHTLY=nightly-x86_64-pc-windows-gnu ;;
+esac
+
 echo "=== Building ospab.os v2 (AETERNA) - build #$NEXT_NUM ==="
 cd "$PROJECT_ROOT"
 
@@ -67,7 +75,7 @@ fi
 # --- Build user programs (user/, target x86_64-unknown-oos, runtime liboos) ---
 # Must run without RUSTFLAGS: it would override user/.cargo/config.toml (linker script).
 echo "--- Building user programs ---"
-( cd "$PROJECT_ROOT/user" && env -u RUSTFLAGS cargo +nightly build --release ) || {
+( cd "$PROJECT_ROOT/user" && env -u RUSTFLAGS cargo +$NIGHTLY build --release ) || {
     echo "ERROR: user programs failed to build" >&2
     exit 1
 }
@@ -77,10 +85,10 @@ export RUSTFLAGS="${RUSTFLAGS:--A warnings}"
 # DOOM (target/doom/libdoom.a) is linked by build.rs
 echo "--- Building kernel ---"
 if [ -n "$TARGET" ]; then
-    cargo +nightly build --release --target "$TARGET"
+    cargo +$NIGHTLY build --release --target "$TARGET"
     KERNEL_BIN="$PROJECT_ROOT/target/$TARGET/release/ospab_os"
 else
-    cargo +nightly build --release
+    cargo +$NIGHTLY build --release
     # .cargo/config sets target = x86_64-ospab.json and build-std
     KERNEL_BIN="$PROJECT_ROOT/target/x86_64-ospab/release/ospab_os"
 fi
@@ -107,7 +115,7 @@ fi
 
 # --- Loaders: both have their own .cargo/config.toml, so RUSTFLAGS must not leak in ---
 echo "--- Building UEFI loader (boot/uefi) ---"
-( cd "$PROJECT_ROOT/boot/uefi" && env -u RUSTFLAGS cargo +nightly build --release ) || {
+( cd "$PROJECT_ROOT/boot/uefi" && env -u RUSTFLAGS cargo +$NIGHTLY build --release ) || {
     echo "ERROR: UEFI loader failed to build" >&2
     exit 1
 }

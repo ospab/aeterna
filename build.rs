@@ -17,6 +17,21 @@ fn build_identity(manifest: &str) {
     let build = env::var("OSPAB_BUILD").unwrap_or_else(|_| "dev".into());
     println!("cargo:rustc-env=OSPAB_BUILD={}", build);
 
+    // OSPAB_VERSION: major.minor from Cargo.toml, the patch number grows by one with every
+    // numbered ISO/image: build VERSION_BASE_BUILD + 1 is x.y.1, the next one x.y.2, ...
+    // When the minor version in Cargo.toml is raised, set VERSION_BASE_BUILD to the last
+    // build number of the previous minor version.
+    const VERSION_BASE_BUILD: u64 = 192;
+    let pkg = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let mut parts = pkg.split('.');
+    let (major, minor) = (parts.next().unwrap_or("0"), parts.next().unwrap_or("0"));
+    let version = match build.parse::<u64>() {
+        Ok(n) if n > VERSION_BASE_BUILD => format!("{}.{}.{}", major, minor, n - VERSION_BASE_BUILD),
+        Ok(_) => format!("{}.{}.0", major, minor),
+        Err(_) => format!("{}.{}-dev", major, minor),
+    };
+    println!("cargo:rustc-env=OSPAB_VERSION={}", version);
+
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").args(args).current_dir(manifest).output().ok()?;
         if !out.status.success() { return None; }

@@ -25,9 +25,9 @@ mod input;
 
 /// Version strings (the kernel library has no `version` module; the build script sets these).
 pub mod ver {
-    pub const OS_VERSION: &str = concat!("ospab.os v", env!("CARGO_PKG_VERSION"));
-    pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-    pub const KERNEL_VERSION: &str = concat!("AETERNA ", env!("CARGO_PKG_VERSION"));
+    pub const OS_VERSION: &str = concat!("ospab.os v", env!("OSPAB_VERSION"));
+    pub const VERSION_STR: &str = env!("OSPAB_VERSION");
+    pub const KERNEL_VERSION: &str = concat!("AETERNA ", env!("OSPAB_VERSION"));
     pub const KERNEL_BUILD: &str = concat!("#", env!("OSPAB_BUILD"), " ", env!("OSPAB_COMMIT"), " ", env!("OSPAB_BUILD_DATE"));
     pub const ARCH: &str = "x86_64";
     pub const LICENSE: &str = "AGPL-3.0-only";

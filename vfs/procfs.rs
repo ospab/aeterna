@@ -194,7 +194,7 @@ impl ProcFsInstance {
     fn gen_version(&self) -> Vec<u8> {
         format!(
             "AETERNA version {} (ospab.os) x86_64, Rust no_std, license AGPL-3.0-only\n",
-            env!("CARGO_PKG_VERSION")
+            env!("OSPAB_VERSION")
         )
         .into_bytes()
     }
