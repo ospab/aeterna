@@ -1,0 +1,15 @@
+[package]
+name = "oosfs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Host tool for AeternaFS v2 images and partitions"
+
+# Standalone: not a member of the kernel or user workspaces.
+[workspace]
+
+[dependencies]
+aeternafs = { path = "../../fs/aeternafs" }
+
+[profile.release]
+opt-level = 3

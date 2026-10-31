@@ -1,7 +1,7 @@
 /*
  * AeternaFS — Native AETERNA Filesystem
  *
- * BSL 1.1 — Copyright (c) 2026 ospab
+ * SPDX-License-Identifier: AGPL-3.0-only — Copyright (c) 2026 ospab
  *
  * A simple but fully functional on-disk filesystem for ospab.os:
  *

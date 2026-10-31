@@ -1,0 +1,24 @@
+[package]
+name = "aeternafs"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "AeternaFS v2: copy-on-write filesystem for ospab.os (no_std + alloc)"
+
+# Standalone: not a member of the kernel or user workspaces.
+[workspace]
+
+[features]
+# `std` adds the host block devices (file, memory, fault injection).
+# The kernel uses `default-features = false`.
+default = ["std"]
+std = []
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug-assertions = false
+
+[profile.test]
+opt-level = 3
