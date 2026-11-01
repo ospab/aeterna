@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ospab
-//! tmt — host tool for ospab.os `.tmt` packages and the tmt.ospab.org repository.
+//! tmt: host tool for ospab.os `.tmt` packages and the tmt.ospab.org repository.
 //!
 //! ```text
 //! tmt keygen [--force] [--key FILE] [--pub FILE]
-//! tmt pack <manifest.toml> [-o OUTDIR]
+//! tmt pack <manifest.toml> [-o OUTDIR] [--set KEY=VALUE]...   (@KEY@ in the manifest)
 //! tmt list <file.tmt>
 //! tmt verify <file.tmt>
 //! tmt repo add <repo-dir> <file.tmt>...      copy packages into <repo-dir>/x86_64/
@@ -152,8 +152,13 @@ struct Manifest {
     description: String,
     arch: String,
     depends: Vec<String>,
+    /// "" (ordinary package) or "system": files go to the EFI System Partition (kernel and
+    /// loaders), dest is one of esp:kernel, esp:loader, esp:bios.
+    kind: String,
     files: Vec<(String, String)>, // (src, dest)
 }
+
+const ESP_ROLES: [&str; 3] = ["esp:kernel", "esp:loader", "esp:bios"];
 
 fn unquote(v: &str) -> Res<String> {
     let v = v.trim();
@@ -254,6 +259,15 @@ fn parse_manifest(text: &str) -> Res<Manifest> {
                 "description" => m.description = unquote(v).map_err(ctx)?,
                 "arch" => m.arch = unquote(v).map_err(ctx)?,
                 "depends" => m.depends = parse_str_array(v).map_err(ctx)?,
+                "kind" => {
+                    m.kind = unquote(v).map_err(ctx)?;
+                    if m.kind != "system" && m.kind != "normal" {
+                        return Err(ctx(format!("unknown kind `{}` (system or normal)", m.kind)));
+                    }
+                    if m.kind == "normal" {
+                        m.kind.clear();
+                    }
+                }
                 _ => return Err(ctx(format!("unknown key `{}`", k))),
             }
         }
@@ -344,7 +358,7 @@ fn read_tmt(data: &[u8]) -> Res<TmtInfo> {
     let mut copy = data.to_vec();
     copy[124..156].fill(0);
     if sha256(&copy)[..] != data[124..156] {
-        return Err("internal SHA-256 mismatch (package corrupted)".into());
+        return Err("SHA-256 mismatch (the package is corrupt)".into());
     }
     let arch = le32(data, 16) as u32;
     let (meta_len, payload_len) = (le32(data, 116), le32(data, 120));
@@ -391,7 +405,24 @@ fn meta_field<'a>(meta: &'a str, key: &str) -> &'a str {
 fn cmd_pack(args: &[String]) -> Res<()> {
     let mpath = args.first().ok_or("usage: tmt pack <manifest.toml> [-o OUTDIR]")?;
     let mpath = Path::new(mpath);
-    let text = fs::read_to_string(mpath).map_err(|e| format!("{}: {}", mpath.display(), e))?;
+    let mut text = fs::read_to_string(mpath).map_err(|e| format!("{}: {}", mpath.display(), e))?;
+    // `--set KEY=VALUE` replaces every `@KEY@` in the manifest (version and paths of build outputs).
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--set" {
+            let kv = args.get(i + 1).ok_or("--set needs KEY=VALUE")?;
+            let (k, v) = kv.split_once('=').ok_or("--set needs KEY=VALUE")?;
+            text = text.replace(&format!("@{}@", k), v);
+            i += 1;
+        }
+        i += 1;
+    }
+    if let Some(p) = text.find('@') {
+        let rest = &text[p..];
+        if rest[1..].find('@').map_or(false, |e| !rest[1..1 + e].contains(char::is_whitespace)) {
+            return Err("manifest has an unreplaced @KEY@ placeholder (use --set KEY=VALUE)".into());
+        }
+    }
     let m = parse_manifest(&text)?;
     if !valid_name(&m.name) {
         return Err(format!("invalid package name `{}`", m.name));
@@ -410,7 +441,11 @@ fn cmd_pack(args: &[String]) -> Res<()> {
     let base = mpath.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut files = Vec::new();
     for (src, dest) in &m.files {
-        if !dest.starts_with('/') || dest.split('/').any(|c| c == "..") {
+        if m.kind == "system" {
+            if !ESP_ROLES.contains(&dest.as_str()) {
+                return Err(format!("dest `{}`: a system package uses only {}", dest, ESP_ROLES.join(", ")));
+            }
+        } else if !dest.starts_with('/') || dest.split('/').any(|c| c == "..") {
             return Err(format!("dest `{}` must be an absolute path without `..`", dest));
         }
         let p = base.join(src);
@@ -420,7 +455,13 @@ fn cmd_pack(args: &[String]) -> Res<()> {
     if files.is_empty() {
         return Err("manifest lists no files".into());
     }
+    if m.kind == "system" && !files.iter().any(|(d, _)| d == "esp:kernel") {
+        return Err("a system package needs a file with dest esp:kernel".into());
+    }
     let mut meta = vec![("description", m.description.replace('\n', " "))];
+    if m.kind == "system" {
+        meta.push(("kind", "system".to_string()));
+    }
     if !m.depends.is_empty() {
         meta.push(("depends", m.depends.join(",")));
     }
@@ -439,6 +480,10 @@ fn cmd_list(args: &[String]) -> Res<()> {
     let i = read_tmt(&data)?;
     println!("{} {} (arch {})", i.name, i.version, i.arch);
     println!("description: {}", meta_field(&i.meta, "description"));
+    let kind = meta_field(&i.meta, "kind");
+    if !kind.is_empty() {
+        println!("kind: {}", kind);
+    }
     let dep = meta_field(&i.meta, "depends");
     if !dep.is_empty() {
         println!("depends: {}", dep);

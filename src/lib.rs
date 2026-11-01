@@ -50,6 +50,16 @@ pub use userspace::axon;
 // Re-export plum for backward compatibility
 pub use userspace::plum;
 
+// System updates on the ESP (tomato's ospab-base package). The loader's config parser and update
+// state format are shared with the boot loaders, so the kernel writes exactly what they read.
+#[path = "../boot/common/config.rs"]
+#[allow(dead_code)]
+pub mod config;
+#[path = "../boot/common/update.rs"]
+#[allow(dead_code)]
+pub mod update;
+pub mod esp;
+
 // DOOM engine (bare-metal port)
 pub mod doom;
 

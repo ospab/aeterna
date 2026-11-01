@@ -36,6 +36,11 @@
 
 extern crate alloc;
 mod alongside;
+mod cyr;
+mod lang;
+mod opts;
+mod provision;
+use lang::tr;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -97,6 +102,7 @@ const R_BODY: u64  = 8;
 // ── Drawing primitives (absolute cells, no wrapping or scrolling) ────────────
 fn cell(col: u64, row: u64, ch: char, fg: u32, bg: u32) {
     if col >= cols() || row >= rows() { return; }
+    if cyr::is_cyrillic(ch) { cyr::draw(col * CW, row * CH, ch, fg, bg); return; }
     framebuffer::draw_char_at(col * CW, row * CH, ch, fg, bg);
 }
 fn abs_text(col: u64, row: u64, s: &str, fg: u32, bg: u32) -> u64 {
@@ -115,6 +121,11 @@ impl Pen {
     fn at(col: u64, row: u64) -> Pen { Pen { col: left() + col, row, bg: BG } }
     fn on(mut self, bg: u32) -> Pen { self.bg = bg; self }
     fn put(&mut self, s: &str, fg: u32) -> &mut Pen {
+        // Every fixed text goes through the language table (texts that are not in it stay as they are).
+        self.col = abs_text(self.col, self.row, tr(s), fg, self.bg); self
+    }
+    /// Like `put`, but never translated (words the user has to type).
+    fn raw(&mut self, s: &str, fg: u32) -> &mut Pen {
         self.col = abs_text(self.col, self.row, s, fg, self.bg); self
     }
     fn pad(&mut self, col: u64) -> &mut Pen {
@@ -176,7 +187,7 @@ fn chrome(step: usize, title: &str, title_fg: u32, sub: &str, keys: &[(&str, &st
     // Header bar
     fill_cells(0, 0, c, 1, BAR_BG);
     let x = abs_text(1, 0, " AETERNA ", BG, ACCENT);
-    abs_text(x + 1, 0, "System Installer", FG, BAR_BG);
+    abs_text(x + 1, 0, tr("System Installer"), FG, BAR_BG);
     let right = format!("ospab.os {}  \u{00B7}  {}", crate::version::VERSION_STR, crate::version::ARCH);
     abs_text(c.saturating_sub(clen(&right) + 2), 0, &right, FG_DIM, BAR_BG);
 
@@ -184,6 +195,7 @@ fn chrome(step: usize, title: &str, title_fg: u32, sub: &str, keys: &[(&str, &st
     let mut segs: Vec<(String, u32, u32)> = Vec::new();
     for (i, name) in STEP_NAMES.iter().enumerate() {
         if i > 0 { segs.push((String::from(" \u{2500}\u{2500} "), RULE, BG)); }
+        let name = tr(name);
         if i < step       { segs.push((format!("\u{2713} {}", name), FG_OK, BG)); }
         else if i == step { segs.push((format!(" {} {} ", i + 1, name), BG, ACCENT)); }
         else              { segs.push((format!("{} {}", i + 1, name), FG_DIM, BG)); }
@@ -207,7 +219,7 @@ fn footer(keys: &[(&str, &str)], note: &str) {
     let mut x = 2;
     for (k, d) in keys {
         x = abs_text(x, r, &format!(" {} ", k), FG_TITLE, KEY_BG);
-        x = abs_text(x, r, &format!(" {}    ", d), FG_DIM, BAR_BG);
+        x = abs_text(x, r, &format!(" {}    ", tr(d)), FG_DIM, BAR_BG);
     }
     if !note.is_empty() { abs_text(x, r, note, FG_DIM, BAR_BG); }
 }
@@ -235,7 +247,12 @@ const CTRL_C: char = '\x03';
 const BKSP: char = '\x08';
 
 fn key() -> char {
-    loop { if let Some(c) = keyboard::poll_key() { return c; } }
+    loop {
+        if let Some(c) = keyboard::poll_key() {
+            ospab_os::plum::account::entropy_note(c as u64);
+            return c;
+        }
+    }
 }
 fn drain_keys() { for _ in 0..64 { let _ = keyboard::try_read_key(); } }
 
@@ -461,6 +478,36 @@ fn get_bios_binary() -> &'static [u8] {
     &[]
 }
 
+/// Packages on the medium: boot modules whose path is /packages/<name>.tmt (scripts/mkiso.sh
+/// copies apps/dist/*.tmt there and lists them as modules in ospab.cfg).
+fn get_packages() -> Vec<Pkg> {
+    use ospab_os::arch::x86_64::boot;
+    let mut v: Vec<Pkg> = Vec::new();
+    if let Some(mut mods) = boot::modules() {
+        while let Some(m) = mods.next() {
+            let path = unsafe {
+                if m.path.is_null() { continue; }
+                let mut len = 0;
+                while *m.path.add(len) != 0 { len += 1; }
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(m.path as *const u8, len))
+            };
+            slog("[INSTALLER] module: "); slog(path); slog(" "); slog_dec(m.size as u64); slog("\r\n");
+            if !path.ends_with(".tmt") { continue; }
+            let data = unsafe { core::slice::from_raw_parts(m.address, m.size as usize) };
+            let hdr = match ospab_os::userspace::tomato::tmt_parse_header(data) {
+                Some(h) => h,
+                None => { slog("[INSTALLER] not a .tmt package: "); slog(path); slog("\r\n"); continue; }
+            };
+            // The medium stores them as p1.tmt, p2.tmt (8.3 names); the header has the real name.
+            let file = format!("{}-{}.tmt", hdr.name, hdr.pkg_version);
+            let file = file.as_str();
+            slog("[INSTALLER] package on the medium: "); slog(file); slog("\r\n");
+            v.push(Pkg { file: String::from(file), data });
+        }
+    }
+    v
+}
+
 fn get_kernel_binary() -> (&'static [u8], usize) {
     use ospab_os::arch::x86_64::boot;
     if let Some(mut mods) = boot::modules() {
@@ -473,6 +520,7 @@ fn get_kernel_binary() -> (&'static [u8], usize) {
                     core::slice::from_raw_parts(m.path as *const u8, len))
             };
             if path.contains("OSPABLDR") || path.contains("ospabldr") { continue; }
+            if path.ends_with(".tmt") || path.contains("/packages/") { continue; }
             if path.contains("aeterna") || path.contains("ospab")
                 || path.contains("KERNEL") || path.contains("kernel")
             {
@@ -486,18 +534,19 @@ fn get_kernel_binary() -> (&'static [u8], usize) {
     (&[], 0)
 }
 
-fn slog(s: &str) { serial::write_str(s); }
-fn slog_dec(mut v: u64) {
-    if v == 0 { serial::write_byte(b'0'); return; }
-    let mut b = [0u8; 20]; let mut i = 0;
-    while v > 0 { b[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-    for j in (0..i).rev() { serial::write_byte(b[j]); }
+/// Everything the installer logs also goes to this buffer; it becomes /var/log/install.log.
+static mut INSTALL_LOG: String = String::new();
+
+fn slog(s: &str) {
+    serial::write_str(s);
+    unsafe { (*core::ptr::addr_of_mut!(INSTALL_LOG)).push_str(s); }
 }
-fn slog_hex32(v: u32) {
-    const HEX: &[u8] = b"0123456789abcdef";
-    serial::write_str("0x");
-    for i in (0..8).rev() { serial::write_byte(HEX[((v >> (i * 4)) & 0xF) as usize]); }
+fn install_log_text() -> String {
+    let raw = unsafe { (*core::ptr::addr_of!(INSTALL_LOG)).clone() };
+    raw.replace("\r\n", "\n")
 }
+fn slog_dec(v: u64) { slog(&format!("{}", v)); }
+fn slog_hex32(v: u32) { slog(&format!("0x{:08x}", v)); }
 
 // ── GPT ───────────────────────────────────────────────────────────────────────
 const ESP_GUID:  [u8; 16] = [0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B];
@@ -529,26 +578,62 @@ fn w64(buf: &mut [u8], o: usize, v: u64) { buf[o..o+8].copy_from_slice(&v.to_le_
 // ════════════════════════════════════════════════════════════════════════════
 const LOCALES: &[&str] = &["en_US.UTF-8","ru_RU.UTF-8","de_DE.UTF-8","fr_FR.UTF-8","zh_CN.UTF-8"];
 
+/// A short text input (fixed buffer, as `edit_field` wants).
+#[derive(Clone, Copy)]
+struct Field { buf: [u8; 32], len: usize }
+impl Field {
+    fn new(s: &str) -> Field {
+        let mut f = Field { buf: [0u8; 32], len: 0 };
+        f.buf[..s.len()].copy_from_slice(s.as_bytes()); f.len = s.len();
+        f
+    }
+    fn text(&self) -> &str { core::str::from_utf8(&self.buf[..self.len]).unwrap_or("") }
+}
+
 struct Config {
     alongside: bool,
+    upgrade:   bool,
     disk:     Option<usize>,
     esp_mb:   u64,
     host:     [u8; 32],
     host_len: usize,
-    pass:     [u8; 32],
-    pass_len: usize,
     locale:   usize,
+    // account
+    user:      Field,
+    pass:      Field,
+    pass2:     Field,
+    autologin: bool,
+    // language and region
+    lang:      usize,
+    keymap:    usize,
+    zone:      usize,
+    rtc_local: bool,
+    // disk: 0 = all free space
+    data_mb:   u64,
+    // boot
+    boot_default: usize,
+    timeout:   usize,
+    res:       usize,
+    // network
+    net_static: bool,
+    addr: Field, mask: Field, gw: Field, dns: Field,
+    ntp: bool,
+    // packages (one flag per `Images::pkgs` entry)
+    pkgs: Vec<bool>,
 }
 impl Config {
     fn hostname(&self) -> &str { core::str::from_utf8(&self.host[..self.host_len]).unwrap_or("aeterna") }
 }
 
-struct Images { efi: &'static [u8], kernel: &'static [u8], bios: &'static [u8] }
+/// A package (.tmt) found on the installer medium.
+struct Pkg { file: String, data: &'static [u8] }
+
+struct Images { efi: &'static [u8], kernel: &'static [u8], bios: &'static [u8], pkgs: Vec<Pkg> }
 
 enum Nav { Next, Back, Quit }
 
 #[derive(Clone, Copy)]
-enum Page { Welcome, Disk, Options, Confirm, Alongside }
+enum Page { Welcome, Disk, Opt(usize), Confirm, Alongside, Upgrade }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Main entry point
@@ -563,37 +648,40 @@ pub fn run() {
     let (efi, _) = get_loader_binary();
     let (kernel, _) = get_kernel_binary();
     let bios = get_bios_binary();
-    let img = Images { efi, kernel, bios };
+    let img = Images { efi, kernel, bios, pkgs: get_packages() };
 
-    let mut cfg = Config {
-        alongside: false,
-        disk: None, esp_mb: ESP_DEFAULT,
-        host: [0u8; 32], host_len: 0,
-        pass: [0u8; 32], pass_len: 0,
-        locale: 0,
-    };
-    cfg.host[..7].copy_from_slice(b"aeterna"); cfg.host_len = 7;
+    let mut cfg = opts::default_config();
+    cfg.pkgs = alloc::vec![false; img.pkgs.len()];
 
     let mut page = Page::Welcome;
     loop {
         let nav = match page {
             Page::Welcome => page_welcome(&disks, &img, &mut cfg),
             Page::Disk    => page_disk(&disks, &mut cfg),
+            Page::Opt(n)  => opts::page(n, cfg.disk.map(|i| disks[i]), &mut cfg, &img),
             Page::Alongside => alongside::run(&disks[cfg.disk.unwrap_or(0)], &cfg, &img),
-            Page::Options => page_options(&disks, &mut cfg),
             Page::Confirm => page_confirm(&disks, &cfg, &img),
+            Page::Upgrade => alongside::upgrade::run(&disks, &img),
         };
         page = match (page, nav) {
             (_, Nav::Quit) => { cancelled(); return; }
-            (Page::Welcome, Nav::Next) => Page::Disk,
+            (Page::Welcome, Nav::Next) => if cfg.upgrade { Page::Upgrade } else { Page::Disk },
             (Page::Welcome, Nav::Back) => { cancelled(); return; }
-            (Page::Disk, Nav::Next)    => if cfg.alongside { Page::Alongside } else { Page::Options },
-            (Page::Alongside, Nav::Back) => Page::Disk,
-            (Page::Alongside, Nav::Next) => { leave(); return; }
+            (Page::Upgrade, Nav::Back) => Page::Welcome,
+            (Page::Upgrade, Nav::Next) => { leave(); return; }
+            (Page::Disk, Nav::Next)    => Page::Opt(0),
             (Page::Disk, Nav::Back)    => Page::Welcome,
-            (Page::Options, Nav::Next) => Page::Confirm,
-            (Page::Options, Nav::Back) => Page::Disk,
-            (Page::Confirm, Nav::Back) => Page::Options,
+            (Page::Opt(n), Nav::Next)  => match opts::next_page(n, &cfg, &img) {
+                Some(p) => Page::Opt(p),
+                None => if cfg.alongside { Page::Alongside } else { Page::Confirm },
+            },
+            (Page::Opt(n), Nav::Back)  => match opts::prev_page(n, &cfg, &img) {
+                Some(p) => Page::Opt(p),
+                None => Page::Disk,
+            },
+            (Page::Alongside, Nav::Back) => Page::Opt(opts::last_page(&cfg, &img)),
+            (Page::Alongside, Nav::Next) => { leave(); return; }
+            (Page::Confirm, Nav::Back) => Page::Opt(opts::last_page(&cfg, &img)),
             (Page::Confirm, Nav::Next) => {
                 let d = disks[cfg.disk.unwrap_or(0)];
                 do_install(d, &cfg, &img);
@@ -628,69 +716,78 @@ fn page_welcome(disks: &[VDisk], img: &Images, cfg: &mut Config) -> Nav {
     slog("[INSTALLER] page: welcome\r\n");
     let usable = disks.iter().filter(|d| !d.too_small()).count();
     let ready = !img.efi.is_empty() && !img.kernel.is_empty() && usable > 0;
-    let keys: &[(&str, &str)] = if ready { &[("\u{2191}\u{2193}", "Mode"), ("Enter", "Begin"), ("Esc", "Quit")] } else { &[("Esc", "Quit")] };
-    chrome(0, "Welcome to AETERNA", FG_TITLE, "This wizard installs ospab.os onto a disk in this computer.", keys);
+    let keys: &[(&str, &str)] = if ready { &[("\u{2191}\u{2193}", tr("Mode")), ("Enter", tr("Begin")), ("L", "English/\u{0420}\u{0443}\u{0441}"), ("Esc", tr("Quit"))] } else { &[("L", "English/\u{0420}\u{0443}\u{0441}"), ("Esc", tr("Quit"))] };
+    chrome(0, tr("Welcome to AETERNA"), FG_TITLE, tr("This wizard installs ospab.os onto a disk in this computer."), keys);
 
-    t(2, R_BODY, "How do you want to install?", FG);
-    let modes: [(&str, &str); 2] = [
+    t(2, R_BODY, tr("How do you want to install?"), FG);
+    let modes: [(&str, &str); 3] = [
         ("Erase entire disk and install", "new GPT, ESP and AETERNA partition; ALL data on the disk is lost"),
         ("Install alongside other systems", "keeps Windows/Linux: one new partition + \\EFI\\ospab on the ESP (UEFI only)"),
+        ("Upgrade an existing installation", "replaces the loader, kernel and boot config only; your data is not touched"),
     ];
-    let sel0 = cfg.alongside as usize;
-    let _ = sel0;
 
-    t(2, R_BODY + 6, "System check", FG_TITLE);
-    check_line(R_BODY + 7, !img.kernel.is_empty(), "Kernel image",
-        &if img.kernel.is_empty() { String::from("not found \u{2014} boot the live ISO") } else { fmt_bytes(img.kernel.len() as u64) });
-    check_line(R_BODY + 8, !img.efi.is_empty(), "ospab UEFI loader",
-        &if img.efi.is_empty() { String::from("not found \u{2014} boot the live ISO") } else { fmt_bytes(img.efi.len() as u64) });
-    check_line(R_BODY + 9, usable > 0, "Storage devices",
-        &if disks.is_empty() { String::from("no disks detected") }
-         else if usable == 0 { String::from("all disks are smaller than 100 MiB") }
-         else { format!("{} found", disks.len()) });
-    check_line(R_BODY + 10, !img.bios.is_empty(), "ospab BIOS loader",
-        &if img.bios.is_empty() { String::from("not found \u{2014} the disk will boot on UEFI only") }
+    t(2, R_BODY + 8, tr("System check"), FG_TITLE);
+    check_line(R_BODY + 9, !img.kernel.is_empty(), tr("Kernel image"),
+        &if img.kernel.is_empty() { String::from(tr("not found \u{2014} boot the live ISO")) } else { fmt_bytes(img.kernel.len() as u64) });
+    check_line(R_BODY + 10, !img.efi.is_empty(), tr("ospab UEFI loader"),
+        &if img.efi.is_empty() { String::from(tr("not found \u{2014} boot the live ISO")) } else { fmt_bytes(img.efi.len() as u64) });
+    check_line(R_BODY + 11, usable > 0, tr("Storage devices"),
+        &if disks.is_empty() { String::from(tr("no disks detected")) }
+         else if usable == 0 { String::from(tr("all disks are smaller than 100 MiB")) }
+         else { format!("{} {}", disks.len(), tr("found")) });
+    check_line(R_BODY + 12, !img.bios.is_empty(), tr("ospab BIOS loader"),
+        &if img.bios.is_empty() { String::from(tr("not found \u{2014} the disk will boot on UEFI only")) }
          else { fmt_bytes(img.bios.len() as u64) });
+    t(2, R_BODY + 13, &format!("{}: {}", tr("Packages on the medium"), img.pkgs.len()), FG_DIM);
 
     // Alongside mode needs UEFI: on BIOS it would replace the MBR boot code of another system.
     let bios_boot = ospab_os::arch::x86_64::boot::is_bios();
+    let fr = R_BODY + 15;
     let draw_foot = |along: bool| {
-        for r in R_BODY + 11..R_BODY + 16 { clear_panel_row(r); }
+        for r in fr..fr + 5 { clear_panel_row(r); }
         if ready && along && bios_boot {
-            draw_box(R_BODY + 11, 5, FG_ERR, ERR_BG, "Not available on BIOS");
-            Pen::at(3, R_BODY + 12).on(ERR_BG).put("This computer started in BIOS mode. Installing alongside other systems would", FG);
-            Pen::at(3, R_BODY + 13).on(ERR_BG).put("replace the boot code in the MBR of the disk, which can make Windows or Linux", FG);
-            Pen::at(3, R_BODY + 14).on(ERR_BG).put("unbootable. Start the live ISO in UEFI mode, or choose \"Erase entire disk\".", FG);
+            draw_box(fr, 5, FG_ERR, ERR_BG, tr("Not available on BIOS"));
+            Pen::at(3, fr + 1).on(ERR_BG).put(tr("This computer started in BIOS mode. Installing alongside other systems would"), FG);
+            Pen::at(3, fr + 2).on(ERR_BG).put(tr("replace the boot code in the MBR of the disk, which can make Windows or Linux"), FG);
+            Pen::at(3, fr + 3).on(ERR_BG).put(tr("unbootable. Start the live ISO in UEFI mode, or choose \"Erase entire disk\"."), FG);
         } else if ready {
-            t(2, R_BODY + 12, "Nothing is written to disk until you confirm on a later page.", FG_DIM);
-            t(2, R_BODY + 13, "Press Enter to begin, or Esc to leave the installer.", FG);
+            t(2, fr + 1, tr("Nothing is written to disk until you confirm on a later page."), FG_DIM);
+            t(2, fr + 2, tr("Press Enter to begin, or Esc to leave the installer."), FG);
         }
     };
-    if ready {
-        draw_foot(cfg.alongside);
-    } else {
-        draw_box(R_BODY + 11, 4, FG_ERR, ERR_BG, "Cannot install");
-        Pen::at(3, R_BODY + 12).on(ERR_BG).put("The checks above must all pass. Start the installer from the", FG);
-        Pen::at(3, R_BODY + 13).on(ERR_BG).put("ospab.os live ISO with a disk of at least 100 MiB attached.", FG);
+    if !ready {
+        draw_box(fr, 4, FG_ERR, ERR_BG, tr("Cannot install"));
+        Pen::at(3, fr + 1).on(ERR_BG).put(tr("The checks above must all pass. Start the installer from the"), FG);
+        Pen::at(3, fr + 2).on(ERR_BG).put(tr("ospab.os live ISO with a disk of at least 100 MiB attached."), FG);
     }
 
+    let mut mode = if cfg.upgrade { 2 } else if cfg.alongside { 1 } else { 0 };
     loop {
+        cfg.alongside = mode == 1;
+        cfg.upgrade = mode == 2;
         if ready { draw_foot(cfg.alongside); }
         for (i, (name, desc)) in modes.iter().enumerate() {
-            let selb = (i == 1) == cfg.alongside;
+            let selb = i == mode;
             let bg = if selb { SEL_BG } else { BG };
             let r = R_BODY + 1 + (i as u64) * 2;
             let mut p = Pen::at(0, r).on(bg);
-            p.put(if selb { "\u{25B6} " } else { "  " }, ACCENT).put(name, if selb { FG_TITLE } else { FG });
+            p.put(if selb { "\u{25B6} " } else { "  " }, ACCENT).put(tr(name), if selb { FG_TITLE } else { FG });
             p.pad(width());
-            Pen::at(4, r + 1).put(&truncate(desc, (width() as usize).saturating_sub(6)), FG_DIM);
+            Pen::at(4, r + 1).put(&truncate(tr(desc), (width() as usize).saturating_sub(6)), FG_DIM);
         }
         match key() {
-            keyboard::KEY_UP | keyboard::KEY_DOWN | '\t' => cfg.alongside = !cfg.alongside,
-            '1' => cfg.alongside = false,
-            '2' => cfg.alongside = true,
+            keyboard::KEY_UP => mode = (mode + 2) % 3,
+            keyboard::KEY_DOWN | '\t' => mode = (mode + 1) % 3,
+            '1' => mode = 0,
+            '2' => mode = 1,
+            '3' => mode = 2,
+            'l' | 'L' => {
+                cfg.lang = 1 - cfg.lang;
+                lang::set(cfg.lang);
+                return page_welcome(disks, img, cfg);
+            }
             '\n' if ready => {
-                if cfg.alongside && bios_boot { continue; } // refused, see the box above
+                if mode == 1 && bios_boot { continue; } // refused, see the box above
                 return Nav::Next;
             }
             ESC | CTRL_C | 'q' | 'Q' => return Nav::Quit,
@@ -704,11 +801,11 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
     slog("[INSTALLER] page: disk\r\n");
     let mut sel = cfg.disk.unwrap_or(0).min(disks.len().saturating_sub(1));
     let mut msg: Option<String> = None;
-    chrome(1, "Choose the target disk", FG_TITLE,
-           if cfg.alongside { "Existing systems are kept; only free space on this disk is used." }
-           else { "The whole disk is used. Everything on it will be erased." },
+    chrome(1, tr("Choose the target disk"), FG_TITLE,
+           tr(if cfg.alongside { "Existing systems are kept; only free space on this disk is used." }
+           else { "The whole disk is used. Everything on it will be erased." }),
            &[("\u{2191}\u{2193}", "Select"), ("Enter", "Use this disk"), ("Esc", "Back"), ("Q", "Quit")]);
-    Pen::at(2, R_BODY).put("DEVICE", FG_DIM).pad(18).put("SIZE", FG_DIM).pad(30).put("BUS", FG_DIM).pad(38).put("MODEL", FG_DIM);
+    Pen::at(2, R_BODY).put(tr("DEVICE"), FG_DIM).pad(18).put(tr("SIZE"), FG_DIM).pad(30).put("BUS", FG_DIM).pad(38).put(tr("MODEL"), FG_DIM);
     hrule(R_BODY + 1);
     loop {
         for (i, d) in disks.iter().enumerate() {
@@ -720,8 +817,8 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
             p.put("/dev/", FG_DIM).put(d.name(), if i == sel { FG_TITLE } else { fg }).pad(18);
             p.put(&fmt_size(d.size_mb), fg).pad(30);
             p.put(d.bus, FG_DIM).pad(38);
-            if d.too_small() && !cfg.alongside { p.put("too small (min 100 MiB)", FG_ERR); }
-            else { p.put(&truncate(if d.model.is_empty() { "(unknown model)" } else { d.model }, (width() - 40) as usize), fg); }
+            if d.too_small() && !cfg.alongside { p.put(tr("too small (min 100 MiB)"), FG_ERR); }
+            else { p.put(&truncate(if d.model.is_empty() { tr("(unknown model)") } else { d.model }, (width() - 40) as usize), fg); }
             p.pad(width());
         }
         let mr = R_BODY + 3 + disks.len() as u64;
@@ -734,7 +831,7 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
             '\n' => {
                 let d = &disks[sel];
                 if d.too_small() && !cfg.alongside {
-                    msg = Some(format!("/dev/{} is too small \u{2014} at least 100 MiB is required.", d.name()));
+                    msg = Some(format!("/dev/{} {}", d.name(), tr("is too small \u{2014} at least 100 MiB is required.")));
                 } else {
                     cfg.disk = Some(sel);
                     if !esp_fits(d, cfg.esp_mb) {
@@ -744,112 +841,6 @@ fn page_disk(disks: &[VDisk], cfg: &mut Config) -> Nav {
                     return Nav::Next;
                 }
             }
-            ESC => return Nav::Back,
-            CTRL_C | 'q' | 'Q' => return Nav::Quit,
-            _ => {}
-        }
-    }
-}
-
-// ── 3. Options ───────────────────────────────────────────────────────────────
-fn page_options(disks: &[VDisk], cfg: &mut Config) -> Nav {
-    slog("[INSTALLER] page: options\r\n");
-    let d = disks[cfg.disk.unwrap_or(0)];
-    const N: usize = 5; // ESP, hostname, password, locale, Continue
-    let mut cur = 0usize;
-    let mut msg: Option<&str> = None;
-    chrome(2, "Installation options", FG_TITLE,
-           "Defaults are fine for most systems.",
-           &[("\u{2191}\u{2193}", "Move"), ("\u{2190}\u{2192}", "Change"), ("Enter", "Edit / Continue"), ("Esc", "Back")]);
-    loop {
-        let row_of = |i: usize| R_BODY + i as u64 + if i == 4 { 1 } else { 0 };
-        for i in 0..N {
-            let r = row_of(i);
-            let selb = i == cur;
-            let bg = if selb { SEL_BG } else { BG };
-            if i == 4 {
-                clear_panel_row(r);
-                let mut p = Pen::at(2, r).on(if selb { ACCENT } else { KEY_BG });
-                p.put("  Continue \u{2192}  ", if selb { BG } else { FG });
-                continue;
-            }
-            let mut p = Pen::at(0, r).on(bg);
-            p.put(if selb { "\u{25B6} " } else { "  " }, ACCENT);
-            let (label, hint) = match i {
-                0 => ("EFI partition size", "\u{2190} \u{2192}"),
-                1 => ("Hostname", "Enter to edit"),
-                2 => ("Root password", "Enter to edit"),
-                _ => ("Locale", "\u{2190} \u{2192}"),
-            };
-            p.put(label, if selb { FG_TITLE } else { FG }).pad(24);
-            match i {
-                0 => { p.put(&fmt_size(cfg.esp_mb), FG_TITLE);
-                       if cfg.esp_mb == ESP_DEFAULT { p.put("  (recommended)", FG_OK); } }
-                1 => { p.put(cfg.hostname(), FG_TITLE); }
-                2 => { if cfg.pass_len == 0 { p.put("(none)", FG_DIM); }
-                       else { for _ in 0..cfg.pass_len { p.put("*", FG_TITLE); } } }
-                _ => { p.put(LOCALES[cfg.locale], FG_TITLE); }
-            }
-            p.pad(58);
-            if selb { p.put(hint, FG_DIM); }
-            p.pad(width());
-        }
-
-        // Disk layout preview
-        let lr = R_BODY + 8;
-        let esp_s = cfg.esp_mb * 2048;
-        let root_s = d.sectors.saturating_sub(2048 + esp_s + 34);
-        clear_panel_row(lr);
-        Pen::at(2, lr).put("Disk layout", FG_TITLE).put("   /dev/", FG_DIM).put(d.name(), FG).put("  ", FG).put(&fmt_size(d.size_mb), FG_DIM);
-        let bw = width() - 4;
-        let esp_cells = ((bw * esp_s) / d.sectors.max(1)).max(2).min(bw - 2);
-        let x = (left() + 2) * CW;
-        let y = (lr + 1) * CH;
-        framebuffer::fill_rect(x, y, bw * CW, CH, BG);
-        framebuffer::fill_rect(x, y + 2, esp_cells * CW - 2, CH - 4, ESP_COL);
-        framebuffer::fill_rect(x + esp_cells * CW, y + 2, (bw - esp_cells) * CW, CH - 4, ROOT_COL);
-        clear_panel_row(lr + 2);
-        Pen::at(2, lr + 2).put("\u{2588}", ESP_COL).put(" EFI System (FAT32)  ", FG).put(&fmt_size(cfg.esp_mb), FG_DIM)
-            .put("      ", FG).put("\u{2588}", ROOT_COL).put(" AETERNA root  ", FG).put(&fmt_size(root_s / 2048), FG_DIM);
-        clear_panel_row(lr + 4);
-        if let Some(m) = msg { t(2, lr + 4, m, FG_ERR); }
-        else if cur == 2 { t(2, lr + 4, "Note: the password is not yet used by this release of AETERNA.", FG_DIM); }
-
-        let k = key();
-        msg = None;
-        let cycle = |cfg: &mut Config, fwd: bool| {
-            let fits: Vec<u64> = ESP_SIZES.iter().copied().filter(|&e| esp_fits(&d, e)).collect();
-            if fits.is_empty() { return; }
-            let pos = fits.iter().position(|&e| e == cfg.esp_mb).unwrap_or(0);
-            let n = fits.len();
-            cfg.esp_mb = fits[if fwd { (pos + 1) % n } else { (pos + n - 1) % n }];
-        };
-        match k {
-            keyboard::KEY_UP   => { cur = if cur == 0 { N - 1 } else { cur - 1 }; }
-            keyboard::KEY_DOWN | '\t' => { cur = (cur + 1) % N; }
-            keyboard::KEY_LEFT | keyboard::KEY_RIGHT => {
-                let fwd = k == keyboard::KEY_RIGHT;
-                match cur {
-                    0 => cycle(cfg, fwd),
-                    3 => { let n = LOCALES.len(); cfg.locale = if fwd { (cfg.locale + 1) % n } else { (cfg.locale + n - 1) % n }; }
-                    _ => {}
-                }
-            }
-            '\n' => match cur {
-                0 => cycle(cfg, true),
-                1 => {
-                    let r = row_of(1);
-                    if edit_field(24, r, 34, &mut cfg.host, &mut cfg.host_len, false, host_char) && cfg.host_len == 0 {
-                        cfg.host[..7].copy_from_slice(b"aeterna"); cfg.host_len = 7;
-                    }
-                }
-                2 => { let r = row_of(2); edit_field(24, r, 34, &mut cfg.pass, &mut cfg.pass_len, true, pass_char); }
-                3 => { cfg.locale = (cfg.locale + 1) % LOCALES.len(); }
-                _ => {
-                    if !esp_fits(&d, cfg.esp_mb) { msg = Some("The EFI partition does not fit on this disk."); }
-                    else { return Nav::Next; }
-                }
-            },
             ESC => return Nav::Back,
             CTRL_C | 'q' | 'Q' => return Nav::Quit,
             _ => {}
@@ -868,51 +859,112 @@ fn layout(d: &VDisk, esp_mb: u64) -> Layout {
              root_mb: (root_end.saturating_sub(root_start) + 1) / 2048 }
 }
 
-fn kv(row: u64, k: &str, v: &str, fg: u32) {
-    Pen::at(2, row).put(k, FG_DIM).pad(18).put(v, fg);
+/// Layout of the data partition for the chosen sizes.
+fn layout_cfg(d: &VDisk, cfg: &Config) -> Layout {
+    let esp_start = 2048;
+    let esp_end = esp_start + cfg.esp_mb * 2048 - 1;
+    let (root_start, root_end) = opts::data_range(d, cfg);
+    Layout { esp_start, esp_end, root_start, root_end,
+             root_mb: (root_end.saturating_sub(root_start) + 1) / 2048 }
+}
+
+/// Shared by both modes: what the user chose, one line per setting.
+fn settings_lines(cfg: &Config, img: &Images) -> Vec<(String, String, u32)> {
+    let z = &ospab_os::time::ZONES[cfg.zone];
+    let mut v: Vec<(String, String, u32)> = Vec::new();
+    let mut add = |k: &str, s: String| v.push((String::from(tr(k)), s, FG));
+    add("Host name", String::from(cfg.hostname()));
+    add("User", format!("{}  ({}, {})", cfg.user.text(),
+        if cfg.pass.len > 0 { tr("password set, stored as a salted hash") } else { tr("no password") },
+        if cfg.autologin { tr("logs in automatically") } else { tr("asks for a login") }));
+    add("Language / locale", format!("{} / {}", opts::LANGS[cfg.lang], LOCALES[cfg.locale]));
+    add("Keyboard", String::from(opts::KEYMAPS[cfg.keymap].1));
+    add("Time zone", format!("{}, {}: {}", z.name, tr("clock chip"), if cfg.rtc_local { tr("local time") } else { tr("UTC") }));
+    add("Boot menu", format!("{}, {}, {}", opts::BOOT_ENTRIES[cfg.boot_default].1, opts::TIMEOUTS[cfg.timeout].1, opts::RESOLUTIONS[cfg.res].0));
+    add("Network", if cfg.net_static {
+        format!("{} {}/{} gw {} dns {}", tr("static"), cfg.addr.text(), cfg.mask.text(),
+            if cfg.gw.len > 0 { cfg.gw.text() } else { "-" }, if cfg.dns.len > 0 { cfg.dns.text() } else { "-" })
+    } else { String::from("DHCP") });
+    add("Time over NTP", String::from(if cfg.ntp { tr("yes") } else { tr("no") }));
+    let names: Vec<&str> = img.pkgs.iter().enumerate().filter(|(i, _)| cfg.pkgs.get(*i).copied().unwrap_or(false))
+        .map(|(_, p)| p.file.trim_end_matches(".tmt")).collect();
+    add("Packages", if names.is_empty() { String::from(tr("none")) } else { names.join(", ") });
+    v
+}
+
+/// The Confirm page lines for "Erase entire disk".
+fn erase_lines(d: &VDisk, cfg: &Config, img: &Images) -> Vec<(String, String, u32)> {
+    let l = layout_cfg(d, cfg);
+    let model = if d.model.is_empty() { d.bus } else { d.model };
+    let mut v: Vec<(String, String, u32)> = Vec::new();
+    v.push((String::from(tr("Target disk")), format!("/dev/{}   {}   {}", d.name(), fmt_size(d.size_mb), truncate(model, 30)), FG_TITLE));
+    v.push((String::from(tr("Partition 1")), format!("EFI System (FAT32)   {:<9}  LBA {}\u{2013}{}", fmt_size(cfg.esp_mb), l.esp_start, l.esp_end), FG));
+    v.push((String::from(tr("Partition 2")), format!("AETERNA data         {:<9}  LBA {}\u{2013}{}", fmt_size(l.root_mb), l.root_start, l.root_end), FG));
+    let used = 2048 + cfg.esp_mb * 2048 + (l.root_end - l.root_start + 1);
+    let unused = d.sectors.saturating_sub(used + 33);
+    if unused > 2048 { v.push((String::from(tr("Left unused")), fmt_size(unused / 2048), FG_OK)); }
+    if img.bios.is_empty() {
+        v.push((String::from(tr("BIOS loader")), String::from(tr("not installed (no BIOS loader on this medium)")), FG_WARN));
+    } else {
+        v.push((String::from(tr("BIOS loader")), format!("MBR boot code + BIOS boot partition, LBA {}\u{2013}{}  ({})",
+            BIOS_PART_START, BIOS_PART_END, fmt_bytes(img.bios.len() as u64 - 0x800)), FG));
+    }
+    v.push((String::from(tr("ESP files")), format!("\\EFI\\BOOT\\BOOTX64.EFI ({})", fmt_bytes(img.efi.len() as u64)), FG));
+    v.push((String::new(), format!("\\boot\\KERNEL ({}), \\boot\\ospab.cfg", fmt_bytes(img.kernel.len() as u64)), FG));
+    v.extend(settings_lines(cfg, img));
+    for (i, (p, what)) in provision::planned_files(cfg).into_iter().enumerate() {
+        v.push((String::from(if i == 0 { tr("Saved layer files") } else { "" }), format!("{}  {}", p, tr(what)), FG));
+    }
+    v
+}
+
+/// Scrollable list of summary lines between rows `r0..r1`.
+fn draw_lines(lines: &[(String, String, u32)], top: usize, r0: u64, r1: u64) {
+    for (i, r) in (r0..r1).enumerate() {
+        clear_panel_row(r);
+        if let Some((k, val, fg)) = lines.get(top + i) {
+            let w = (width() as usize).saturating_sub(22);
+            Pen::at(2, r).put(k, FG_DIM).pad(22).put(&truncate(val, w), *fg);
+        }
+    }
+    if top > 0 { t(width() - 3, r0, "\u{25B2}", ACCENT); }
+    if top + ((r1 - r0) as usize) < lines.len() { t(width() - 3, r1 - 1, "\u{25BC}", ACCENT); }
 }
 
 fn page_confirm(disks: &[VDisk], cfg: &Config, img: &Images) -> Nav {
     slog("[INSTALLER] page: confirm\r\n");
     let d = disks[cfg.disk.unwrap_or(0)];
-    let l = layout(&d, cfg.esp_mb);
-    chrome(3, "Review and confirm", FG_TITLE, "Please check the plan. Nothing has been written yet.",
-           &[("Enter", "Install"), ("Esc", "Back")]);
+    chrome(3, tr("Review and confirm"), FG_TITLE, tr("Please check the plan. Nothing has been written yet."),
+           &[("\u{2191}\u{2193}", tr("Scroll")), ("Enter", tr("Install")), ("Esc", tr("Back"))]);
 
-    let model = if d.model.is_empty() { d.bus } else { d.model };
-    kv(R_BODY,     "Target disk", &format!("/dev/{}   {}   {}", d.name(), fmt_size(d.size_mb), truncate(model, 30)), FG_TITLE);
-    kv(R_BODY + 1, "Partition 1", &format!("EFI System (FAT32)   {:<9}  LBA {}\u{2013}{}", fmt_size(cfg.esp_mb), l.esp_start, l.esp_end), FG);
-    kv(R_BODY + 2, "Partition 2", &format!("AETERNA root         {:<9}  LBA {}\u{2013}{}", fmt_size(l.root_mb), l.root_start, l.root_end), FG);
-    kv(R_BODY + 3, "UEFI loader", &format!("ospab-boot \u{2192} /EFI/BOOT/BOOTX64.EFI  ({})", fmt_bytes(img.efi.len() as u64)), FG);
-    kv(R_BODY + 4, "Kernel",      &format!("AETERNA {} \u{2192} /boot/KERNEL  ({})", crate::version::VERSION_STR, fmt_bytes(img.kernel.len() as u64)), FG);
-    kv(R_BODY + 5, "Hostname",    cfg.hostname(), FG);
-    kv(R_BODY + 6, "Locale",      LOCALES[cfg.locale], FG);
-    if img.bios.is_empty() {
-        kv(R_BODY + 7, "BIOS loader", "not installed (no BIOS loader on this medium)", FG_WARN);
-    } else {
-        kv(R_BODY + 7, "BIOS loader", &format!("MBR boot code + BIOS boot partition, LBA {}\u{2013}{}  ({})",
-            BIOS_PART_START, BIOS_PART_END, fmt_bytes(img.bios.len() as u64 - 0x800)), FG);
-    }
-
-    let br = R_BODY + 8;
-    draw_box(br, 4, FG_ERR, ERR_BG, "WARNING");
-    Pen::at(3, br + 1).on(ERR_BG).put(&format!("ALL DATA ON /dev/{} ({}) WILL BE PERMANENTLY ERASED.", d.name(), fmt_size(d.size_mb)), FG_ERR);
-    Pen::at(3, br + 2).on(ERR_BG).put("Existing partitions and files on this disk cannot be recovered.", FG);
+    let lines = erase_lines(&d, cfg, img);
+    let br = rows().saturating_sub(10);
+    let mut top = 0usize;
+    let view = (br - 1 - R_BODY) as usize;
+    draw_box(br, 4, FG_ERR, ERR_BG, tr("WARNING"));
+    Pen::at(3, br + 1).on(ERR_BG).put(&format!("{} /dev/{} ({}) {}", tr("ALL DATA ON"), d.name(), fmt_size(d.size_mb), tr("WILL BE PERMANENTLY ERASED.")), FG_ERR);
+    Pen::at(3, br + 2).on(ERR_BG).put(tr("Existing partitions and files on this disk cannot be recovered."), FG);
 
     let pr = br + 5;
-    Pen::at(2, pr).put("Type ", FG).put("yes", FG_TITLE).put(" and press Enter to install:", FG);
+    Pen::at(2, pr).put(tr("Type "), FG).raw("yes", FG_TITLE).put(tr(" and press Enter to install:"), FG);
     drain_keys();
     let mut buf = [0u8; 8];
     let mut len = 0usize;
     let mut msg = false;
+    let fc = 4 + clen(tr("Type ")) + 3 + clen(tr(" and press Enter to install:"));
     loop {
-        let mut p = Pen::at(40, pr).on(FIELD_BG);
+        draw_lines(&lines, top, R_BODY, R_BODY + view as u64);
+        let mut p = Pen::at(fc, pr).on(FIELD_BG);
         p.put(" ", FG);
         for i in 0..len { cell(p.col, pr, buf[i] as char, FG_TITLE, FIELD_BG); p.col += 1; }
-        p.put("_", ACCENT).pad(50);
+        p.put("_", ACCENT).pad(fc + 10);
         clear_panel_row(pr + 2);
-        if msg { t(2, pr + 2, "Type yes to erase the disk and install, or press Esc to go back.", FG_ERR); }
+        if msg { t(2, pr + 2, tr("Type yes to erase the disk and install, or press Esc to go back."), FG_ERR); }
         match key() {
+            keyboard::KEY_UP => { top = top.saturating_sub(1); }
+            keyboard::KEY_DOWN => { if top + view < lines.len() { top += 1; } }
+            keyboard::KEY_PGUP => { top = top.saturating_sub(view); }
+            keyboard::KEY_PGDN => { top = (top + view).min(lines.len().saturating_sub(view)); }
             '\n' => {
                 if &buf[..len] == b"yes" || &buf[..len] == b"YES" || &buf[..len] == b"Yes" {
                     slog("[INSTALLER] confirmed\r\n");
@@ -969,7 +1021,7 @@ fn step_draw(i: usize, st: St, detail: &str) {
         St::Fail    => ("\u{2717}", FG_ERR, FG_ERR, "FAILED",  FG_ERR),
     };
     t(2, r, icon, ic);
-    t(4, r, labels()[i], lc);
+    t(4, r, tr(labels()[i]), lc);
     if !detail.is_empty() { t(STEP_BAR_COL, r, detail, if st == St::Fail { FG_ERR } else { FG_DIM }); }
     t(width() - clen(status) - 1, r, status, sc);
     slog("[INSTALLER] step "); slog_dec(i as u64 + 1);
@@ -997,7 +1049,7 @@ fn install_failed(i: usize, why: &str) {
     footer(&[("Enter", "Return to shell")], "");
     let r = R_CHECKS;
     draw_box(r, 6, FG_ERR, ERR_BG, "Installation failed");
-    Pen::at(3, r + 1).on(ERR_BG).put(&format!("Step {} of {}: ", i + 1, labels().len()), FG_DIM).put(why, FG_ERR);
+    Pen::at(3, r + 1).on(ERR_BG).put(&format!("{} {} {} {}: ", tr("Step"), i + 1, tr("of"), labels().len()), FG_DIM).put(why, FG_ERR);
     if is_alongside() {
         Pen::at(3, r + 2).on(ERR_BG).put("Existing partitions were not modified. Files may remain in \\EFI\\ospab.", FG);
         Pen::at(3, r + 3).on(ERR_BG).put("Remove that folder from Windows/Linux before trying again.", FG);
@@ -1019,7 +1071,7 @@ fn draw_checks(row: u64, checks: &[Check]) {
         let col = if i % 2 == 0 { 4 } else { 40 };
         let mut p = Pen::at(col, r);
         if c.ok { p.put("\u{2713} ", FG_OK); } else { p.put("\u{2717} ", FG_ERR); }
-        p.put(c.label, if c.ok { FG } else { FG_ERR });
+        p.put(tr(c.label), if c.ok { FG } else { FG_ERR });
     }
 }
 
@@ -1031,7 +1083,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let (kernel_data, kernel_size) = (img.kernel, img.kernel.len());
 
     // ── Layout ────────────────────────────────────────────────────────────
-    let Layout { esp_start, esp_end, root_start, root_end, root_mb } = layout(&disk, esp_size_mb);
+    let Layout { esp_start, esp_end, root_start, root_end, root_mb } = layout_cfg(&disk, cfg);
     let esp_sectors: u64 = esp_size_mb * 2048; // 512-byte sectors
 
     slog("[INSTALLER] /dev/"); slog(disk.name()); slog("\r\n");
@@ -1039,11 +1091,11 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     slog_dec(kernel_size as u64); slog("B\r\n");
 
     // ── Screen ────────────────────────────────────────────────────────────
-    chrome(4, "Installing AETERNA", FG_TITLE,
-           &format!("Writing to /dev/{} \u{2014} do not power off or remove the disk.", disk.name()), &[]);
+    chrome(4, tr("Installing AETERNA"), FG_TITLE,
+           &format!("{} /dev/{} \u{2014} {}", tr("Writing to"), disk.name(), tr("do not power off or remove the disk.")), &[]);
     footer(&[], "Installing\u{2026} please wait");
     for i in 0..labels().len() { step_draw(i, St::Pending, ""); }
-    t(2, R_OVR, "Overall progress", FG_DIM);
+    t(2, R_OVR, tr("Overall progress"), FG_DIM);
     WRITE_ERRS.store(0, Ordering::Relaxed);
 
     // ── FAT32 geometry (needed up front for the progress estimate) ────────
@@ -1089,7 +1141,22 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
     let ker_nc = if kernel_size > 0 { ((kernel_size + cb - 1) / cb) as u32 } else { 1 };
     let efi_w = ((efi_size + 511) / 512) as u64 + 2 * efi_nc as u64;
     let ker_w = ((kernel_size + 511) / 512) as u64 + 2 * ker_nc as u64;
-    let conf_content = build_ospab_cfg(false);
+    let conf_content = build_cfg(false, &Globals::from_config(cfg), false, "");
+    // The live session must not write its own changes into the disk we are installing to.
+    ospab_os::fs::disk_sync::set_read_only(true);
+    // First contents of the persistent layer: account, settings, preinstalled packages.
+    slog("[INSTALLER] building the persistent layer\r\n");
+    let mut tree = provision::base_tree(cfg);
+    let (pk_done, pk_bad) = provision::add_packages(cfg, img, &mut tree);
+    let mut store_img = provision::serialize(&tree);
+    let mut store_note = format!("{} files", tree.len());
+    if store_img.len() > provision::MAX_STORE_BYTES {
+        install_failed(5, "the preinstalled packages do not fit into the 8 MiB saved layer");
+        return;
+    }
+    for p in &pk_bad { slog("[INSTALLER] package problem: "); slog(p); slog("\r\n"); }
+    if !pk_done.is_empty() { store_note = format!("{}, {} package(s)", store_note, pk_done.len()); }
+    let store_chunks = ((store_img.len() / 512 + 63) / 64) as u64;
     let bios_ok = !img.bios.is_empty();
     let stage2: &[u8] = if bios_ok { &img.bios[0x800..] } else { &[] };
     let bios_sectors = ((stage2.len() + 511) / 512) as u64;
@@ -1105,7 +1172,7 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         + efi_w + ker_w
         + 2 + ((conf_content.len() as u64 + 511) / 512).max(1)
         + bios_sectors                                       // BIOS loader, stage 2
-        + 1;                                                 // identity
+        + 1 + store_chunks;                                  // identity, saved layer
     P_DONE.store(0, Ordering::Relaxed);
     P_LAST.store(u64::MAX, Ordering::Relaxed);
     P_TOTAL.store(total_writes, Ordering::Relaxed);
@@ -1413,12 +1480,17 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         id[510]=0xAE; id[511]=0x05;
         if !disk_write(disk.index, root_start, 1, &id) { die!(5, "cannot write the identity record"); }
     }
+    let store_lba = root_start + provision::STORE_OFFSET;
+    if !provision::write_store(store_lba, &store_img, &mut |l, d| disk_write(disk.index, l, (d.len() / 512) as u32, d)) {
+        die!(5, "cannot write the saved layer (account and settings)");
+    }
+    slog("[INSTALLER] saved layer written: "); slog_dec(store_img.len() as u64); slog(" bytes at LBA "); slog_dec(store_lba); slog("\r\n");
 
     // Final flush: all FAT32 + kernel + identity data committed before readback
     slog("[INSTALLER] Final flush before verification...\r\n");
     disk_flush(disk.index);
     if WRITE_ERRS.load(Ordering::Relaxed) != errs0 { die!(5, "write errors while writing ospab.cfg"); }
-    step_end(5, St::Ok, "/boot/ospab.cfg");
+    step_end(5, St::Ok, &format!("ospab.cfg, {}", store_note));
     P_TOTAL.store(0, Ordering::Relaxed);
     draw_overall(1000);
 
@@ -1547,6 +1619,22 @@ fn do_install(disk: VDisk, cfg: &Config, img: &Images) {
         let ok = disk_read(disk.index,root_start,1,&mut buf) && &buf[..8]==b"AETERNA " && buf[510]==0xAE && buf[511]==0x05;
         checks.push(Check { label: "Identity record", ok });
     }
+    {
+        let ok = provision::verify_store(disk.index, store_lba, &tree)
+            && ospab_os::fs::disk_sync::base_lba(disk.index) == Some(store_lba);
+        checks.push(Check { label: "Saved layer (account)", ok });
+    }
+    // The install log goes into the saved layer last, so it can contain the verification above.
+    {
+        let mut text = install_log_text();
+        text.push_str(&format!("[INSTALLER] result: {} checks so far, {} failed\n", checks.len(), checks.iter().filter(|c| !c.ok).count()));
+        tree.insert(String::from("/var/log/install.log"), ospab_os::fs::ramfs::RamNode::File(text.into_bytes()));
+        store_img = provision::serialize(&tree);
+        let ok = store_img.len() <= provision::MAX_STORE_BYTES
+            && provision::write_store(store_lba, &store_img, &mut |l, d| disk_write(disk.index, l, (d.len() / 512) as u32, d))
+            && { disk_flush(disk.index); provision::verify_store(disk.index, store_lba, &tree) };
+        checks.push(Check { label: "Install log saved", ok });
+    }
     let failed = checks.iter().filter(|c| !c.ok).count();
     let all_ok = failed == 0 && backup_ok;
     if failed == 0 { step_end(6, St::Ok, &format!("{} checks passed", checks.len())); }
@@ -1567,25 +1655,25 @@ fn page_done(disk: &VDisk, cfg: &Config, root_mb: u64, checks: &[Check], all_ok:
     slog("[INSTALLER] page: done\r\n");
     let (title, tfg) = if all_ok { ("Installation complete", FG_OK) }
                        else { ("Installation finished with problems", FG_WARN) };
-    chrome(5, title, tfg, "AETERNA has been written to the disk.",
+    chrome(5, tr(title), tfg, tr("AETERNA has been written to the disk."),
            &[("Enter", "Reboot now"), ("Esc", "Back to shell")]);
 
     let (border, fill) = if all_ok { (FG_OK, OK_BG) } else { (FG_WARN, WARN_BG) };
     draw_box(R_BODY, 4, border, fill, "");
     let mut p = Pen::at(3, R_BODY + 1).on(fill);
-    if all_ok { p.put("\u{2713}  ", FG_OK).put("ospab.os is installed on ", FG_TITLE); }
-    else { p.put("!  ", FG_WARN).put("Some checks failed on ", FG_TITLE); }
+    if all_ok { p.put("\u{2713}  ", FG_OK).put(tr("ospab.os is installed on "), FG_TITLE); }
+    else { p.put("!  ", FG_WARN).put(tr("Some checks failed on "), FG_TITLE); }
     p.put(&format!("/dev/{}", disk.name()), FG_TITLE);
-    Pen::at(6, R_BODY + 2).on(fill).put(&format!("ESP {} FAT32  \u{00B7}  root {}  \u{00B7}  {}  \u{00B7}  {}",
-        fmt_size(cfg.esp_mb), fmt_size(root_mb), cfg.hostname(), LOCALES[cfg.locale]), FG_DIM);
+    Pen::at(6, R_BODY + 2).on(fill).put(&format!("ESP {}  \u{00B7}  {} {}  \u{00B7}  {}@{}  \u{00B7}  {}",
+        fmt_size(cfg.esp_mb), tr("data"), fmt_size(root_mb), cfg.user.text(), cfg.hostname(), ospab_os::time::ZONES[cfg.zone].name), FG_DIM);
 
-    t(2, R_BODY + 5, "Verification", FG_TITLE);
+    t(2, R_BODY + 5, tr("Verification"), FG_TITLE);
     draw_checks(R_BODY + 6, checks);
     let mut nr = R_BODY + 6 + ((checks.len() + 1) / 2) as u64;
     if !backup_ok { t(4, nr, "! Backup GPT at the end of the disk could not be written.", FG_WARN); nr += 1; }
 
     let sr = nr + 1;
-    t(2, sr, "Next steps", FG_TITLE);
+    t(2, sr, tr("Next steps"), FG_TITLE);
     Pen::at(4, sr + 1).put("1  ", ACCENT).put("Remove the installation media: ", FG).put("eject / disconnect the ISO", FG_TITLE);
     Pen::at(4, sr + 2).put("   ", ACCENT).put("(in VMware/VirtualBox: disconnect the virtual CD/DVD drive).", FG_DIM);
     let bios_inst = checks.iter().any(|c| c.label == "BIOS boot code");
@@ -1810,4 +1898,89 @@ fn build_ospab_cfg(alongside: bool) -> &'static str {
     } else {
         installed_cfg!("/boot/KERNEL", "whole-disk install, /boot")
     }
+}
+
+// ── ospab.cfg built from the chosen options ──────────────────────────────────
+
+/// Values of the `[global]` section.
+struct Globals { timeout: String, default: String, remember_last: String, resolution: String, serial: String, theme: String }
+
+impl Globals {
+    fn from_config(cfg: &Config) -> Globals {
+        Globals {
+            timeout: String::from(opts::TIMEOUTS[cfg.timeout].0),
+            default: String::from(opts::BOOT_ENTRIES[cfg.boot_default].0),
+            remember_last: String::from("yes"),
+            resolution: String::from(opts::RESOLUTIONS[cfg.res].0),
+            serial: String::from("no"),
+            theme: String::from("dark"),
+        }
+    }
+    /// Defaults of a fresh installed system, overridden by what an older ospab.cfg says.
+    fn from_old(old: &str) -> Globals {
+        let mut g = Globals {
+            timeout: String::from("5"), default: String::from("ospab"), remember_last: String::from("yes"),
+            resolution: String::from("auto"), serial: String::from("no"), theme: String::from("dark"),
+        };
+        let mut in_global = true;
+        for line in old.lines() {
+            let line = line.trim();
+            if line.starts_with('[') { in_global = line == "[global]"; continue; }
+            if !in_global || line.starts_with('#') { continue; }
+            if let Some((k, v)) = line.split_once('=') {
+                let (k, v) = (k.trim(), String::from(v.trim()));
+                match k {
+                    "timeout" => g.timeout = v, "default" => g.default = v, "remember_last" => g.remember_last = v,
+                    "resolution" => g.resolution = v, "serial" => g.serial = v, "theme" => g.theme = v,
+                    _ => {}
+                }
+            }
+        }
+        g
+    }
+}
+
+const STD_ENTRIES: [&str; 10] = ["ospab", "desktop", "debug", "previous", "memtest", "firmware", "reboot", "poweroff", "live", "installer"];
+
+/// Entry sections of an old config that this installer does not generate itself.
+fn extra_sections(old: &str) -> String {
+    let mut out = String::new();
+    let mut keep = false;
+    for line in old.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            keep = match t.strip_prefix("[entry ").and_then(|r| r.strip_suffix(']')) {
+                Some(id) => !STD_ENTRIES.contains(&id.trim()),
+                None => false,
+            };
+        }
+        if keep { out.push_str(line); out.push('\n'); }
+    }
+    out
+}
+
+/// ospab.cfg of an installed system. `previous`: add the "ospab.os (previous)" entry that boots
+/// KERNEL.OLD. `extra`: sections copied from the old config (upgrade).
+fn build_cfg(alongside: bool, g: &Globals, previous: bool, extra: &str) -> String {
+    let kernel = if alongside { "/EFI/ospab/KERNEL" } else { "/boot/KERNEL" };
+    let old_kernel = if alongside { "/EFI/ospab/KERNEL.OLD" } else { "/boot/KERNEL.OLD" };
+    let place = if alongside { "next to other systems, /EFI/ospab" } else { "whole-disk install, /boot" };
+    let mut s = format!("# ospab.os loader configuration, format version 1 (docs/en/boot.md).\n# Written by the installer ({}). Errors in this file are shown in the boot menu.\n", place);
+    s.push_str(&format!("version = 1\n\n[global]\ntimeout = {}\ndefault = {}\nremember_last = {}\nresolution = {}\nserial = {}\ntheme = {}\n\n",
+        g.timeout, g.default, g.remember_last, g.resolution, g.serial, g.theme));
+    let mut entry = |id: &str, title: &str, kernel: &str, cmdline: &str| {
+        s.push_str(&format!("[entry {}]\ntitle = {}\ntype = ospab\nkernel = {}\n", id, title, kernel));
+        if !cmdline.is_empty() { s.push_str(&format!("cmdline = {}\n", cmdline)); }
+        s.push('\n');
+    };
+    entry("ospab", "ospab.os", kernel, "");
+    entry("desktop", "ospab.os Desktop", kernel, "session=desktop");
+    entry("debug", "ospab.os (debug)", kernel, "debug=1 selftest=ipc persist=ro");
+    if previous { entry("previous", "ospab.os (previous)", old_kernel, ""); }
+    s.push_str("[entry memtest]\ntitle = Memory test\ntype = memtest\ncmdline = passes=1\n\n");
+    s.push_str("[entry firmware]\ntitle = Firmware settings\ntype = firmware\n\n");
+    s.push_str("[entry reboot]\ntitle = Reboot\ntype = reboot\n\n");
+    s.push_str("[entry poweroff]\ntitle = Power off\ntype = poweroff\n");
+    if !extra.is_empty() { s.push('\n'); s.push_str(extra); }
+    s
 }

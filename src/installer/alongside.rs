@@ -28,6 +28,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 
+pub mod upgrade;
+
 const ALIGN: u64 = 2048; // 1 MiB
 /// The persistence area (vfs/disk_sync.rs) needs 8 MiB + the identity sectors.
 const MIN_NEW_SECTORS: u64 = 64 * 2048; // 64 MiB
@@ -513,6 +515,10 @@ struct Plan {
     gpt_writes: Vec<(u64, [u8; 512], &'static str)>, // in write order
     new_entries: Vec<u8>,
     identity: [u8; 512],
+    tree: alloc::collections::BTreeMap<String, ospab_os::fs::ramfs::RamNode>, // saved layer (without packages)
+    store_est: usize,             // size of the saved layer with the packages, bytes
+    listing: Vec<(String, &'static str)>, // files of the saved layer, for the dry-run
+    pkg_names: Vec<String>,
     allowed: Vec<(u64, u64)>,     // [start, end) LBA ranges writes may touch
     total_sectors: u64,
 }
@@ -544,7 +550,8 @@ fn build_plan(d: &VDisk, g: &Gpt, esp: &Part, gap: (u64, u64), size: u64, cfg: &
     let ospab_dir = fat.mkdir(&mut ov, efi_cluster, false, NAME_DIR, 0x08)?;
 
     // files
-    let cfg_text = build_ospab_cfg(true).as_bytes();
+    let cfg_text: &'static [u8] =
+        alloc::boxed::Box::leak(build_cfg(true, &Globals::from_config(cfg), false, "").into_boxed_str()).as_bytes();
     let spec: [(&'static str, &'static [u8; 11], &'static [u8], u8); 3] = [
         ("OSPABLDR.EFI", NAME_LDR, img.efi, 0),
         ("ospab.cfg", NAME_CFG, cfg_text, 0x18),
@@ -628,11 +635,20 @@ fn build_plan(d: &VDisk, g: &Gpt, esp: &Part, gap: (u64, u64), size: u64, cfg: &
     let mut allowed = alloc::vec![(esp.start, esp.end + 1), (new_start, new_end + 1)];
     for (l, _, _) in &gpt_writes { allowed.push((*l, *l + 1)); }
 
-    let mut total = ov.map.len() as u64 + gpt_writes.len() as u64 + 2;
+    // Saved layer: account, settings and the selected packages
+    let tree = provision::base_tree(cfg);
+    let store_est = provision::serialize(&tree).len() + opts::pkg_total(cfg, img) + 8192;
+    if store_est > provision::MAX_STORE_BYTES {
+        return Err(String::from("The selected packages do not fit into the 8 MiB saved layer.\nGo back and deselect some."));
+    }
+    let mut total = ov.map.len() as u64 + gpt_writes.len() as u64 + 1 + (store_est / 512 + 1) as u64;
     for f in &files { total += f.clusters.len() as u64 * fat.spc as u64; }
     Ok(Plan {
         esp: esp.clone(), esp_no: esp.slot + 1, new_slot, new_start, new_end, fat, ov, files, efi_existed,
-        ospab_dir, gpt_writes, new_entries: ne, identity: id, allowed, total_sectors: total,
+        ospab_dir, gpt_writes, new_entries: ne, identity: id, tree, store_est, allowed, total_sectors: total,
+        listing: provision::planned_files(cfg),
+        pkg_names: img.pkgs.iter().enumerate().filter(|(i, _)| cfg.pkgs.get(*i).copied().unwrap_or(false))
+            .map(|(_, p)| String::from(p.file.trim_end_matches(".tmt"))).collect(),
     })
 }
 
@@ -668,7 +684,11 @@ fn summary(d: &VDisk, g: &Gpt, p: &Plan) -> Vec<(&'static str, String)> {
         g.ent_lba + si, p.new_slot + 1, g.bak_hdr_lba, g.bak_ent_lba + si))));
     v.push(("New partition", tr(format!("#{} AETERNA  LBA {}..{}  ({})",
         p.new_slot + 1, p.new_start, p.new_end, fmt_sectors(p.new_end - p.new_start + 1)))));
-    v.push(("  its sectors", tr(format!("LBA {} (identity), {} (empty store)", p.new_start, p.new_start + 8))));
+    v.push(("  its sectors", tr(format!("LBA {} (identity), {}.. (saved layer, about {})", p.new_start, p.new_start + 8, fmt_bytes(p.store_est as u64)))));
+    for (i, (path, what)) in p.listing.iter().enumerate() {
+        v.push((if i == 0 { "  saved layer" } else { "" }, tr(format!("{}  {}", path, what))));
+    }
+    if !p.pkg_names.is_empty() { v.push(("  packages", tr(p.pkg_names.join(", ")))); }
     v.push(("ESP", tr(format!("#{} LBA {}..{}  FAT32, {} B clusters", p.esp_no, p.esp.start, p.esp.end, p.fat.spc * 512))));
     v.push(("  FAT sectors", tr(ranges(&label_lbas(p, "FAT"), 4))));
     let mut dl = label_lbas(p, "dir-new");
@@ -976,8 +996,7 @@ fn page_confirm(d: &VDisk, g: &Gpt, p: &Plan) -> Nav {
 // ── Execution ────────────────────────────────────────────────────────────────
 struct Outcome { checks: Vec<Check>, ok: bool }
 
-fn execute(d: &VDisk, g: &Gpt, plan: Plan, cfg: &Config, img: &Images) {
-    let _ = img;
+fn execute(d: &VDisk, g: &Gpt, mut plan: Plan, cfg: &Config, img: &Images) {
     chrome(4, "Installing alongside", FG_TITLE,
            &format!("Writing to /dev/{} \u{2014} do not power off or remove the disk.", d.name()), &[]);
     footer(&[], "Installing\u{2026} please wait");
@@ -1040,9 +1059,16 @@ fn execute(d: &VDisk, g: &Gpt, plan: Plan, cfg: &Config, img: &Images) {
     // 4 — the new partition's own sectors (inside free space we are about to claim)
     step_begin(4, 0);
     if !w.write(plan.new_start, &plan.identity) { die!(4, "cannot write the identity record"); }
-    if !w.write(plan.new_start + 8, &[0u8; 512]) { die!(4, "cannot clear the persistence header"); }
+    // The live session must not write its own changes into the new partition.
+    ospab_os::fs::disk_sync::set_read_only(true);
+    let (pk_done, pk_bad) = provision::add_packages(cfg, img, &mut plan.tree);
+    for p in &pk_bad { slog("[ALONGSIDE] package problem: "); slog(p); slog("\r\n"); }
+    let mut store_img = provision::serialize(&plan.tree);
+    if store_img.len() > provision::MAX_STORE_BYTES { die!(4, "the packages do not fit into the 8 MiB saved layer"); }
+    let store_lba = plan.new_start + provision::STORE_OFFSET;
+    if !provision::write_store(store_lba, &store_img, &mut |l, dd| w.write(l, dd)) { die!(4, "cannot write the saved layer"); }
     disk_flush(d.index);
-    step_end(4, St::Ok, "identity + empty store");
+    step_end(4, St::Ok, &format!("identity + {} files, {} package(s)", plan.tree.len(), pk_done.len()));
 
     // 5 — GPT last: backup entry, backup header, primary entry, primary header
     step_begin(5, 0);
@@ -1057,7 +1083,20 @@ fn execute(d: &VDisk, g: &Gpt, plan: Plan, cfg: &Config, img: &Images) {
 
     // 6 — read back
     step_begin(6, 0);
-    let out = verify(d, g, &plan);
+    let mut out = verify(d, g, &plan);
+    out.checks.push(Check { label: "Saved layer (account)", ok: provision::verify_store(d.index, store_lba, &plan.tree) });
+    {
+        // The install log goes into the saved layer last, so it can contain the verification above.
+        let mut text = install_log_text();
+        text.push_str(&format!("[ALONGSIDE] result: {} checks so far, {} failed\n", out.checks.len(), out.checks.iter().filter(|c| !c.ok).count()));
+        plan.tree.insert(String::from("/var/log/install.log"), ospab_os::fs::ramfs::RamNode::File(text.into_bytes()));
+        store_img = provision::serialize(&plan.tree);
+        let ok = store_img.len() <= provision::MAX_STORE_BYTES
+            && provision::write_store(store_lba, &store_img, &mut |l, dd| w.write(l, dd))
+            && { disk_flush(d.index); provision::verify_store(d.index, store_lba, &plan.tree) };
+        out.checks.push(Check { label: "Install log saved", ok });
+    }
+    out.ok = out.checks.iter().all(|c| c.ok);
     let failed = out.checks.iter().filter(|c| !c.ok).count();
     if failed == 0 { step_end(6, St::Ok, &format!("{} checks passed", out.checks.len())); }
     else { step_end(6, St::Fail, &format!("{} of {} checks failed", failed, out.checks.len())); }

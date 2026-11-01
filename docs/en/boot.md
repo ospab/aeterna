@@ -31,18 +31,18 @@ The kernel does not know which loader started it. Both build the same `BootInfo`
 Stage 1 is one 512-byte sector. Stage 2 is about 85 KiB (`boot/bios`).
 
 1. The BIOS loads sector 0 of the boot drive (MBR), or the El Torito boot image of a CD, to
-   `0x7C00`. This is **stage 1**. It reads stage 2 with INT 13h extensions to `0x8000` (the
+   `0x7C00`. This is stage 1. It reads stage 2 with INT 13h extensions to `0x8000` (the
    drive's sector size is taken from INT 13h AH=48h, so 512-byte and 2048-byte sectors both work)
    and jumps to it in real mode with DL = boot drive.
-2. **Stage 2, real mode:** enables A20, loads a GDT, builds identity page tables for the first
-   4 GiB (2 MiB pages), and enters long mode.
-3. **Stage 2, 64-bit Rust** (`boot/bios/src/main.rs`). The code runs at `0x8000` with the stack,
+2. Stage 2, real mode: enables A20, loads a GDT, builds identity page tables for the first
+   4 GiB (2 MiB pages) and enters long mode.
+3. Stage 2, 64-bit Rust (`boot/bios/src/main.rs`). The code runs at `0x8000` with the stack,
    page tables and a 2 MiB heap at `0x200000`. BIOS services are called through a thunk
    (`rm.S`): it leaves long mode, runs `int n` in real mode with a register block, and returns.
-   Interrupts stay off in long mode; they are on only during the `int`.
+   Interrupts stay off in long mode and are on only during the `int`.
 4. It calibrates the TSC with the PIT, reads the E820 memory map (E801 and INT 15h AH=88h as
    fallbacks) and looks for ACPI S5 (see Power off below).
-5. **Boot volume**, on the boot drive only, in this order: ISO9660 on the whole device (a CD, or
+5. Boot volume, on the boot drive only, in this order: ISO9660 on the whole device (a CD, or
    the hybrid ISO on a stick), FAT32 in the partitions of the GPT or MBR, FAT32 without a partition
    table. The volume must contain `/boot/ospab.cfg` or `/boot/KERNEL`.
 6. The config is read from `/boot/ospab.cfg` and parsed by the shared parser. Entries that do not
@@ -85,10 +85,10 @@ when needed. If the tables or `_S5_` are missing, the Power off entry is hidden.
 
 | LBA | Contents |
 |---|---|
-| 0 | protective MBR (type `0xEE`) with the **stage 1** boot code in bytes 0..445 |
+| 0 | protective MBR (type `0xEE`) with the stage 1 boot code in bytes 0..445 |
 | 1 | GPT header |
 | 2..33 | GPT partition entries |
-| 34..2047 | **BIOS boot partition** (type `21686148-6449-6E6F-744E-656564454649`): stage 2, raw, about 85 KiB of 1 MiB |
+| 34..2047 | BIOS boot partition (type `21686148-6449-6E6F-744E-656564454649`): stage 2, raw, about 85 KiB of 1 MiB |
 | 2048.. | EFI System Partition, FAT32: `/EFI/BOOT/BOOTX64.EFI`, `/boot/KERNEL`, `/boot/ospab.cfg` |
 | after the ESP | root partition `AETERNA` |
 | last sectors | backup GPT |
@@ -104,8 +104,8 @@ The same disk boots on UEFI (the firmware reads the ESP) and on BIOS (the BIOS r
 
 ### Alongside other systems
 
-"Install alongside" never writes MBR boot code, so it is **refused on BIOS** (the installer says
-why). Boot the live ISO in UEFI mode for it, or choose "Erase entire disk".
+"Install alongside" never writes MBR boot code, so the installer refuses it on BIOS and says why.
+Boot the live ISO in UEFI mode for it, or choose "Erase entire disk".
 
 ### Hybrid ISO (`scripts/mkiso.sh`, made by `./build.sh`)
 
@@ -120,11 +120,11 @@ why). Boot the live ISO in UEFI mode for it, or choose "Erase entire disk".
 `/boot/bios.img` is stage 1 (offset 0, padded to 2048 bytes) followed by stage 2 (offset `0x800`).
 All three ways to start work:
 
-- **CD, BIOS:** the El Torito image runs stage 1 with the sector after it (from the boot info
+- CD, BIOS: the El Torito image runs stage 1 with the sector after it (from the boot info
   table) as stage 2. The loader reads the kernel from the ISO9660 tree.
-- **USB stick (`dd` of the ISO), BIOS:** the BIOS runs the MBR. Stage 1 reads stage 2 from
+- USB stick (`dd` of the ISO), BIOS: the BIOS runs the MBR. Stage 1 reads stage 2 from
   `bios.img` inside the ISO through the patched LBA. The loader finds ISO9660 on the whole device.
-- **CD or USB, UEFI:** the firmware starts `\EFI\BOOT\BOOTX64.EFI` from the El Torito entry or
+- CD or USB, UEFI: the firmware starts `\EFI\BOOT\BOOTX64.EFI` from the El Torito entry or
   the EFI partition.
 
 The EFI image is FAT16 and below 32 MiB on purpose: the El Torito sector count is 16 bits, and
@@ -146,7 +146,7 @@ OVMF rejects a larger FAT volume.
    - the kernel boot log: one `[  OK  ]` line per subsystem (CPU, display, memory, ...), then the shell.
      The last `OK` line on screen is the last step that finished. TODO: document the early progress
      bar once the kernel has a fixed one.
-   A black screen with nothing, not even the menu, means the firmware did not start the loader:
+   - A black screen with nothing, not even the menu, means the firmware did not start the loader:
    check the boot mode (UEFI/BIOS) and that the stick was written in DD mode.
 6. Serial output (115200 8N1, COM1) carries the same log when the screen stays black.
 
@@ -177,7 +177,7 @@ built-in defaults (one entry that boots `/boot/KERNEL`). BIOS: `/boot/ospab.cfg`
 built-in defaults. The first file found is used alone.
 
 Format: INI-like text, `key = value`, `[section]` headers, `#` comment lines (whole line only).
-Sections were chosen over a flat list because each entry has its own keys and validation per
+Entries are sections, not a flat list, because each entry has its own keys and validation per
 type needs a clear entry boundary. The first line that matters is `version = 1`.
 
 ### Global keys (before any header, or under `[global]`)
@@ -273,21 +273,85 @@ loader (`/EFI/OSPAB/OSPABLDR.EFI`) and the BIOS image (`/boot/bios.img`).
 Kernel parameters: `debug=1`, `persist=ro`, `selftest=ipc|mem|all`, `session=desktop`, `mode=`.
 `selftest=mem` needs a second serial port (COM2).
 
+## Updating the system
+
+`tomato upgrade` ([Packages](packages.md), "Updating the system") installs a new kernel next to
+the old one on the ESP and arms a boot counter. Files, in the directory of `ospab.cfg`
+(`/boot` or `/EFI/ospab`):
+
+| File | Meaning |
+|---|---|
+| `KERNEL` | the kernel the entries boot |
+| `KERNEL.OLD` | the previous kernel (last known good) |
+| `KERNEL.NEW` | exists only during an update |
+| `UPDATE.ST` | boot counter, exactly 512 bytes |
+| `BOOTX64.OLD` / `OSPABLDR.OLD` | the previous loader, for manual recovery |
+
+`ospab.cfg` gets an entry "ospab.os (previous)" (`kernel = .../KERNEL.OLD`). You can always pick it
+in the menu.
+
+### Boot counter and automatic rollback
+
+`UPDATE.ST` is text padded with zeros to 512 bytes, so a loader can overwrite it in place without
+touching the FAT:
+
+```
+ospab-update 1
+pending=1
+tries=2
+failed=0
+kernel=/boot/KERNEL
+old=/boot/KERNEL.OLD
+version=1.1.0.191
+previous=1.1.0.190
+```
+
+Both loaders do the same (`boot/common/update.rs`), UEFI through SimpleFileSystem, BIOS through
+INT 13h:
+
+1. `pending=1`, `tries>0`: when an `ospab` entry that boots `kernel=` is started, `tries` is
+   decreased and written back before the jump, and `update_try=1` is added to the kernel command line.
+2. The kernel reaches the point where the console is ready (the `Console ready` line) and, because
+   of `update_try=1`, writes `pending=0 tries=0`. The update is confirmed.
+3. `pending=1`, `tries=0`: the kernel did not confirm in 2 boots. The loader writes
+   `pending=0 failed=1`, replaces `kernel=` with `old=` in every entry (and in its modules), adds
+   `update_fallback=1` to the command line and shows the menu with the reason, for example
+   "System update 1.1.0.191 failed to start 2 times. Booting the previous kernel 1.1.0.190". The
+   countdown boots the previous kernel. The kernel prints a warning line `System update` too.
+4. `failed=1` stays until the next `tomato upgrade` writes a new state. A new update does not
+   overwrite `KERNEL.OLD` while the state is `pending` or `failed`.
+
+Rules and limits:
+
+- Booting "ospab.os (previous)" by hand never confirms the new kernel: only a start with
+  `update_try=1` does. Editing the command line with `e` keeps `update_try=1`, because the loader
+  adds it after the edit.
+- If the previous kernel file is missing, the loader says so and tries the new kernel again.
+- If the loader cannot write `UPDATE.ST` (read-only firmware file system), the counter does not
+  count down and no automatic rollback happens; the menu entry still works.
+- Menu timeouts: the menu stays visible after a fallback even with `timeout = 0`.
+- A crash during the update (power loss) leaves either the old or the new kernel as `KERNEL`; the
+  switch is a single 32-byte directory write. A leftover `KERNEL.NEW` is removed by the next update.
+- BIOS stage 2 is written before stage 1 (in the MBR). If the power fails between the two writes
+  and the new stage 2 is larger than the old stage 1 expects, BIOS boot fails until the disk is
+  repaired from the live ISO; UEFI boot is not affected.
+
 ## Memory test
 
-A loader feature, not a kernel mode: the tester is `boot/common/memtest.rs`.
-Per pass: walking ones and zeros (8 shifts each), address in address (plus complement),
-moving inversions (`0x55..`, `0x00FF..`, up then down), random pattern (plus complement).
-Screen: progress bar, current test, pass, time, error count; Esc aborts. The result screen
-shows PASSED / FAILED / ABORTED, the amount tested and the first 16 errors (address, expected,
-actual, test); it is also printed to serial when `serial = yes`.
-Options in the entry command line: `passes=N` (1..99), `limit=MiB`, `inject=1` (flip one bit
-after the first write, to check that errors are reported).
+The memory test belongs to the loader, not the kernel: the tester is `boot/common/memtest.rs`.
+Each pass runs walking ones and zeros (8 shifts each), address in address (plus complement),
+moving inversions (`0x55..`, `0x00FF..`, up then down) and a random pattern (plus complement).
+The screen shows a progress bar, the current test, pass, time and error count. Esc aborts. The
+result screen shows PASSED, FAILED or ABORTED, the amount tested and the first 16 errors
+(address, expected, actual, test). It is also printed to serial when `serial = yes`.
 
-- **UEFI:** allocates free RAM above 1 MiB from the firmware in 32 MiB chunks, tests each chunk
+Options in the entry command line: `passes=N` (1..99), `limit=MiB`, and `inject=1`, which flips
+one bit after the first write to check that errors are reported.
+
+- UEFI: allocates free RAM above 1 MiB from the firmware in 32 MiB chunks, tests each chunk
   and frees it, so firmware and loader memory is never overwritten (memory the firmware holds is
   not tested).
-- **BIOS:** tests the E820 usable ranges directly, in 32 MiB chunks. Not tested: the first 5 MiB
+- BIOS: tests the E820 usable ranges directly, in 32 MiB chunks. Not tested: the first 5 MiB
   (BIOS data and the loader itself). RAM above 4 GiB is tested too; the loader extends its page
   tables for it first.
 

@@ -69,6 +69,46 @@ impl Volume {
         }
     }
 
+    /// Overwrite the first `data.len()` bytes of an existing file of exactly that size, then read
+    /// it back. Never changes the allocation (the update state file, see common/update.rs).
+    /// False on a read-only volume (ISO9660) and on any error.
+    pub fn write_in_place(&mut self, path: &str, data: &[u8]) -> bool {
+        let Volume::Fat(root, _) = self else { return false };
+        let mut name: Vec<u16> = path
+            .trim_start_matches('/')
+            .chars()
+            .map(|c| if c == '/' { b'\\' as u16 } else { c as u16 })
+            .collect();
+        name.push(0);
+        unsafe {
+            let mut f: *mut File = ptr::null_mut();
+            if is_error(((**root).open)(*root, &mut f, name.as_ptr(), FILE_MODE_READ_WRITE, 0)) {
+                return false;
+            }
+            let mut size = 0u64;
+            ((*f).set_position)(f, u64::MAX);
+            ((*f).get_position)(f, &mut size);
+            ((*f).set_position)(f, 0);
+            let mut ok = size == data.len() as u64;
+            if ok {
+                let mut n = data.len();
+                ok = !is_error(((*f).write)(f, &mut n, data.as_ptr())) && n == data.len();
+            }
+            if ok {
+                ok = !is_error(((*f).flush)(f));
+            }
+            ((*f).close)(f);
+            if !ok {
+                return false;
+            }
+        }
+        // Read back through a fresh handle.
+        match self.read_small(path) {
+            Some(back) => back == data,
+            None => false,
+        }
+    }
+
     /// Small files (config): into the pool.
     pub fn read_small(&mut self, path: &str) -> Option<Vec<u8>> {
         let f = self.load(path, OSPAB_RECLAIM_MEMORY)?;

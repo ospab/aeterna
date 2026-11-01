@@ -220,121 +220,216 @@ pub fn run_mkfs(args: &str) {
     puts(label);
     puts("'\n");
 
-    // Parse device path → find partition info
-    if device.starts_with("/dev/nvme0n1p") {
-        let part_num_str = &device["/dev/nvme0n1p".len()..];
-        let part_num: usize = match parse_usize(part_num_str) {
-            Some(n) if n >= 1 => n,
-            _ => { err("mkfs: invalid partition number\n"); return; }
-        };
-        let idx = part_num - 1;
-        let part = match crate::drivers::gpt::get_partition(idx) {
-            Some(p) => p,
-            None => {
-                err("mkfs: partition not found in GPT\n");
-                dim("Tip: run `fdisk -l` to list available partitions\n");
+    let (disk, start, sectors) = match resolve_partition(device, "mkfs") {
+        Some(t) => t,
+        None => return,
+    };
+    // Never format the volume that holds `/`.
+    if let Some(v) = crate::fs::aeternafs::root_volume() {
+        if let Some(a) = crate::fs::disk_sync::area(v.disk_index()) {
+            if v.disk_index() == disk && start < a.v2_lba + a.v2_sectors && start + sectors > a.legacy_lba {
+                err("mkfs: this partition holds the running system's files\n");
                 return;
             }
-        };
-        let ss = crate::drivers::nvme::sector_size();
-        let fmt_ok = crate::fs::aeternafs::mkfs(
-            crate::fs::aeternafs::DiskBacking::NvmePartition { part_start: part.start_lba },
-            part.start_lba,
-            part.end_lba.saturating_sub(part.start_lba) + 1,
-            ss,
-            label,
-        );
-        if fmt_ok {
-            ok("[AeternaFS] Format successful\n");
-            puts("  Label:     "); puts(label); puts("\n");
-            puts("  Partition: "); puts(device); puts("\n");
-            puts("  Start LBA: "); put_u64(part.start_lba); puts("\n");
-            puts("  Sectors:   "); put_u64(part.end_lba.saturating_sub(part.start_lba) + 1); puts("\n");
-            dim("Run `mount /dev/nvme0n1p");
-            put_u64_col(part_num as u64, FG_DIM);
-            dim(" /mnt/target` to mount (not yet implemented interactively),\n");
-            dim("or use `install` to deploy AETERNA to this partition.\n");
-        } else {
-            err("mkfs: format failed\n");
         }
-    } else if device.starts_with("/dev/") {
-        // AHCI partition — try to find disk index from name
-        let name = &device["/dev/".len()..];
-        let (disk_name, part_str) = split_dev_name(name);
-        let disk_idx = match ahci_name_to_idx(disk_name) {
-            Some(i) => i,
-            None => { err("mkfs: unknown device (only /dev/nvme0n1pN, /dev/sdaN and /dev/vdaN supported)\n"); return; }
-        };
-        let part_num: usize = match parse_usize(part_str) {
-            Some(n) if n >= 1 => n,
-            _ => { err("mkfs: invalid partition number\n"); return; }
-        };
+    }
+    match crate::fs::aeternafs::mkfs(disk, start, sectors, label) {
+        Ok(()) => {
+            ok("[AeternaFS v2] Format successful\n");
+            puts("  Label:     "); puts(label); puts("\n");
+            puts("  Device:    "); puts(device); puts("\n");
+            puts("  Start LBA: "); put_u64(start); puts("\n");
+            puts("  Sectors:   "); put_u64(sectors); puts("\n");
+            dim("Mount it with `mount <device> <mountpoint>`.\n");
+        }
+        Err(e) => {
+            err("mkfs: format failed: ");
+            err(&alloc::format!("{}\n", e));
+        }
+    }
+}
 
-        // Parse GPT on the AHCI disk to get partition LBAs
-        let mut ahci_dev = crate::drivers::block::AhciDisk { disk_idx };
-        let pc = crate::drivers::gpt::parse(&mut ahci_dev).unwrap_or(0);
-        if pc == 0 {
-            err("mkfs: no GPT found on disk\n");
-            return;
+/// `/dev/nvme0n1pN`, `/dev/sdaN`, `/dev/vdaN`, `/dev/hdaN` -> (disk index, first sector,
+/// sectors) in 512-byte units, from the GPT of that disk.
+fn resolve_partition(device: &str, who: &str) -> Option<(usize, u64, u64)> {
+    if device.starts_with("/dev/nvme0n1p") {
+        let part_num = match parse_usize(&device["/dev/nvme0n1p".len()..]) {
+            Some(n) if n >= 1 => n,
+            _ => { err(who); err(": invalid partition number\n"); return None; }
+        };
+        let disk = (0..crate::drivers::disk_count()).find(|&i| {
+            crate::drivers::disk_info(i).map_or(false, |d| d.kind == crate::drivers::DiskKind::Nvme)
+        });
+        let disk = match disk { Some(d) => d, None => { err(who); err(": no NVMe disk\n"); return None; } };
+        let part = match crate::drivers::gpt::get_partition(part_num - 1) {
+            Some(p) => p,
+            None => {
+                err(who); err(": partition not found in GPT\n");
+                dim("Tip: run `fdisk -l` to list available partitions\n");
+                return None;
+            }
+        };
+        // GPT LBAs of an NVMe namespace are in its own sector size; the drivers use 512.
+        let mul = (crate::drivers::nvme::sector_size() / 512) as u64;
+        let first = part.start_lba * mul;
+        let count = (part.end_lba.saturating_sub(part.start_lba) + 1) * mul;
+        return Some((disk, first, count));
+    }
+    if let Some(name) = device.strip_prefix("/dev/") {
+        let (disk_name, part_str) = split_dev_name(name);
+        let disk = match ahci_name_to_idx(disk_name) {
+            Some(i) => i,
+            None => { err(who); err(": unknown device (supported: /dev/nvme0n1pN, /dev/sdaN, /dev/vdaN, /dev/hdaN)\n"); return None; }
+        };
+        let part_num = match parse_usize(part_str) {
+            Some(n) if n >= 1 => n,
+            _ => { err(who); err(": invalid partition number\n"); return None; }
+        };
+        let mut dev = crate::drivers::block::AhciDisk { disk_idx: disk };
+        if crate::drivers::gpt::parse(&mut dev).unwrap_or(0) == 0 {
+            err(who); err(": no GPT found on the disk\n");
+            return None;
         }
         let part = match crate::drivers::gpt::get_partition(part_num - 1) {
             Some(p) => p,
-            None => { err("mkfs: partition index out of range\n"); return; }
+            None => { err(who); err(": partition index out of range\n"); return None; }
         };
-        let fmt_ok = crate::fs::aeternafs::mkfs(
-            crate::fs::aeternafs::DiskBacking::AhciPartition {
-                disk_idx,
-                part_start: part.start_lba,
-            },
-            part.start_lba,
-            part.end_lba.saturating_sub(part.start_lba) + 1,
-            512,
-            label,
-        );
-        if fmt_ok { ok("Format successful\n"); } else { err("mkfs: format failed\n"); }
-    } else {
-        err("mkfs: unrecognized device path\n");
-        dim("Supported: /dev/nvme0n1pN  /dev/sdaN\n");
+        return Some((disk, part.start_lba, part.end_lba.saturating_sub(part.start_lba) + 1));
     }
+    err(who);
+    err(": unrecognized device path\n");
+    dim("Supported: /dev/nvme0n1pN  /dev/sdaN  /dev/vdaN  /dev/hdaN\n");
+    None
 }
 
 // ─── mount helper (called after mkfs or at boot) ──────────────────────────
 
 /// `mount <device> <mountpoint>`
 pub fn run_mount(args: &str) {
-    let mut toks = args.splitn(3, ' ');
-    let device = match toks.next() { Some(d) if !d.is_empty() => d.trim(), _ => {
-        err("mount: usage: mount <device> <mountpoint>\n"); return;
-    }};
-    let mountpoint = match toks.next() { Some(m) if !m.is_empty() => m.trim(), _ => {
-        err("mount: missing mountpoint\n"); return;
-    }};
-
-    puts("Mounting ");
-    puts(device);
-    puts(" at ");
-    puts(mountpoint);
-    puts("...\n");
-
-    let mounted = if device.starts_with("/dev/nvme0n1p") {
-        let part_str = &device["/dev/nvme0n1p".len()..];
-        let idx = parse_usize(part_str).unwrap_or(1).saturating_sub(1);
-        if let Some(part) = crate::drivers::gpt::get_partition(idx) {
-            let ss = crate::drivers::nvme::sector_size();
-            let ok = crate::fs::aeternafs::mount_nvme_partition(part.start_lba, ss);
-            if ok {
-                crate::fs::mount(mountpoint, crate::fs::aeternafs::instance())
-            } else {
-                false
-            }
-        } else { false }
-    } else {
-        err("mount: only NVMe partitions supported interactively\n");
-        false
+    let mut toks = args.split_whitespace();
+    let device = match toks.next() {
+        Some(d) => d,
+        None => { show_volumes(); return; }
     };
+    let mountpoint = match toks.next() {
+        Some(m) if m.starts_with('/') => m,
+        _ => { err("mount: usage: mount [<device> <mountpoint>]\n"); return; }
+    };
+    let (disk, start, sectors) = match resolve_partition(device, "mount") {
+        Some(t) => t,
+        None => return,
+    };
+    // The running system's own volume is already mounted below `/`.
+    if let Some(v) = crate::fs::aeternafs::root_volume() {
+        if let Some(a) = crate::fs::disk_sync::area(v.disk_index()) {
+            if v.disk_index() == disk && start < a.v2_lba + a.v2_sectors && start + sectors > a.legacy_lba {
+                err("mount: this partition holds the running system's files (already in use for /)\n");
+                return;
+            }
+        }
+    }
+    if !crate::fs::aeternafs::has_v2_magic(disk, start) {
+        err("mount: no AeternaFS v2 volume there; format it with `mkfs` first\n");
+        return;
+    }
+    match crate::fs::aeternafs::mount_raw(disk, start, sectors) {
+        Ok(vol) => {
+            let fs = crate::fs::aeternafs::AeFs::register(vol, "aeternafs", disk, false);
+            if crate::fs::mount(mountpoint, fs) {
+                ok("Mounted successfully\n");
+            } else {
+                err("mount: the mount point is taken or the table is full\n");
+            }
+        }
+        Err(e) => {
+            err("mount: ");
+            err(&alloc::format!("{}\n", e));
+        }
+    }
+}
 
-    if mounted { ok("Mounted successfully\n"); }
-    else { err("mount: failed — check that the partition is formatted with mkfs first\n"); }
+/// `mount` without arguments: the volumes AeternaFS has mounted.
+fn show_volumes() {
+    puts("Mounted filesystems:\n");
+    puts("  cowfs         on /       (read-only system files + writable layer)\n");
+    puts("  procfs        on /proc\n");
+    let mut any = false;
+    for v in crate::fs::aeternafs::volumes_info() {
+        any = true;
+        puts("  ");
+        puts(&alloc::format!("aeternafs v2  disk {}  {}  gen {}  {} MiB free of {} MiB  {} snapshot(s){}\n",
+            v.disk, if v.label.is_empty() { "-" } else { &v.label }, v.generation,
+            v.free_blocks * 4 / 1024, v.total_blocks * 4 / 1024, v.snapshots,
+            if v.is_root { "  (writable layer of /)" } else { "" }));
+    }
+    if !any {
+        dim("  no persistent volume: changes to / stay in RAM\n");
+    }
+}
+
+// ─── fsck / snap ──────────────────────────────────────────────────────────
+
+fn volume_or_err(who: &str) -> Option<&'static crate::fs::aeternafs::AeFs> {
+    match crate::fs::aeternafs::root_volume() {
+        Some(v) => Some(v),
+        None => {
+            err(who);
+            err(": no persistent AeternaFS volume (live system or no AETERNA partition)\n");
+            None
+        }
+    }
+}
+
+/// `fsck [--deep]`: commit pending changes, then check the persistent volume.
+pub fn run_fsck(args: &str) {
+    let deep = args.split_whitespace().any(|a| a == "--deep" || a == "-d");
+    let v = match volume_or_err("fsck") { Some(v) => v, None => return };
+    puts(if deep { "Checking the volume, reading every data page...\n" } else { "Checking the volume...\n" });
+    match v.fsck(deep) {
+        Ok(r) => {
+            puts(&alloc::format!(
+                "  trees {}  nodes {}  inodes {} ({} dirs, {} files, {} symlinks)\n  data blocks {}  free blocks {}  snapshots {}\n",
+                r.trees, r.nodes, r.inodes, r.dirs, r.files, r.symlinks, r.data_blocks, r.free_blocks, r.snapshots));
+            if r.is_ok() {
+                ok("Clean: no errors found.\n");
+            } else {
+                err(&alloc::format!("{} error(s):\n", r.errors.len()));
+                for e in r.errors.iter().take(20) {
+                    err(&alloc::format!("  {}\n", e));
+                }
+            }
+        }
+        Err(e) => err(&alloc::format!("fsck: {}\n", e)),
+    }
+}
+
+/// `snap create|list|delete [name]` on the persistent volume.
+pub fn run_snap(args: &str) {
+    let mut t = args.split_whitespace();
+    let sub = t.next().unwrap_or("list");
+    let name = t.next();
+    let v = match volume_or_err("snap") { Some(v) => v, None => return };
+    match (sub, name) {
+        ("list", _) | ("ls", _) => match v.snapshot_list() {
+            Ok(l) if l.is_empty() => dim("no snapshots\n"),
+            Ok(l) => {
+                puts("  ID  GENERATION  NAME\n");
+                for s in l {
+                    puts(&alloc::format!("  {:<3} {:<11} {}\n", s.id, s.gen, s.name));
+                }
+            }
+            Err(e) => err(&alloc::format!("snap: {}\n", e)),
+        },
+        ("create", Some(n)) => match v.snapshot_create(n) {
+            Ok(()) => ok("Snapshot created.\n"),
+            Err(e) => err(&alloc::format!("snap: {}\n", e)),
+        },
+        ("delete", Some(n)) | ("rm", Some(n)) => match v.snapshot_delete(n) {
+            Ok(()) => ok("Snapshot deleted.\n"),
+            Err(e) => err(&alloc::format!("snap: {}\n", e)),
+        },
+        _ => err("usage: snap create <name> | snap list | snap delete <name>\n"),
+    }
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────

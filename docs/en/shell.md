@@ -1,7 +1,7 @@
 # Shell and tools
 
-The console runs **plum**, a shell with Bourne-style syntax. Today the shell and the coreutils run
-inside the kernel; programs installed from packages run as separate ring-3 processes.
+The console runs plum, a shell with Bourne-style syntax. For now the shell and the coreutils run
+inside the kernel. Programs installed from packages run as separate ring-3 processes.
 
 ## Syntax
 
@@ -32,7 +32,7 @@ one after another, not concurrently.
   `xargs`, `yes`.
 - System: `uname`, `date`, `uptime`, `hostname`, `free`, `lsmem`, `ps`, `top`, `kill`, `dmesg`,
   `lspci`, `shutdown`, `reboot`.
-- Disks: `lsblk`, `fdisk -l`, `mkfs`, `mount`, `install`.
+- Disks: `lsblk`, `fdisk -l`, `mkfs`, `mount`, `fsck`, `snap`, `install`.
 - Network: `ip`, `ifconfig`, `ping`, `nslookup`, `curl`, `traceroute`, `netstat`, `ntpdate`,
   `ostp`. See [Networking](networking.md).
 - Apps: `grape` (text editor), `tomato` (packages), `doom`, `soundtest`, `vol`, `clip`.
@@ -60,9 +60,9 @@ the exit code, and Ctrl+C asks the kernel to stop them. See [Packages](packages.
 
 ## Clipboard and serial console
 
-In VMware, **Ctrl+V** pastes the Windows clipboard into the console (copy and paste must be
-allowed in the VM's Guest Isolation settings). Line breaks in pasted text become spaces, so a
-pasted link never runs a command on its own.
+In VMware, Ctrl+V pastes the Windows clipboard into the console. Copy and paste must be allowed
+in the VM's Guest Isolation settings. Line breaks in pasted text become spaces, so a pasted link
+cannot run a command on its own.
 
 ```
 # clip                          print the host clipboard
@@ -84,18 +84,18 @@ right click. In QEMU use `-serial stdio`.
 # display scale 2           console font scale: 1, 2 or auto (2 from 2560 px wide)
 ```
 
-`display set` switches at once, turns autofit off and saves the mode in `/etc/display.conf`;
-it is applied at the next boot. Changing the mode works only on the VMware SVGA II adapter
-(VMware, QEMU `-vga vmware`); elsewhere `display list` shows the boot mode only. The text on the
-console is redrawn at the new size; lines longer than the new width are cut. See
+`display set` switches at once, turns autofit off and saves the mode in `/etc/display.conf`,
+which is applied at the next boot. The mode can be changed only on the VMware SVGA II adapter
+(VMware, QEMU `-vga vmware`). Elsewhere `display list` shows the boot mode and nothing else. The
+console text is redrawn at the new size, and lines longer than the new width are cut. See
 [Hardware](hardware.md#display-modes-and-autofit).
 
 ## Time
 
-The clock starts from the CMOS RTC at boot and is corrected by NTP (`ntpdate`, and once at
-console start when the network is up). If the RTC keeps local time, as Windows and VMware do,
-the offset is learned on the first NTP sync and saved to `/etc/rtc_offset`. The time zone for
-display is read from `/etc/timezone`, for example `UTC+3`.
+At boot the clock starts from the CMOS RTC. NTP then corrects it, through `ntpdate` and once at
+console start if the network is up. If the RTC keeps local time, as Windows and VMware do, the
+offset is learned on the first NTP sync and saved to `/etc/rtc_offset`. The time zone for display
+comes from `/etc/timezone`, for example `UTC+3`.
 
 `date -e` prints seconds since the ospab epoch, 2012-08-09 00:00:00 UTC; `date --unix` prints
 Unix time.

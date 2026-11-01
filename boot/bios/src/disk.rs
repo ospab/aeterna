@@ -78,6 +78,64 @@ impl Disk {
         false
     }
 
+    /// Write `data` (at most one bounce buffer) at sector `lba`; `data.len()` must be a whole
+    /// number of sectors. INT 13h AH=43h, no write-verify.
+    fn write_sectors(&self, lba: u64, data: &[u8]) -> bool {
+        let count = (data.len() as u32) / self.bps;
+        if count == 0 || data.len() as u32 % self.bps != 0 || data.len() as u32 > BOUNCE_LEN || count > 127 {
+            return false;
+        }
+        for attempt in 0..3 {
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), BOUNCE as *mut u8, data.len());
+                ptr::write(DAP as *mut u8, 16);
+                ptr::write((DAP + 1) as *mut u8, 0);
+                ptr::write((DAP + 2) as *mut u16, count as u16);
+                ptr::write((DAP + 4) as *mut u16, (BOUNCE & 15) as u16);
+                ptr::write((DAP + 6) as *mut u16, (BOUNCE >> 4) as u16);
+                ptr::write_unaligned((DAP + 8) as *mut u64, lba);
+            }
+            let mut r = Regs::new();
+            r.eax = 0x4300;
+            r.edx = self.drive as u32;
+            r.ds_si(DAP);
+            rm::int(0x13, &mut r);
+            if !r.carry() {
+                return true;
+            }
+            if attempt < 2 {
+                let mut r = Regs::new();
+                r.eax = 0;
+                r.edx = self.drive as u32;
+                rm::int(0x13, &mut r);
+            }
+        }
+        false
+    }
+
+    /// Overwrite `data.len()` bytes at byte `offset` (read-modify-write of the sectors it
+    /// touches), then read them back and compare.
+    pub fn write_bytes(&self, offset: u64, data: &[u8]) -> bool {
+        let bps = self.bps as u64;
+        let first = offset / bps;
+        let last = (offset + data.len() as u64 + bps - 1) / bps;
+        let n = (last - first) as usize;
+        if n == 0 || n > 64 {
+            return false;
+        }
+        let mut buf = alloc::vec![0u8; n * bps as usize];
+        if !self.read_bytes(first * bps, &mut buf) {
+            return false;
+        }
+        let skip = (offset - first * bps) as usize;
+        buf[skip..skip + data.len()].copy_from_slice(data);
+        if !self.write_sectors(first, &buf) {
+            return false;
+        }
+        let mut back = alloc::vec![0u8; data.len()];
+        self.read_bytes(offset, &mut back) && back == data
+    }
+
     /// Read bytes at any offset.
     pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> bool {
         let max_sectors = (BOUNCE_LEN / self.bps).min(127);
@@ -274,6 +332,16 @@ impl Fat {
         out
     }
 
+    /// Overwrite an existing file of exactly `data.len()` bytes (at most one cluster) in place;
+    /// the allocation does not change. Used for the update state file (common/update.rs).
+    fn write_in_place(&mut self, path: &str, data: &[u8]) -> bool {
+        let Some(e) = self.lookup(path) else { return false };
+        if e.dir || e.size as usize != data.len() || data.len() as u64 > self.cluster_bytes() || !self.is_data(e.cluster) {
+            return false;
+        }
+        self.disk.write_bytes(self.data_off + (e.cluster as u64 - 2) * self.cluster_bytes(), data)
+    }
+
     fn lookup(&mut self, path: &str) -> Option<DirEnt> {
         let mut cur = DirEnt { name: String::new(), cluster: self.root, size: 0, dir: true };
         for comp in path.split('/').filter(|c| !c.is_empty()) {
@@ -405,6 +473,14 @@ impl Volume {
         let pages = ((size + PAGE - 1) / PAGE).max(1) as usize;
         let addr = crate::pmem::alloc_pages(pages, kind);
         if self.read_into(path, size, addr as *mut u8) { Some(Loaded { addr, size }) } else { None }
+    }
+
+    /// See `Fat::write_in_place`; false on ISO9660 (read-only) and on any error.
+    pub fn write_in_place(&mut self, path: &str, data: &[u8]) -> bool {
+        match self {
+            Volume::Fat(f) => f.write_in_place(path, data),
+            Volume::Iso(_) => false,
+        }
     }
 
     /// Small files (the configuration) into the heap.

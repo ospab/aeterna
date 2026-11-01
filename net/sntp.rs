@@ -11,8 +11,8 @@
  *   - Unix time = NTP seconds − 2_208_988_800
  *
  * Timezone:
- *   /etc/timezone holds: "UTC"  "UTC+3"  "UTC-5"  "UTC+5:30"
- *   Only UTC±H[:MM] offsets are supported.
+ *   /etc/timezone holds: "UTC"  "UTC+3"  "UTC-5"  "UTC+5:30", or a zone name from
+ *   time::ZONES ("Europe/Berlin"), which includes daylight saving.
  *
  * API:
  *   sync_system_time()          — try NTP_FALLBACKS list, update global state
@@ -92,13 +92,20 @@ pub fn invalidate_tz_cache() { unsafe { TZ_LOADED = false; } }
 
 /// Parse a timezone string and return the UTC offset in **seconds**.
 ///
-/// Recognised formats: `"UTC"`, `"UTC+3"`, `"UTC-5"`, `"UTC+5:30"`.
-/// Anything else (e.g. IANA zone names) returns `0`.
+/// Recognised formats: `"UTC"`, `"UTC+3"`, `"UTC-5"`, `"UTC+5:30"`, and the zone names of
+/// `time::ZONES`. Anything else returns `0`.
 pub fn parse_timezone_offset(data: &[u8]) -> i64 {
     // Trim trailing whitespace / newlines.
     let mut end = data.len();
     while end > 0 && matches!(data[end - 1], b'\n' | b'\r' | b' ' | b'\t') { end -= 1; }
     let s = &data[..end];
+
+    // A zone name from the installer's list (Europe/Berlin): standard offset plus daylight saving now.
+    if let Ok(name) = core::str::from_utf8(s) {
+        if crate::time::zone_by_name(name.trim()).is_some() {
+            return crate::time::zone_offset_secs(name, crate::time::unix_secs());
+        }
+    }
 
     if s == b"UTC" || s.is_empty() { return 0; }
 

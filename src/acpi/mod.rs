@@ -649,6 +649,7 @@ fn enable_acpi_mode() {
 /// Falls back to emulator-specific ports if ACPI is not available.
 pub fn shutdown() {
     serial::write_str("[ACPI] Shutdown requested\r\n");
+    crate::fs::aeternafs::flush_for_power();
     crate::drivers::audio::stop();
 
     unsafe {
@@ -716,6 +717,7 @@ pub fn shutdown() {
 /// Tries: FADT reset register → PCI reset (0xCF9) → PS/2 controller → triple fault.
 pub fn reboot() {
     serial::write_str("[ACPI] Reboot requested\r\n");
+    crate::fs::aeternafs::flush_for_power();
     crate::drivers::audio::stop();
 
     unsafe {

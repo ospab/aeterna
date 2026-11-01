@@ -43,6 +43,8 @@ mod menu;
 mod modesel;
 #[path = "../../common/paging.rs"]
 mod paging;
+#[path = "../../common/update.rs"]
+mod update;
 
 /// Page allocator hook for boot/common.
 mod plat {
@@ -209,6 +211,30 @@ pub extern "sysv64" fn bios_main(_drive: u32) -> ! {
         println!("ospab.cfg:{}: {}", e.line, e.msg);
     }
 
+    // System update state (UPDATE.ST next to the config): trial boots and fallback to the
+    // previous kernel, see common/update.rs.
+    let mut notice = String::new();
+    let mut force_menu = false;
+    let mut upd_state: Option<update::State> = None;
+    let upd_path = update::state_path(CONFIG_PATH);
+    if source == CONFIG_PATH {
+        if let Some(st) = vol.read_small(&upd_path).and_then(|raw| update::parse(&raw)) {
+            let old_exists = vol.exists(&st.old);
+            let out = update::evaluate(&mut cfg, st, old_exists);
+            if let Some(b) = out.write.as_ref().and_then(update::encode) {
+                if !vol.write_in_place(&upd_path, &b) {
+                    println!("update state: cannot write {}", upd_path);
+                }
+            }
+            if let Some(n) = out.notice {
+                println!("{}", n);
+                notice = n;
+            }
+            force_menu = out.state.failed;
+            upd_state = Some(out.state);
+        }
+    }
+
     let pal = menu::Palette::new(cfg.theme);
     let mut tm = hw::BiosTerm::new();
 
@@ -216,13 +242,14 @@ pub extern "sysv64" fn bios_main(_drive: u32) -> ! {
     // One visible entry and no errors: no menu. timeout = 0: no menu unless a key is waiting.
     let visible = cfg.entries.iter().filter(|e| !e.hidden).count();
     let mut skip_menu = errors.is_empty()
+        && !force_menu
         && (visible <= 1 || (cfg.timeout == Some(0) && menu::Term::poll_key(&mut tm).is_none()));
 
     loop {
-        let (index, cmdline) = if skip_menu {
+        let (index, mut cmdline) = if skip_menu {
             (selected, cfg.entries[selected].cmdline.clone())
         } else {
-            let info = menu::MenuInfo { loader: LOADER_NAME, source: &source, errors: &errors, selected };
+            let info = menu::MenuInfo { loader: LOADER_NAME, source: &source, errors: &errors, selected, notice: &notice };
             let c = menu::run(&mut tm, &pal, &cfg, &info);
             (c.index, c.cmdline)
         };
@@ -230,6 +257,14 @@ pub extern "sysv64" fn bios_main(_drive: u32) -> ! {
         let entry = &cfg.entries[index];
         match entry.typ {
             EntryType::Ospab => {
+                // Trial boot of an updated kernel: one try is used up before the jump.
+                if let Some(next) = upd_state.as_ref().and_then(|s| update::trial_boot(s, &entry.kernel, &mut cmdline)) {
+                    if let Some(b) = update::encode(&next) {
+                        if !vol.write_in_place(&upd_path, &b) {
+                            println!("update state: cannot write {}", upd_path);
+                        }
+                    }
+                }
                 menu::Term::clear(&mut tm, 0x07);
                 menu::Term::set_cursor(&mut tm, 0, 0, true);
                 boot_kernel(&mut vol, &cfg, entry, &cmdline);

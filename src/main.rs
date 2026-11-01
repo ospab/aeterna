@@ -213,8 +213,10 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     base_ramfs.is_readonly = true;
     let upper_ramfs = Box::leak(Box::new(ospab_os::fs::ramfs::RamFs::new()));
     ospab_os::fs::set_syncable_fs(upper_ramfs);
+    // The writable layer starts in RAM; with an AETERNA partition it switches to AeternaFS v2.
+    let upper_switch = Box::leak(Box::new(ospab_os::fs::persist::SwitchFs::new(upper_ramfs)));
 
-    let cow_root = Box::leak(Box::new(ospab_os::fs::cow::CowFs::new(base_ramfs, upper_ramfs)));
+    let cow_root = Box::leak(Box::new(ospab_os::fs::cow::CowFs::new(base_ramfs, upper_switch)));
     ospab_os::fs::mount("/", cow_root);
     ospab_os::fs::mount("/proc", ospab_os::fs::procfs::instance());
     boot_log!(Status::Ok, "Root filesystem", "RAM overlay, {} system files, /proc", base_ramfs.node_count());
@@ -232,30 +234,19 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
             }
         }
 
-        // Restore the writable layer saved by `sync` (vfs/disk_sync.rs decides where it lives)
+        // Persistent writable layer: AeternaFS v2 on the AETERNA partition (vfs/persist.rs
+        // mounts it, migrates the old RAM snapshot, or formats a new volume).
         boot_step("Persistence");
-        let target = ospab_os::fs::disk_sync::primary_disk_index()
-            .and_then(|i| ospab_os::fs::disk_sync::base_lba(i).map(|lba| (i, lba)));
-        match target {
-            None => boot_log!(Status::Info, "Persistence",
-                "no AETERNA partition: changes stay in RAM"),
-            Some((disk, lba)) => {
-                serial_line!("[FS] Persistence area: disk {}, LBA {}", disk, lba);
-                let restored = ospab_os::fs::disk_sync::read_from_disk().and_then(|data| {
-                    let bytes = data.len();
-                    ospab_os::fs::disk_sync::deserialize_ramfs(&data).map(|tree| (tree, bytes))
-                });
-                match restored {
-                    Some((tree, bytes)) => {
-                        upper_ramfs.restore_from_tree(tree);
-                        boot_log!(Status::Ok, "Persistence", "restored {} files ({} bytes) from disk {}",
-                            upper_ramfs.node_count(), bytes, disk);
-                        klog::boot("Filesystem restored from disk");
-                    }
-                    None => boot_log!(Status::Info, "Persistence",
-                        "disk {}: nothing saved yet, `sync` writes it", disk),
-                }
-            }
+        let report = ospab_os::fs::persist::init(upper_switch, upper_ramfs);
+        let status = match report.level {
+            ospab_os::fs::persist::Level::Ok => Status::Ok,
+            ospab_os::fs::persist::Level::Info => Status::Info,
+            ospab_os::fs::persist::Level::Warn => Status::Warn,
+        };
+        boot_log!(status, "Persistence", "{}", report.text);
+        if ospab_os::fs::persist::is_active() {
+            klog::boot("Filesystem mounted from disk");
+            ospab_os::fs::persist::start_committer();
         }
     } else {
         boot_log!(Status::Absent, "Storage", "no ATA/AHCI/NVMe/virtio disks");
@@ -284,8 +275,7 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     }
 
     // NVMe controllers are probed inside drivers::init() (and show up in the
-    // Storage list above); this step only reads the GPT of the NVMe disk and
-    // auto-mounts an AeternaFS partition.
+    // Storage list above); this step only reads the GPT of the NVMe disk.
     boot_step("USB");
     if ospab_os::xhci::init() {
         let (kbd, mouse) = ospab_os::xhci::hid_counts();
@@ -302,17 +292,6 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
 
         if gpt_parts > 0 {
             boot_log!(Status::Ok, "NVMe", "{} GPT partitions", gpt_parts);
-            // Auto-mount the first AeternaFS partition at /mnt/target
-            for pi in 0..gpt_parts {
-                if let Some(part) = ospab_os::drivers::gpt::get_partition(pi) {
-                    let ss = ospab_os::drivers::nvme::sector_size();
-                    if ospab_os::fs::aeternafs::mount_nvme_partition(part.start_lba, ss) {
-                        ospab_os::fs::mount("/mnt/target", ospab_os::fs::aeternafs::instance());
-                        boot_log!(Status::Info, "NVMe", "AeternaFS partition {} mounted at /mnt/target", pi);
-                        break;
-                    }
-                }
-            }
         } else {
             boot_log!(Status::Ok, "NVMe", "no partition table (use `fdisk`, then `mkfs`)");
         }
@@ -369,6 +348,13 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
         ring3_self_test();
         boot_log!(Status::Ok, "Console", "ready");
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
+        // System update: the console is up, so tell the loader this kernel started well.
+        if ospab_os::arch::x86_64::boot::cmdline_get("update_fallback") == "1" {
+            boot_log!(Status::Warn, "System update", "the updated kernel failed to start; running the previous kernel");
+        }
+        if let Some(m) = ospab_os::esp::mark_boot_ok() {
+            serial_line!("[UPDATE] {}", m);
+        }
     }
     klog::boot("Entering terminal");
     terminal::run();

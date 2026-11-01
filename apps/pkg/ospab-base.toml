@@ -1,0 +1,23 @@
+# ospab-base: the kernel, the UEFI loader and the BIOS loader, installed on the EFI System
+# Partition (not in the RAM filesystem) by `tomato upgrade`. A template: build.ps1 -Base /
+# build.sh base fill in @VERSION@ (kernel version + build number, e.g. 1.1.0.191) and the
+# paths of the build outputs with `tmt pack --set`. Plain `tmt pack` of this file fails on purpose.
+# Copyright (c) 2026 ospab. SPDX-License-Identifier: AGPL-3.0-only
+name = "ospab-base"
+version = "@VERSION@"
+kind = "system"
+description = "ospab.os system: kernel, UEFI loader and BIOS loader (written to the EFI System Partition, reboot required)"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "@KERNEL@"
+dest = "esp:kernel"
+
+[[files]]
+src = "@LOADER@"
+dest = "esp:loader"
+
+[[files]]
+src = "@BIOS@"
+dest = "esp:bios"

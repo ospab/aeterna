@@ -222,14 +222,16 @@ pub fn write(disk: usize, lba: u64, count: u32, data: &[u8]) -> bool {
     }
 }
 
-/// Flush the device write cache of disk n (no-op for ATA/AHCI, which this
-/// driver set already drives write-through).
+/// Flush the device write cache of disk n: NVMe Flush, virtio FLUSH, ATA FLUSH CACHE (EXT)
+/// through AHCI. The legacy PIO ATA driver flushes after every write command itself.
+/// When this returns true, everything written to the disk before is durable.
 pub fn flush(disk: usize) -> bool {
     match disk_info(disk) {
         Some(d) => match d.kind {
             DiskKind::Nvme => nvme::flush(),
             DiskKind::Virtio => virtio_blk::flush(kind_index(disk)),
-            _ => true,
+            DiskKind::Ahci => ahci::flush_cache(kind_index(disk)),
+            DiskKind::Ata => true,
         },
         None => false,
     }

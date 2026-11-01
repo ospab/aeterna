@@ -17,7 +17,12 @@ param(
     [string]$Key,
     [string]$Upload,
     [string]$RemoteDir = '/var/www/tmt.ospab.org/x86_64',
-    [string[]]$Only
+    [string[]]$Only,
+    # Also pack the system package ospab-base (kernel + loaders) from the build outputs of
+    # ./build.sh (kernel, boot\uefi, boot\bios\target\bios.img). Version = kernel version + build number.
+    [switch]$Base,
+    # Build number for -Base (default: the number of the newest isos\ospab-os-v2-N.iso).
+    [string]$Build
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,10 +70,24 @@ try {
     New-Item -ItemType Directory $dist | Out-Null
     Push-Location $Apps
     try {
-        $manifests = Get-ChildItem (Join-Path $Apps 'pkg\*.toml')
+        # ospab-base.toml is a template for -Base, not a package of its own.
+        $manifests = Get-ChildItem (Join-Path $Apps 'pkg\*.toml') | Where-Object { $_.BaseName -ne 'ospab-base' }
         if ($Only) { $manifests = $manifests | Where-Object { $Only -contains $_.BaseName } }
         foreach ($m in $manifests) {
             Run "Packing $($m.Name)" { & $Tmt pack $m.FullName -o $dist }
+        }
+        if ($Base) {
+            $ver = ((Select-String -Path (Join-Path $Root 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value)
+            if (-not $Build) {
+                $Build = (Get-ChildItem (Join-Path $Root 'isos\ospab-os-v2-*.iso') | ForEach-Object { [int]($_.BaseName -replace '.*-', '') } | Sort-Object | Select-Object -Last 1)
+            }
+            if (-not $Build) { throw 'no build number: pass -Build N' }
+            $kernel = Join-Path $Root 'target\x86_64-ospab\release\ospab_os'
+            $loader = Join-Path $Root 'boot\uefi\target\x86_64-unknown-uefi\release\ospab_boot.efi'
+            $bios = Join-Path $Root 'boot\bios\target\bios.img'
+            foreach ($f in $kernel, $loader, $bios) { if (-not (Test-Path $f)) { throw "missing $f (run ./build.sh first)" } }
+            Write-Host "ospab-base $ver.$Build"
+            Run 'Packing ospab-base' { & $Tmt pack (Join-Path $Apps 'pkg\ospab-base.toml') -o $dist --set "VERSION=$ver.$Build" --set "KERNEL=$kernel" --set "LOADER=$loader" --set "BIOS=$bios" }
         }
     } finally { Pop-Location }
 

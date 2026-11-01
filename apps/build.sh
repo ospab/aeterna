@@ -21,7 +21,21 @@ env -u RUSTFLAGS cargo +nightly build --release
 
 # 3. packages
 rm -rf dist && mkdir -p dist
-for m in pkg/*.toml; do "$TMT" pack "$m" -o dist; done
+for m in pkg/*.toml; do
+    [ "$m" = "pkg/ospab-base.toml" ] && continue   # template, see BASE below
+    "$TMT" pack "$m" -o dist
+done
+
+# 3b. system package ospab-base (kernel + loaders from the build outputs of ../build.sh):
+#     BASE=<build number> apps/build.sh      version = kernel version + build number
+if [ -n "${BASE:-}" ]; then
+    VER="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$ROOT/Cargo.toml" | head -1)"
+    K="$ROOT/target/x86_64-ospab/release/ospab_os"
+    L="$ROOT/boot/uefi/target/x86_64-unknown-uefi/release/ospab_boot.efi"
+    B="$ROOT/boot/bios/target/bios.img"
+    for f in "$K" "$L" "$B"; do [ -f "$f" ] || { echo "missing $f (run ./build.sh first)" >&2; exit 1; }; done
+    "$TMT" pack pkg/ospab-base.toml -o dist --set "VERSION=$VER.$BASE" --set "KERNEL=$K" --set "LOADER=$L" --set "BIOS=$B"
+fi
 
 # 4. optional repository
 if [ "$1" = "repo" ]; then

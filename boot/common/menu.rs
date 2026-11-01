@@ -149,6 +149,13 @@ pub struct MenuInfo<'a> {
     pub errors: &'a [ConfigError],
     /// Index of the entry to preselect.
     pub selected: usize,
+    /// System update status (trial boot, fallback to the previous kernel), shown above the footer.
+    pub notice: &'a str,
+}
+
+/// Number of text rows the notice takes (0 when there is none).
+fn notice_rows(info: &MenuInfo) -> usize {
+    if info.notice.is_empty() { 0 } else { 3 }
 }
 
 fn draw(t: &mut dyn Term, pal: &Palette, cfg: &Config, vis: &[usize], sel: usize, top: usize, info: &MenuInfo,
@@ -162,7 +169,7 @@ fn draw(t: &mut dyn Term, pal: &Palette, cfg: &Config, vis: &[usize], sel: usize
     // Space: rows 3.. for entries; footer needs 6 rows; errors extra.
     let err_rows = if info.errors.is_empty() { 0 } else { (info.errors.len().min(5) + 2).min(rows / 3) };
     let list_top = 3;
-    let list_rows = rows.saturating_sub(list_top + 6 + err_rows).max(3);
+    let list_rows = rows.saturating_sub(list_top + 6 + err_rows + notice_rows(info)).max(3);
     let width = vis.iter().map(|&i| cfg.entries[i].title.chars().count()).max().unwrap_or(10) + 6;
     let width = width.min(cols.saturating_sub(6));
     for (row, &idx) in vis.iter().enumerate().skip(top).take(list_rows) {
@@ -191,6 +198,20 @@ fn draw(t: &mut dyn Term, pal: &Palette, cfg: &Config, vis: &[usize], sel: usize
         }
     }
 
+    if !info.notice.is_empty() {
+        // Two lines, wrapped at a space, above the "type:" row.
+        let w = cols.saturating_sub(4).max(20);
+        let text = info.notice;
+        let cut = if text.len() <= w {
+            text.len()
+        } else {
+            text[..w].rfind(' ').unwrap_or(w)
+        };
+        t.put(rows - 8, 2, &text[..cut], pal.error);
+        let rest = text[cut..].trim_start();
+        let rest = if rest.len() > w { &rest[..w] } else { rest };
+        t.put(rows - 7, 2, rest, pal.error);
+    }
     let e = &cfg.entries[vis[sel]];
     t.put(rows - 5, 2, &alloc::format!("type: {}", e.typ.name()), pal.dim);
     if matches!(e.typ, EntryType::Ospab | EntryType::Memtest) {
@@ -213,7 +234,7 @@ pub fn run(t: &mut dyn Term, pal: &Palette, cfg: &Config, info: &MenuInfo) -> Ch
     let vis: Vec<usize> = (0..cfg.entries.len()).filter(|&i| !cfg.entries[i].hidden || i == info.selected).collect();
     let mut sel = vis.iter().position(|&i| i == info.selected).unwrap_or(0);
     let (_, rows) = t.size();
-    let list_rows = rows.saturating_sub(3 + 6 + if info.errors.is_empty() { 0 } else { 7 }).max(3);
+    let list_rows = rows.saturating_sub(3 + 6 + if info.errors.is_empty() { 0 } else { 7 } + notice_rows(info)).max(3);
     let mut top = 0usize;
     let mut countdown = if info.errors.is_empty() { cfg.timeout } else { None };
     // Drop stale keys (a key held during POST must not choose an entry).

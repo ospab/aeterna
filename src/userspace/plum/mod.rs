@@ -31,6 +31,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub mod account;
 pub mod arith;
 pub mod bash;
 pub mod builtins;
@@ -94,11 +95,12 @@ pub fn shell() -> &'static mut PlumShell {
                 expanding_aliases: Vec::new(),
             };
             for (k, v) in [
-                ("HOME", "/home/root"),
-                ("USER", "root"),
+                ("HOME", "/home/live"),
+                ("USER", "live"),
+                ("LOGNAME", "live"),
                 ("SHELL", "/bin/plum"),
                 ("PATH", "/bin:/sbin:/usr/bin"),
-                ("PS1", "\\u@\\h:\\w# "),
+                ("PS1", "\\u@\\h:\\w$ "),
                 ("TERM", "aeterna-fb"),
                 ("EDITOR", "grape"),
                 ("HOSTNAME", "ospab"),

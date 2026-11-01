@@ -123,6 +123,8 @@ pub fn run(name: &str, args: &[String]) -> bool {
         "fdisk" => disk_tools::run_fdisk(&joined()),
         "lsblk" => disk_tools::run_lsblk(&joined()),
         "mkfs" => disk_tools::run_mkfs(&joined()),
+        "fsck" => disk_tools::run_fsck(&joined()),
+        "snap" => disk_tools::run_snap(&joined()),
         "mount" => disk_tools::run_mount(&joined()),
         "verify_mem" | "verify_sched" | "verify_net" | "verify_audio" => {
             crate::userspace::ivs::dispatch(name, &joined());
@@ -139,7 +141,7 @@ pub fn command_list() -> &'static [&'static str] {
         "find", "tee", "wc", "head", "tail", "grep", "egrep", "sort", "uniq", "cut", "tr", "rev",
         "nl", "xxd", "diff", "awk", "basename", "dirname", "seq", "yes", "printf", "xargs",
         "sleep", "ps", "top", "kill", "netstat", "ping", "traceroute", "ip", "curl", "nslookup",
-        "lspci", "desktop", "fdisk", "lsblk", "mkfs", "mount", "ostp", "clip", "display",
+        "lspci", "desktop", "fdisk", "lsblk", "mkfs", "mount", "fsck", "snap", "ostp", "clip", "display",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }
@@ -766,19 +768,27 @@ fn cmd_df(args: &[String]) {
     let pct = if heap_total > 0 { used * 100 / heap_total } else { 0 };
     out(&format!("{} {} {} {} {}  {}\n", pad_right("ramfs+cow", 14), pad_left(&fmt(heap_total), 10), pad_left(&fmt(used), 9),
         pad_left(&fmt(heap_free), 9), pad_left(&format!("{}%", pct), 4), "/"));
+    let vols = crate::fs::aeternafs::volumes_info();
+    for v in &vols {
+        let size = (v.total_blocks * 4096) as usize;
+        let avail = (v.free_blocks * 4096) as usize;
+        let used = size.saturating_sub(avail);
+        let pct = if size > 0 { used * 100 / size } else { 0 };
+        let mount = if v.is_root { "(persistent layer of /)" } else { "" };
+        out(&format!("{} {} {} {} {}  {}\n", pad_right(&format!("aeternafs{}", v.disk), 14), pad_left(&fmt(size), 10),
+            pad_left(&fmt(used), 9), pad_left(&fmt(avail), 9), pad_left(&format!("{}%", pct), 4), mount));
+    }
     for i in 0..crate::drivers::disk_count() {
+        if vols.iter().any(|v| v.disk == i) { continue; }
         if let Some(info) = crate::drivers::disk_info(i) {
             let size = info.size_mb as usize * 1024 * 1024;
-            let snap = crate::fs::disk_sync::last_snapshot_bytes();
-            let pct = if size > 0 { snap * 100 / size } else { 0 };
             out(&format!("{} {} {} {} {}  {}\n", pad_right(&format!("disk{}", i), 14), pad_left(&fmt(size), 10),
-                pad_left(&fmt(snap), 9), pad_left(&fmt(size.saturating_sub(snap)), 9), pad_left(&format!("{}%", pct), 4),
-                "(not mounted; 'save' snapshot store)"));
+                pad_left("-", 9), pad_left("-", 9), pad_left("-", 4), "(not mounted)"));
         }
     }
     if !io::out_is_captured() {
-        outc("note: / lives in the kernel heap. Size/Avail are the heap's (shared with the kernel);\n", io::FG_DIM);
-        outc("      Used is the total size of all files. disk Used = size of the last saved snapshot.\n", io::FG_DIM);
+        outc("note: the RAM part of / lives in the kernel heap. Size/Avail are the heap's (shared with the kernel);\n", io::FG_DIM);
+        outc("      Used is the total size of all files. aeternafs rows are the disk volume (see `mount`, `fsck`).\n", io::FG_DIM);
     }
 }
 

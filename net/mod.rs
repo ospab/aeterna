@@ -195,6 +195,52 @@ pub fn dhcp_renew() -> bool {
     }
 }
 
+// ─── /etc/network.conf ───────────────────────────────────────────────────────
+
+/// Settings written by the installer (`key = value` lines, `#` comments):
+/// `mode = dhcp|static`, `address`, `mask`, `gateway`, `dns` (dotted IPv4), `ntp = yes|no`.
+/// A missing file or key means DHCP and NTP on.
+pub const NETWORK_CONF: &str = "/etc/network.conf";
+
+pub struct NetConf {
+    /// False: use the static values below instead of DHCP.
+    pub dhcp: bool,
+    pub address: [u8; 4],
+    pub mask: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
+    /// Sync the clock over NTP at console start.
+    pub ntp: bool,
+}
+
+pub fn load_conf() -> NetConf {
+    let mut c = NetConf { dhcp: true, address: [0; 4], mask: [255, 255, 255, 0], gateway: [0; 4], dns: [0; 4], ntp: true };
+    let data = match crate::fs::read_file(NETWORK_CONF) { Some(d) => d, None => return c };
+    let text = match core::str::from_utf8(&data) { Ok(t) => t, Err(_) => return c };
+    let mut want_static = false;
+    let mut have_addr = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let (k, v) = match line.split_once('=') { Some((k, v)) => (k.trim(), v.trim()), None => continue };
+        let ip = || resolver::parse_ipv4(v);
+        match k {
+            "mode" => want_static = v == "static",
+            "address" => if let Some(a) = ip() { c.address = a; have_addr = a != [0; 4]; },
+            "mask" => if let Some(a) = ip() { c.mask = a; },
+            "gateway" => if let Some(a) = ip() { c.gateway = a; },
+            "dns" => if let Some(a) = ip() { c.dns = a; },
+            "ntp" => c.ntp = !matches!(v, "no" | "off" | "false" | "0"),
+            _ => {}
+        }
+    }
+    c.dhcp = !(want_static && have_addr);
+    c
+}
+
+/// True unless /etc/network.conf turns NTP off.
+pub fn ntp_enabled() -> bool { load_conf().ntp }
+
 /// Initialize the network stack. Call after PCI scan.
 pub fn init() -> bool {
     crate::arch::x86_64::serial::write_str("[NET] Initializing network stack...\r\n");
@@ -246,9 +292,27 @@ pub fn init() -> bool {
     crate::arch::x86_64::serial::write_str("\r\n");
 
     // Step 2: DHCP — obtain IP configuration from the network
-    crate::arch::x86_64::serial::write_str("[NET] Starting DHCP...\r\n");
+    let conf = load_conf();
     let mac = unsafe { OUR_MAC };
-    match dhcp::discover(mac) {
+    let lease = if conf.dhcp {
+        crate::arch::x86_64::serial::write_str("[NET] Starting DHCP...\r\n");
+        dhcp::discover(mac)
+    } else {
+        crate::arch::x86_64::serial::write_str("[NET] Static address from /etc/network.conf\r\n");
+        None
+    };
+    match lease {
+        None if !conf.dhcp => {
+            unsafe {
+                OUR_IP      = conf.address;
+                SUBNET_MASK = conf.mask;
+                GATEWAY_IP  = conf.gateway;
+                DNS_IP      = conf.dns;
+            }
+            crate::arch::x86_64::serial::write_str("[NET] Static configuration: ");
+            serial_ip(conf.address);
+            crate::arch::x86_64::serial::write_str("\r\n");
+        }
         Some(lease) => {
             unsafe {
                 OUR_IP      = lease.your_ip;

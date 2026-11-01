@@ -35,6 +35,29 @@ cp "$KERNEL" "$STAGE/root/boot/KERNEL"
 cp "$CFG"    "$STAGE/root/boot/ospab.cfg"
 cp "$BIOS"   "$STAGE/root/boot/bios.img"
 
+# Packages for the installer to preinstall offline: apps/dist/*.tmt -> /packages/, each one loaded as
+# a module by the entries that load bios.img (live, desktop, installer, debug). The loader allows
+# 16 modules per entry, 3 are taken, so at most 13 packages are used.
+PKG_DIR="${PKG_DIR:-$ROOT/apps/dist}"
+PKGS=""
+if ls "$PKG_DIR"/*.tmt >/dev/null 2>&1; then
+    mkdir -p "$STAGE/root/packages"
+    # The BIOS loader reads ISO9660 primary names (8.3), so the files are stored as p1.tmt, p2.tmt, ...;
+    # the installer takes name and version from the package header.
+    N=0
+    for p in $(ls "$PKG_DIR"/*.tmt | head -n 13); do
+        N=$((N + 1))
+        cp "$p" "$STAGE/root/packages/p$N.tmt"
+        PKGS="$PKGS $(basename "$p")"
+    done
+    awk -v n="$N" '
+        { print }
+        /^module = \/boot\/bios.img bios/ {
+            for (i = 1; i <= n; i++) print "module = /packages/p" i ".tmt pkg" i
+        }' "$CFG" > "$STAGE/root/boot/ospab.cfg"
+    echo "packages on the ISO:$PKGS"
+fi
+
 # EFI system image: FAT16 (firmware reads FAT12/16/32 on removable media), payload + 4 MiB, at least
 # 16 MiB. It must stay below 32 MiB: the El Torito sector count is 16 bits (65535 sectors) and
 # some firmware (OVMF) refuses a FAT volume larger than that.
@@ -47,6 +70,10 @@ dd if=/dev/zero of="$IMG" bs=1M count="$IMG_MB" status=none
 mkfs.vfat -F 16 -n OSPAB "$IMG" >/dev/null
 export MTOOLS_SKIP_CHECK=1
 mmd -i "$IMG" ::/EFI ::/EFI/BOOT ::/EFI/OSPAB ::/boot
+if [ -d "$STAGE/root/packages" ]; then
+    mmd -i "$IMG" ::/packages
+    for p in "$STAGE"/root/packages/p*.tmt; do mcopy -i "$IMG" "$p" ::/packages/; done
+fi
 mcopy -i "$IMG" "$STAGE/root/EFI/BOOT/BOOTX64.EFI"   ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG" "$STAGE/root/EFI/OSPAB/OSPABLDR.EFI" ::/EFI/OSPAB/OSPABLDR.EFI
 mcopy -i "$IMG" "$STAGE/root/boot/KERNEL"            ::/boot/KERNEL

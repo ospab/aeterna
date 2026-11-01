@@ -325,7 +325,8 @@ pub fn cmd_df(_args: &str) {
     for i in 0..disk_count {
         if let Some(info) = crate::drivers::disk_info(i) {
             let disk_kb = info.size_mb as usize * 1024;
-            let raw = crate::fs::disk_sync::last_snapshot_bytes();
+            let raw = crate::fs::aeternafs::volumes_info().iter().find(|v| v.disk == i)
+                .map_or(0, |v| ((v.total_blocks - v.free_blocks) * 4096) as usize);
             let used_kb = if raw > 0 { raw / 1024 } else { 0 };
             puts("  disk");
             put_usize(i);

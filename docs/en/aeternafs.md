@@ -2,11 +2,12 @@
 
 AeternaFS v2 is the native filesystem of ospab.os. It is a copy-on-write
 filesystem with checksums on all metadata and data, atomic commits and cheap
-snapshots. It replaces the old toy `vfs/aeternafs.rs` and the periodic dump of
-the RAM filesystem in `vfs/disk_sync.rs`.
+snapshots. It replaces the old toy filesystem and the periodic dump of the RAM
+filesystem to the `AETERNA` partition.
 
-Status: stage 1. The crate `fs/aeternafs` (no_std + alloc) and the host tool
-`tools/oosfs` exist and are tested on the host. The kernel does not use them yet.
+Status: stage 2. The crate `fs/aeternafs` (no_std + alloc) and the host tool
+`tools/oosfs` are tested on the host. The kernel uses the crate as the
+persistent layer of `/` (see Kernel integration).
 
 ## Goals
 
@@ -183,6 +184,95 @@ Limits and simplifications:
 - The free-space chain is rewritten as a whole at each commit.
 - No users or groups: rights belong to the capability model of the kernel, not
   to the filesystem. Mode bits are stored for tools.
+
+## Kernel integration
+
+Files: `vfs/aeternafs.rs` (block device and VFS adapter), `vfs/persist.rs`
+(boot, migration, commit thread), `vfs/disk_sync.rs` (where the volume lives,
+reader of the old snapshot, entry points of `sync`).
+
+**Block device.** `KDisk` maps 4096-byte blocks to 512-byte sectors of a disk
+(`drivers::read/write`). The NVMe driver translates 4K-native namespaces. Flush
+is the driver's cache flush: NVMe Flush, virtio FLUSH, ATA FLUSH CACHE (EXT)
+through AHCI. The PIO ATA driver flushes after every write command. The commit
+protocol flushes twice, so no write barrier flag (FUA) is needed.
+
+**Layout of the `AETERNA` partition** (or of a raw disk from LBA 2048):
+
+| Sectors (512 bytes)              | Content                                   |
+|----------------------------------|-------------------------------------------|
+| partition start .. +8            | identity record written by the installer  |
+| +8 .. +8+16384                   | old RAM snapshot (8 MiB), read once       |
+| +8+16384 .. partition end        | AeternaFS v2 volume                       |
+
+**VFS adapter.** `AeFs` implements `FileSystem` over the crate. Every call
+takes one mutex (the single writer) and sets the time of new inodes from the
+system clock. `write_file`, `write_at`, `append_file`, `touch`, `mkdir` and
+`rename` create missing parent directories, like the RamFS. The writable layer
+of the root overlay (`vfs/cow.rs`) forwards to a `SwitchFs`. It points to the
+RamFS until `vfs/persist.rs` finds a volume and switches it to `AeFs`. Without a
+disk (live ISO) nothing changes.
+
+**Commit policy.** Operations change memory and free blocks only. A commit makes
+them durable and atomic.
+
+- `fs-commit`, a kernel thread, runs once per second. It commits 3 s after the
+  last change and at the latest 15 s after the first uncommitted change. It does
+  not depend on the shell, so it also runs while a full-screen program or a long
+  command owns the console. The shell idle loop calls the same function.
+- `sync` (and `save`) commit at once.
+- `reboot`, `shutdown` and the power button commit first (`acpi::reboot`,
+  `acpi::shutdown`). The power-button path cannot wait for a lock, so it
+  commits only if the volume is free.
+- The installer and `persist=ro` set the volume read-only: nothing is committed.
+
+After power loss the volume mounts at the last commit. Changes after it are lost.
+
+**Boot** (`Persistence:` line of the boot log):
+
+| Found on disk                        | Action                                              |
+|--------------------------------------|-----------------------------------------------------|
+| old RAM snapshot (and parsable)      | migrate (below)                                     |
+| AeternaFS v2 superblock              | mount                                               |
+| nothing                              | format a new volume                                 |
+
+A new volume is created only inside an `AETERNA` partition. A disk without one
+(an empty disk you are about to install onto, another system's disk) is used only
+if it already holds a volume or an old snapshot, and is never formatted. A volume that is present but
+does not mount (checksum, version) is never formatted: persistence stays off for
+that boot and the log line says why.
+
+**Migration of the old snapshot.** The snapshot is read completely into memory
+and parsed. A new volume is formatted after the snapshot area, so the snapshot
+is not touched. All directories and files are imported and committed, then
+`fsck` runs. Only then the snapshot's magic sector is overwritten with zeros
+and flushed. Power loss at any point leaves one usable copy: before the clear,
+the next boot migrates again. A snapshot that is present always wins over a
+volume, so a reinstall that writes a fresh snapshot over a partition with an
+older volume is handled the same way.
+
+**Shell.**
+
+- `df`: rows for the volume (size, used, available) and for disks without a
+  volume.
+- `mount` without arguments lists the volumes. `mount <device> <dir>` mounts
+  another v2 volume (`/dev/sdaN`, `/dev/vdaN`, `/dev/nvme0n1pN`).
+- `mkfs <device> [label]` formats a partition with a v2 volume (not the one that
+  holds `/`).
+- `fsck [--deep]` commits, then checks the volume of `/` with the crate's
+  `fsck`. `--deep` reads every data page.
+- `snap create|list|delete <name>` manage snapshots of the volume of `/`.
+  Update integration (snapshot before an update, rollback) is not done yet.
+
+**For the installer.** To create the volume at install time instead of the old
+snapshot: take `disk_sync::area(disk)` (`v2_lba`, `v2_sectors`), call
+`fs::aeternafs::mkfs(disk, v2_lba, v2_sectors, "AETERNA")`, mount it with
+`mount_raw` and `AeFs::register`, write the files, then `commit(true)`. Zero the
+sector at `legacy_lba` so that no old snapshot wins at the first boot.
+
+Known limits: one volume is the persistent layer, the layer is chosen by
+`select_disk` (first AHCI disk, else disk 0). Writing a very large file holds
+the volume mutex for its whole duration. File data is not cached in memory.
 
 ## Tests
 

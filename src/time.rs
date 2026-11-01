@@ -136,11 +136,53 @@ pub fn set_rtc_offset(secs: i64) {
     }
 }
 
+/// `/etc/rtc_mode`: `utc` or `local` (written by the installer; absent = learn the offset from NTP).
+pub const RTC_MODE_FILE: &str = "/etc/rtc_mode";
+/// `/etc/timezone`: an IANA name from `ZONES` (e.g. `Europe/Berlin`) or `UTC+H[:MM]`.
+pub const TIMEZONE_FILE: &str = "/etc/timezone";
+
+/// True when `/etc/rtc_mode` says `utc`: the RTC is trusted as UTC and no offset is learned.
+static RTC_UTC_FORCED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Apply `/etc/rtc_mode`, `/etc/timezone` and `/etc/rtc_offset` (call once the VFS is up).
+///
+/// * `utc`: the CMOS clock is UTC; the offset is 0 and NTP never changes that.
+/// * `local`: the CMOS clock shows local time (Windows dual boot). The offset RTC - UTC is the one
+///   learned from NTP and saved in `/etc/rtc_offset`, or else the offset of the time zone.
+/// * no file: the offset saved by an earlier NTP sync, if any (the behaviour before the installer
+///   wrote `rtc_mode`).
+pub fn load_config() {
+    let read = |p: &str| crate::fs::read_file(p).and_then(|d| core::str::from_utf8(&d).ok().map(|s| alloc::string::String::from(s.trim())));
+    let saved = read(RTC_OFFSET_FILE).and_then(|s| s.parse::<i64>().ok());
+    match read(RTC_MODE_FILE).as_deref() {
+        Some("utc") => {
+            RTC_UTC_FORCED.store(true, core::sync::atomic::Ordering::Relaxed);
+            set_rtc_offset(0);
+        }
+        Some("local") => {
+            let off = saved.unwrap_or_else(|| {
+                let tz = read(TIMEZONE_FILE).unwrap_or_default();
+                // The RTC shows local time: undo the standard offset to get a UTC guess for the DST rule.
+                let rtc = read_rtc_utc_guess();
+                zone_offset_secs(&tz, rtc - zone_offset_secs(&tz, rtc))
+            });
+            set_rtc_offset(off);
+        }
+        _ => { if let Some(off) = saved { set_rtc_offset(off); } }
+    }
+}
+
+fn read_rtc_utc_guess() -> i64 {
+    let (y, mo, d, h, mi, s) = read_rtc();
+    from_civil(y, mo, d, h, mi, s).div_euclid(NS_PER_SEC) + EPOCH_UNIX_SECS
+}
+
 /// After an NTP sync: compare with the raw RTC and learn a local-time offset.
 /// Offsets are rounded to 15 minutes (all real time zones); anything else is drift.
 /// Returns Some(offset) when it changed.
 pub fn learn_rtc_offset() -> Option<i64> {
     if source() != Source::Ntp { return None; }
+    if RTC_UTC_FORCED.load(core::sync::atomic::Ordering::Relaxed) { return None; }
     let (y, mo, d, h, mi, s) = read_rtc();
     let rtc = from_civil(y, mo, d, h, mi, s).div_euclid(NS_PER_SEC);
     let diff = rtc - now_secs();
@@ -152,6 +194,168 @@ pub fn learn_rtc_offset() -> Option<i64> {
     if rounded == rtc_offset() { return None; }
     CLOCK.lock().rtc_offset_secs = rounded;
     Some(rounded)
+}
+
+// ─── Time zones ──────────────────────────────────────────────────────────────
+//
+// A short list of common zones with their standard UTC offset and a simple daylight-saving rule.
+// The installer offers this list and writes the name to /etc/timezone; `net::sntp` and the
+// RTC code turn the name into an offset with `zone_offset_secs`. Zones that are not in the list
+// can still be set as `UTC+H[:MM]`.
+
+/// Daylight-saving rule of a zone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dst {
+    /// No daylight saving.
+    None,
+    /// EU: last Sunday of March 01:00 UTC to last Sunday of October 01:00 UTC.
+    Eu,
+    /// US/Canada: second Sunday of March 02:00 to first Sunday of November 02:00 (local time).
+    Us,
+    /// Australia (south-east): first Sunday of October 02:00 to first Sunday of April 03:00 (local).
+    Au,
+    /// New Zealand: last Sunday of September 02:00 to first Sunday of April 03:00 (local).
+    Nz,
+}
+
+#[derive(Clone, Copy)]
+pub struct Zone {
+    pub name: &'static str,
+    /// Standard (winter) offset from UTC in minutes.
+    pub std_min: i16,
+    pub dst: Dst,
+}
+
+const fn z(name: &'static str, std_min: i16, dst: Dst) -> Zone { Zone { name, std_min, dst } }
+
+pub const ZONES: &[Zone] = &[
+    z("UTC", 0, Dst::None),
+    z("Europe/London", 0, Dst::Eu),
+    z("Europe/Dublin", 0, Dst::Eu),
+    z("Europe/Lisbon", 0, Dst::Eu),
+    z("Europe/Berlin", 60, Dst::Eu),
+    z("Europe/Paris", 60, Dst::Eu),
+    z("Europe/Madrid", 60, Dst::Eu),
+    z("Europe/Rome", 60, Dst::Eu),
+    z("Europe/Warsaw", 60, Dst::Eu),
+    z("Europe/Prague", 60, Dst::Eu),
+    z("Europe/Stockholm", 60, Dst::Eu),
+    z("Africa/Lagos", 60, Dst::None),
+    z("Europe/Athens", 120, Dst::Eu),
+    z("Europe/Helsinki", 120, Dst::Eu),
+    z("Europe/Kyiv", 120, Dst::Eu),
+    z("Europe/Kaliningrad", 120, Dst::None),
+    z("Africa/Cairo", 120, Dst::None),
+    z("Africa/Johannesburg", 120, Dst::None),
+    z("Europe/Istanbul", 180, Dst::None),
+    z("Europe/Moscow", 180, Dst::None),
+    z("Europe/Minsk", 180, Dst::None),
+    z("Europe/Samara", 240, Dst::None),
+    z("Asia/Dubai", 240, Dst::None),
+    z("Asia/Yekaterinburg", 300, Dst::None),
+    z("Asia/Tashkent", 300, Dst::None),
+    z("Asia/Karachi", 300, Dst::None),
+    z("Asia/Kolkata", 330, Dst::None),
+    z("Asia/Omsk", 360, Dst::None),
+    z("Asia/Dhaka", 360, Dst::None),
+    z("Asia/Novosibirsk", 420, Dst::None),
+    z("Asia/Krasnoyarsk", 420, Dst::None),
+    z("Asia/Bangkok", 420, Dst::None),
+    z("Asia/Irkutsk", 480, Dst::None),
+    z("Asia/Shanghai", 480, Dst::None),
+    z("Asia/Singapore", 480, Dst::None),
+    z("Asia/Yakutsk", 540, Dst::None),
+    z("Asia/Tokyo", 540, Dst::None),
+    z("Asia/Seoul", 540, Dst::None),
+    z("Asia/Vladivostok", 600, Dst::None),
+    z("Australia/Sydney", 600, Dst::Au),
+    z("Asia/Magadan", 660, Dst::None),
+    z("Pacific/Auckland", 720, Dst::Nz),
+    z("Asia/Kamchatka", 720, Dst::None),
+    z("America/Sao_Paulo", -180, Dst::None),
+    z("America/Buenos_Aires", -180, Dst::None),
+    z("America/New_York", -300, Dst::Us),
+    z("America/Toronto", -300, Dst::Us),
+    z("America/Chicago", -360, Dst::Us),
+    z("America/Mexico_City", -360, Dst::None),
+    z("America/Denver", -420, Dst::Us),
+    z("America/Los_Angeles", -480, Dst::Us),
+    z("America/Anchorage", -540, Dst::Us),
+    z("Pacific/Honolulu", -600, Dst::None),
+];
+
+pub fn zone_by_name(name: &str) -> Option<&'static Zone> {
+    ZONES.iter().find(|z| z.name == name)
+}
+
+/// Day of month (1-based) of the `n`-th Sunday of `month`; `n == 0` means the last Sunday.
+fn sunday_of(year: i64, month: u32, n: u32) -> u32 {
+    let first = days_from_civil(year, month, 1);
+    let wd = (first + 4).rem_euclid(7) as u32; // 0 = Sunday (1970-01-01 was a Thursday)
+    let first_sun = 1 + (7 - wd) % 7;
+    if n > 0 { return first_sun + 7 * (n - 1); }
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let len = (days_from_civil(ny, nm, 1) - first) as u32;
+    first_sun + 7 * ((len - first_sun) / 7)
+}
+
+fn utc_secs_of(year: i64, month: u32, day: u32, hour: i64) -> i64 {
+    days_from_civil(year, month, day) * 86_400 + hour * 3600
+}
+
+impl Zone {
+    /// True if daylight saving is in effect at the Unix time `utc`.
+    pub fn is_dst(&self, utc: i64) -> bool {
+        let std = self.std_min as i64 * 60;
+        let year = civil_from_days((utc + std).div_euclid(86_400)).0;
+        match self.dst {
+            Dst::None => false,
+            Dst::Eu => {
+                let start = utc_secs_of(year, 3, sunday_of(year, 3, 0), 1);
+                let end = utc_secs_of(year, 10, sunday_of(year, 10, 0), 1);
+                utc >= start && utc < end
+            }
+            Dst::Us => {
+                let start = utc_secs_of(year, 3, sunday_of(year, 3, 2), 2) - std;
+                let end = utc_secs_of(year, 11, sunday_of(year, 11, 1), 2) - (std + 3600);
+                utc >= start && utc < end
+            }
+            // Southern hemisphere: DST spans the new year.
+            Dst::Au => {
+                let end = utc_secs_of(year, 4, sunday_of(year, 4, 1), 3) - (std + 3600);
+                let start = utc_secs_of(year, 10, sunday_of(year, 10, 1), 2) - std;
+                utc < end || utc >= start
+            }
+            Dst::Nz => {
+                let end = utc_secs_of(year, 4, sunday_of(year, 4, 1), 3) - (std + 3600);
+                let start = utc_secs_of(year, 9, sunday_of(year, 9, 0), 2) - std;
+                utc < end || utc >= start
+            }
+        }
+    }
+
+    /// Offset from UTC in seconds at the Unix time `utc`.
+    pub fn offset_at(&self, utc: i64) -> i64 {
+        self.std_min as i64 * 60 + if self.is_dst(utc) { 3600 } else { 0 }
+    }
+}
+
+/// Offset in seconds for the contents of /etc/timezone at the Unix time `utc`:
+/// a name from `ZONES`, or `UTC`, `UTC+3`, `UTC-5`, `UTC+5:30`. Anything else is 0.
+pub fn zone_offset_secs(tz: &str, utc: i64) -> i64 {
+    let tz = tz.trim();
+    if let Some(z) = zone_by_name(tz) { return z.offset_at(utc); }
+    let rest = match tz.strip_prefix("UTC") { Some(r) => r, None => return 0 };
+    let (sign, rest) = match rest.as_bytes().first() {
+        Some(b'+') => (1i64, &rest[1..]),
+        Some(b'-') => (-1i64, &rest[1..]),
+        _ => return 0,
+    };
+    let (h, m) = match rest.split_once(':') { Some((h, m)) => (h, m), None => (rest, "0") };
+    match (h.parse::<i64>(), m.parse::<i64>()) {
+        (Ok(h), Ok(m)) if (0..=14).contains(&h) && (0..60).contains(&m) => sign * (h * 3600 + m * 60),
+        _ => 0,
+    }
 }
 
 // ─── Unix interchange ───────────────────────────────────────────────────────
@@ -314,6 +518,46 @@ mod tests {
         let t = to_civil(from_civil(1980, 1, 1, 0, 0, 0));
         assert_eq!((t.year, t.month, t.day), (1980, 1, 1));
         assert!(from_civil(1980, 1, 1, 0, 0, 0) < 0);
+    }
+    fn unix(y: i64, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        to_unix_secs(from_civil(y, mo, d, h, mi, 0))
+    }
+    #[test] fn sundays() {
+        assert_eq!(sunday_of(2024, 3, 0), 31);
+        assert_eq!(sunday_of(2024, 10, 0), 27);
+        assert_eq!(sunday_of(2024, 3, 2), 10);
+        assert_eq!(sunday_of(2024, 11, 1), 3);
+        assert_eq!(sunday_of(2024, 4, 1), 7);
+    }
+    #[test] fn eu_dst() {
+        let z = zone_by_name("Europe/Berlin").unwrap();
+        assert_eq!(z.offset_at(unix(2024, 1, 15, 12, 0)), 3600);
+        assert_eq!(z.offset_at(unix(2024, 7, 1, 12, 0)), 7200);
+        assert_eq!(z.offset_at(unix(2024, 3, 31, 0, 59)), 3600);
+        assert_eq!(z.offset_at(unix(2024, 3, 31, 1, 0)), 7200);
+        assert_eq!(z.offset_at(unix(2024, 10, 27, 1, 0)), 3600);
+    }
+    #[test] fn us_and_south_dst() {
+        let ny = zone_by_name("America/New_York").unwrap();
+        assert_eq!(ny.offset_at(unix(2024, 3, 10, 6, 59)), -18000);
+        assert_eq!(ny.offset_at(unix(2024, 3, 10, 7, 0)), -14400);
+        assert_eq!(ny.offset_at(unix(2024, 11, 3, 5, 59)), -14400);
+        assert_eq!(ny.offset_at(unix(2024, 11, 3, 6, 0)), -18000);
+        let sy = zone_by_name("Australia/Sydney").unwrap();
+        assert_eq!(sy.offset_at(unix(2024, 1, 1, 0, 0)), 11 * 3600);
+        assert_eq!(sy.offset_at(unix(2024, 7, 1, 0, 0)), 10 * 3600);
+        let nz = zone_by_name("Pacific/Auckland").unwrap();
+        assert_eq!(nz.offset_at(unix(2024, 12, 1, 0, 0)), 13 * 3600);
+        assert_eq!(nz.offset_at(unix(2024, 6, 1, 0, 0)), 12 * 3600);
+        let msk = zone_by_name("Europe/Moscow").unwrap();
+        assert_eq!(msk.offset_at(unix(2024, 7, 1, 0, 0)), 3 * 3600);
+    }
+    #[test] fn tz_strings() {
+        assert_eq!(zone_offset_secs("UTC", 0), 0);
+        assert_eq!(zone_offset_secs("UTC+3", 0), 10800);
+        assert_eq!(zone_offset_secs("UTC-5:30", 0), -19800);
+        assert_eq!(zone_offset_secs("Europe/Moscow\n", 0), 10800);
+        assert_eq!(zone_offset_secs("Nowhere/Land", 0), 0);
     }
     #[test] fn leap_day() {
         let t = to_civil(from_civil(2024, 2, 29, 23, 59, 59));

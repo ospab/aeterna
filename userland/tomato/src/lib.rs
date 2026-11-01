@@ -2,12 +2,12 @@
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
 
-tomato — package manager for ospab.os (AETERNA)
+tomato, the package manager for ospab.os (AETERNA)
 
-Packages are `.tmt` files (format below). They can be installed from a local
-file, from the local cache, or from a signed repository:
+Packages are `.tmt` files (format below). They install from a local file,
+from the local cache, or from a signed repository:
 
-  tomato -Sy                  download + verify the repository index
+  tomato -Sy                  download and verify the repository index
   tomato -S <name>...         install (dependencies are resolved from the index)
   tomato -Syu | -Su           upgrade installed packages
   tomato -Ss [text]           search the synced index
@@ -45,6 +45,17 @@ const DEFAULT_REPO: &str = "https://tmt.ospab.org/x86_64/";
 const REPO_PUBKEY_HEX: &str = include_str!("../repo_key.pub");
 const MAX_INDEX: usize = 1024 * 1024;
 const MAX_PACKAGE: usize = 8 * 1024 * 1024;
+/// The system package carries the kernel (about 10 MiB), so it may be bigger.
+const MAX_SYSTEM_PACKAGE: usize = 24 * 1024 * 1024;
+/// Name of the package that updates the kernel and loaders on the ESP (`kind=system`).
+const SYSTEM_PKG: &str = "ospab-base";
+
+/// `-y` / `--yes` was given: do not ask before writing to the ESP.
+static ASSUME_YES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn limit_for(name: &str) -> usize {
+    if name == SYSTEM_PKG { MAX_SYSTEM_PACKAGE } else { MAX_PACKAGE }
+}
 
 fn ensure_dirs() {
     for d in ["/etc", "/var", "/var/lib", "/var/lib/tomato", LOCAL_PATH, SYNC_PATH, "/var/cache", "/var/cache/tomato", CACHE_PATH] {
@@ -59,7 +70,9 @@ fn usage() {
 ");
     io::out("  tomato update                  download and verify the package index
 ");
-    io::out("  tomato upgrade                 upgrade installed packages (run update first)
+    io::out("  tomato upgrade [-y]            upgrade installed packages and the system (run update first)
+");
+    io::out("  tomato system                  running build, installed system package, boot counter
 ");
     io::out("  tomato install <name>...       install packages and their dependencies
 ");
@@ -115,8 +128,10 @@ pub fn run(args: &str) {
     }
     let mut parts = args.split_whitespace();
     let op = parts.next().unwrap_or("");
-    // apt-style answers to "are you sure" are not asked, so -y is accepted and ignored
-    let targets: Vec<&str> = parts.filter(|t| *t != "-y" && *t != "--yes").collect();
+    // -y answers the question before a system update writes to the ESP
+    let all: Vec<&str> = parts.collect();
+    ASSUME_YES.store(all.iter().any(|t| *t == "-y" || *t == "--yes"), core::sync::atomic::Ordering::Relaxed);
+    let targets: Vec<&str> = all.into_iter().filter(|t| *t != "-y" && *t != "--yes").collect();
     // apt-style verbs map onto the original pacman-style operations
     let op = match op {
         "update" => "-Sy",
@@ -132,6 +147,7 @@ pub fn run(args: &str) {
     };
     match op {
         "" | "-h" | "--help" | "help" => usage(),
+        "system" => system_status(),
         "-Sy" | "-Syy" => {
             if !sync() { return; }
             if !targets.is_empty() { for t in &targets { install_by_name(t); } }
@@ -281,7 +297,7 @@ fn load_synced() -> Option<(String, Vec<RepoPkg>)> {
     if let Err(e) = verify_index_signature(&idx, &sig) {
         io::err("tomato: the synced index failed signature verification (");
         io::err(e);
-        io::err("); ignoring it - run 'tomato update'\n");
+        io::err(")); ignoring it, run 'tomato update'\n");
         return None;
     }
     Some((base, parse_index(&idx)?))
@@ -383,7 +399,11 @@ fn resolve(name: &str, pkgs: &[RepoPkg], plan: &mut Vec<RepoPkg>, stack: &mut Ve
 fn fetch_verified(base: &str, p: &RepoPkg) -> Option<Vec<u8>> {
     let url = alloc::format!("{}{}", base, p.filename);
     io::out(&alloc::format!("   downloading {} ({} bytes)\n", p.filename, p.size));
-    let data = match http_get(&url, p.size.max(1).min(MAX_PACKAGE)) {
+    if p.size > limit_for(&p.name) {
+        io::err(&alloc::format!("tomato: {}: {} bytes is more than the allowed package size\n", p.filename, p.size));
+        return None;
+    }
+    let data = match http_get(&url, p.size.max(1)) {
         Ok(d) => d,
         Err(e) => { io::err(&alloc::format!("tomato: {}\n", e)); return None; }
     };
@@ -425,9 +445,11 @@ fn install_plan(base: &str, plan: &[RepoPkg]) -> bool {
                 return false;
             }
         }
+        let is_system = p.name == SYSTEM_PKG;
+        // The system package (about 10 MiB) is not cached: it would fill the RAM filesystem.
         let cached = alloc::format!("{}/{}", CACHE_PATH, p.filename);
-        crate::fs::write_file(&cached, blob);
-        if !install_blob(blob, &cached) { return false; }
+        if !is_system { crate::fs::write_file(&cached, blob); }
+        if !install_blob(blob, &cached, true) { return false; }
     }
     true
 }
@@ -469,6 +491,7 @@ fn upgrade() {
     let mut plan: Vec<RepoPkg> = Vec::new();
     if let Some(entries) = crate::fs::readdir(LOCAL_PATH) {
         for e in entries {
+            if e.name == SYSTEM_PKG { continue; } // reported on its own line below
             let rec = match read_record(&e.name) { Some(r) => r, None => continue };
             let have = record_field(&rec, "version").unwrap_or("0");
             if let Some(p) = pkgs.iter().find(|p| p.name == e.name) {
@@ -482,8 +505,25 @@ fn upgrade() {
             }
         }
     }
+    // The system package is always a candidate: its baseline is the installed record, or, when
+    // the system came from the ISO, the running build.
+    if let Some(p) = pkgs.iter().find(|p| p.name == SYSTEM_PKG) {
+        let running = crate::esp::running_version();
+        let have = read_record(SYSTEM_PKG)
+            .and_then(|r| record_field(&r, "version").map(String::from))
+            .unwrap_or_else(|| running.clone());
+        if ver_cmp(&have, &p.version) == core::cmp::Ordering::Less {
+            io::out_c(&alloc::format!("system: {} -> {}, reboot required\n", have, p.version), io::FG_WARN);
+            if let Err(err) = resolve(SYSTEM_PKG, &pkgs, &mut plan, &mut Vec::new(), true) {
+                io::err(&alloc::format!("tomato: {}\n", err));
+                return;
+            }
+        } else if ver_cmp(&running, &have) == core::cmp::Ordering::Less {
+            io::out(&alloc::format!("system: {} is installed, running {}: reboot to use it\n", have, running));
+        }
+    }
     if plan.is_empty() {
-        io::out("there is nothing to do: all installed packages are up to date\n");
+        io::out("all installed packages are up to date\n");
         return;
     }
     install_plan(&base, &plan);
@@ -616,6 +656,10 @@ fn remove(name: &str, skip_dep_check: bool) {
         Some(r) => r,
         None => { io::err("tomato: target not found: "); io::err(name); io::err("\n"); return; }
     };
+    if record_field(&rec, "kind") == Some("system") {
+        io::err("tomato: cannot remove the system package; it is the running kernel and the boot files\n");
+        return;
+    }
     if !skip_dep_check {
         if let Some(entries) = crate::fs::readdir(LOCAL_PATH) {
             for e in entries {
@@ -662,8 +706,8 @@ fn remove(name: &str, skip_dep_check: bool) {
 //      16     4  Architecture (LE u32; 0=any, 1=x86_64, 2=aarch64)
 //      20    64  Package name (UTF-8, null-padded, max 63 chars)
 //      84    32  Package version (UTF-8, null-padded, max 31 chars)
-//     116     4  meta_len    — length of metadata section (LE u32)
-//     120     4  payload_len — length of payload section (LE u32)
+//     116     4  meta_len    length of the metadata section (LE u32)
+//     120     4  payload_len length of the payload section (LE u32)
 //     124    32  SHA-256 over the blob with bytes 124..156 zeroed
 //     156    meta_len  metadata: UTF-8 key=value lines (description, ...)
 //    156+meta_len  payload: [u32 path_len][path][u32 data_len][data] ...
@@ -701,14 +745,13 @@ pub struct TmtHeader {
 
 /// Create a `.tmt` package blob in memory.
 ///
-/// # Arguments
-/// * `name`       — package name (max 63 bytes)
-/// * `version`    — package version string (max 31 bytes)
-/// * `arch`       — TMT_ARCH_ANY / TMT_ARCH_X64 / TMT_ARCH_AA64
-/// * `metadata`   — UTF-8 key=value lines (appended together with '\n')
-/// * `files`      — slice of (path, data) tuples to embed
+/// * `name`: package name (max 63 bytes)
+/// * `version`: package version string (max 31 bytes)
+/// * `arch`: TMT_ARCH_ANY, TMT_ARCH_X64 or TMT_ARCH_AA64
+/// * `metadata`: key=value pairs, written as UTF-8 lines
+/// * `files`: (path, data) pairs to embed
 ///
-/// Returns the complete .tmt blob with a valid SHA-256 checksum.
+/// Returns the whole blob with its SHA-256 filled in.
 pub fn tmt_pack(
     name: &str,
     version: &str,
@@ -747,7 +790,7 @@ pub fn tmt_pack(
     blob.extend_from_slice(&TMT_MAGIC);
     // Version (4)
     blob.extend_from_slice(&TMT_VERSION.to_le_bytes());
-    // Flags (4) — no compression, no external sig
+    // Flags (4): no compression, no external signature
     blob.extend_from_slice(&0u32.to_le_bytes());
     // Arch (4)
     blob.extend_from_slice(&arch.to_le_bytes());
@@ -765,7 +808,7 @@ pub fn tmt_pack(
     blob.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
     // payload_len (4)
     blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    // SHA-256 placeholder (32 zeros — to be replaced after hash)
+    // SHA-256 placeholder (32 zeros), replaced once the hash is known
     for _ in 0..32 { blob.push(0); }
 
     // Append data sections
@@ -795,13 +838,8 @@ pub fn tmt_verify(data: &[u8]) -> bool {
         Err(_) => return false,
     };
 
-    // Zero the checksum field in a copy, then hash
-    let mut copy: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(data.len());
-    copy.extend_from_slice(data);
-    for b in &mut copy[124..156] { *b = 0; }
-    let computed = sha256_hash(&copy);
-
-    computed == stored
+    // Hash with the checksum field taken as zero
+    sha256_zeroed(data, 124, 156) == stored
 }
 
 // ─── Parse header ────────────────────────────────────────────────────────
@@ -866,6 +904,12 @@ pub fn tmt_list_contents(data: &[u8]) -> alloc::vec::Vec<String> {
 
 /// Compute SHA-256 over arbitrary data. Pure Rust, no_std.
 pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
+    sha256_zeroed(data, 0, 0)
+}
+
+/// SHA-256 of `data` with the bytes `zero_from..zero_to` taken as zero, without copying `data`
+/// (a kernel package is about 10 MiB; copies of it would not fit the heap).
+fn sha256_zeroed(data: &[u8], zero_from: usize, zero_to: usize) -> [u8; 32] {
     // Initial hash values (first 32 bits of fractional parts of sqrt of primes 2..19)
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -894,19 +938,25 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
 
     // Pre-processing: add padding
     let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut padded: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(
-        data.len() + 64 + 8
-    );
-    padded.extend_from_slice(data);
-    padded.push(0x80); // append bit '1'
-    while (padded.len() % 64) != 56 {
-        padded.push(0x00);
+    let full = data.len() / 64 * 64;
+    let mut tail: alloc::vec::Vec<u8> = data[full..].to_vec();
+    tail.push(0x80); // append bit '1'
+    while (tail.len() % 64) != 56 {
+        tail.push(0x00);
     }
     // Append original length as big-endian u64
-    for b in &bit_len.to_be_bytes() { padded.push(*b); }
+    for b in &bit_len.to_be_bytes() { tail.push(*b); }
 
     // Process each 512-bit (64-byte) chunk
-    for chunk in padded.chunks_exact(64) {
+    let mut pos = 0usize;
+    for src in data[..full].chunks_exact(64).chain(tail.chunks_exact(64)) {
+        let mut blk = [0u8; 64];
+        blk.copy_from_slice(src);
+        for (i, b) in blk.iter_mut().enumerate() {
+            if pos + i >= zero_from && pos + i < zero_to { *b = 0; }
+        }
+        pos += 64;
+        let chunk = &blk;
         // Prepare message schedule
         let mut w = [0u32; 64];
         for i in 0..16 {
@@ -982,11 +1032,20 @@ pub fn tmt_install(vfs_path: &str) -> bool {
         io::err("tomato: "); io::err(vfs_path); io::err(": not a .tmt package\n");
         return false;
     }
-    install_blob(&data, vfs_path)
+    install_blob(&data, vfs_path, false)
+}
+
+/// Install a package from memory (used by the installer to preinstall the packages on the ISO).
+/// Same checks and file layout as `tomato install <file.tmt>`; `source` is recorded as `installed_from`.
+pub fn install_package_bytes(data: &[u8], source: &str) -> bool {
+    ensure_dirs();
+    install_blob(data, source, false)
 }
 
 /// Verify the package's own checksum and extract it. `source` is recorded as `installed_from`.
-fn install_blob(data: &[u8], source: &str) -> bool {
+/// `trusted` is true only for packages that came through the signed index (size and SHA-256
+/// checked); a `kind=system` package is refused otherwise.
+fn install_blob(data: &[u8], source: &str, trusted: bool) -> bool {
     let vfs_path = source;
     let hdr = match tmt_parse_header(data) {
         Some(h) => h,
@@ -1012,6 +1071,16 @@ fn install_blob(data: &[u8], source: &str) -> bool {
     }
     let meta = String::from_utf8_lossy(&data[TMT_HEADER_SIZE..meta_end]).into_owned();
     let payload = &data[meta_end..payload_end];
+    let is_system = record_field(&meta, "kind") == Some("system");
+    if is_system && !trusted {
+        io::err("tomato: a system package changes the kernel and the boot files; it is only installed from the signed repository\n");
+        io::err("        (tomato update, then tomato install ospab-base); nothing installed\n");
+        return false;
+    }
+    if is_system && hdr.name != SYSTEM_PKG {
+        io::err("tomato: unknown system package; nothing installed\n");
+        return false;
+    }
 
     // Parse every entry first; refuse the whole package on any bad entry.
     let mut entries: Vec<(String, &[u8])> = Vec::new();
@@ -1021,7 +1090,15 @@ fn install_blob(data: &[u8], source: &str) -> bool {
         let pl = le_u32(payload, c);
         c += 4;
         if c + pl + 4 > payload.len() { io::err("tomato: corrupt payload\n"); return false; }
-        let path = match core::str::from_utf8(&payload[c..c + pl]).ok().and_then(safe_path) {
+        let raw = core::str::from_utf8(&payload[c..c + pl]).ok();
+        let path = match raw.and_then(|r| {
+            if is_system {
+                // system packages only use the logical ESP roles
+                matches!(r, "esp:kernel" | "esp:loader" | "esp:bios").then(|| String::from(r))
+            } else {
+                safe_path(r)
+            }
+        }) {
             Some(p) => p,
             None => { io::err("tomato: package contains an unsafe path; nothing installed\n"); return false; }
         };
@@ -1031,6 +1108,10 @@ fn install_blob(data: &[u8], source: &str) -> bool {
         if c + dl > payload.len() { io::err("tomato: corrupt payload\n"); return false; }
         entries.push((path, &payload[c..c + dl]));
         c += dl;
+    }
+
+    if is_system {
+        return install_system(&hdr, &meta, &entries, source);
     }
 
     // Conflicts: existing files not owned by an installed version of this package.
@@ -1088,6 +1169,74 @@ fn install_blob(data: &[u8], source: &str) -> bool {
     true
 }
 
+// ─── System package (kernel + loaders on the ESP) ─────────────────────────
+
+/// Ask "[y/N]" unless -y was given. Reads from piped stdin, else from the keyboard.
+fn confirm(question: &str) -> bool {
+    if ASSUME_YES.load(core::sync::atomic::Ordering::Relaxed) { return true; }
+    io::out(question);
+    io::out(" [y/N] ");
+    let ans = match io::read_stdin_line() {
+        Some(l) => l,
+        None => io::read_console_line(),
+    };
+    matches!(ans.as_deref().map(str::trim), Some("y") | Some("Y") | Some("yes"))
+}
+
+/// `kind=system` package: write the kernel and loaders to the ESP (src/esp.rs), then record it.
+fn install_system(hdr: &TmtHeader, meta: &str, entries: &[(String, &[u8])], source: &str) -> bool {
+    let find = |role: &str| entries.iter().find(|(p, _)| p == role).map(|(_, d)| *d);
+    let kernel = match find("esp:kernel") {
+        Some(k) => k,
+        None => { io::err("tomato: the system package has no kernel; nothing installed\n"); return false; }
+    };
+    let img = crate::esp::SystemImage { version: &hdr.pkg_version, kernel, loader: find("esp:loader"), bios: find("esp:bios") };
+    let plan = match crate::esp::prepare(img) {
+        Ok(p) => p,
+        Err(e) => { io::err(&alloc::format!("tomato: system update refused: {}\n", e)); return false; }
+    };
+    io::out(&alloc::format!(":: system update {} -> {}\n", crate::esp::running_version(), hdr.pkg_version));
+    for l in &plan.lines { io::out("   "); io::out(l); io::out("\n"); }
+    if plan.up_to_date {
+        io::out("the ESP already holds this kernel and loader; the boot counter is rewritten anyway\n");
+    }
+    if !confirm("Write these files to the EFI System Partition?") {
+        io::err("tomato: cancelled, nothing was written\n");
+        return false;
+    }
+    match plan.apply() {
+        Ok(log) => { for l in log { io::out("   "); io::out(&l); io::out("\n"); } }
+        Err(e) => {
+            io::err(&alloc::format!("tomato: system update failed: {}\n", e));
+            io::err("        The running system is unchanged; the old KERNEL is still the one that boots.\n");
+            return false;
+        }
+    }
+    let mut rec = alloc::format!("name={}\nversion={}\ninstalled_from={}\nkind=system\n", hdr.name, hdr.pkg_version, source);
+    if let Some(d) = record_field(meta, "description") { rec.push_str("description="); rec.push_str(d); rec.push('\n'); }
+    crate::fs::write_file(&record_path(&hdr.name), rec.as_bytes());
+    io::out_c(&alloc::format!("installed {} {}: reboot to run it. If it does not start twice, the loader boots the previous kernel.\n",
+        hdr.name, hdr.pkg_version), io::FG_OK);
+    true
+}
+
+/// `tomato system`: running build, installed system package, state of the boot counter.
+fn system_status() {
+    io::out(&alloc::format!("running   : {}\n", crate::esp::running_version()));
+    match read_record(SYSTEM_PKG) {
+        Some(r) => io::out(&alloc::format!("installed : {} {}\n", SYSTEM_PKG, record_field(&r, "version").unwrap_or("?"))),
+        None => io::out(&alloc::format!("installed : {} is not installed (the system came with the ISO)\n", SYSTEM_PKG)),
+    }
+    match crate::esp::read_state() {
+        None => io::out("boot state: no update pending\n"),
+        Some(s) => {
+            let what = if s.failed { "FAILED, the loader boots the previous kernel" }
+                else if s.pending { "pending, waiting for a successful boot" } else { "confirmed" };
+            io::out(&alloc::format!("boot state: update {} {} (tries left {}), previous {}\n", s.version, what, s.tries, s.previous));
+        }
+    }
+}
+
 // ─── .tmt command integration ─────────────────────────────────────────────
 
 /// `tomato --tmt <install|list|verify|pack> ...`
@@ -1101,7 +1250,7 @@ pub fn tmt_dispatch(args: &str) {
         "list" | "verify" if !arg(1).is_empty() => {
             let data = match crate::fs::read_file(&resolve(arg(1))) {
                 Some(d) => d,
-                None => { io::err("tomato: file not found\n"); return; }
+                None => { io::err("tomato: cannot read the file\n"); return; }
             };
             let hdr = match tmt_parse_header(&data) {
                 Some(h) => h,
@@ -1112,7 +1261,7 @@ pub fn tmt_dispatch(args: &str) {
                 if ok { io::out("checksum OK\n"); } else { io::err("checksum FAILED\n"); }
                 return;
             }
-            if !ok { io::err("warning: checksum invalid\n"); }
+            if !ok { io::err("tomato: warning: checksum does not match\n"); }
             io::out(&alloc::format!("{} {}\n", hdr.name, hdr.pkg_version));
             for p in tmt_list_contents(&data) {
                 io::out("  ");

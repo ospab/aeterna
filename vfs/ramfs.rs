@@ -86,7 +86,6 @@ impl RamFs {
             tree.insert(String::from("/etc"), RamNode::Dir);
             tree.insert(String::from("/tmp"), RamNode::Dir);
             tree.insert(String::from("/home"), RamNode::Dir);
-            tree.insert(String::from("/home/root"), RamNode::Dir);
             tree.insert(String::from("/var"), RamNode::Dir);
             tree.insert(String::from("/var/log"), RamNode::Dir);
             tree.insert(String::from("/dev"), RamNode::Dir);
@@ -111,9 +110,9 @@ impl RamFs {
                     concat!(
                         "NAME=\"ospab.os\"\n",
                         "ID=ospab\n",
-                        "VERSION=\"", env!("CARGO_PKG_VERSION"), "\"\n",
-                        "VERSION_ID=", env!("CARGO_PKG_VERSION"), "\n",
-                        "PRETTY_NAME=\"ospab.os ", env!("CARGO_PKG_VERSION"), " (kernel AETERNA)\"\n",
+                        "VERSION=\"", env!("OSPAB_VERSION"), "\"\n",
+                        "VERSION_ID=", env!("OSPAB_VERSION"), "\n",
+                        "PRETTY_NAME=\"ospab.os ", env!("OSPAB_VERSION"), " (kernel AETERNA)\"\n",
                         "KERNEL=AETERNA\n",
                         "LICENSE=AGPL-3.0-only\n",
                     ).as_bytes() as &[u8],

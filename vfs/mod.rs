@@ -26,16 +26,17 @@ pub mod ramfs;
 pub mod disk_sync;
 pub mod cow;
 pub mod aeternafs;
+pub mod persist;
 pub mod procfs;
 
-// Re-export RamNode for disk_sync serialization
+// Re-export RamNode for disk_sync (old snapshot reader)
 pub use ramfs::RamNode;
 use alloc::boxed::Box;
 
-// ─── Syncable FS Registry ───────────────────────────────────────────────────
+// ─── Writable layer registry ────────────────────────────────────────────────
 
-/// The filesystem instance that should be synced to disk.
-/// Set during boot to the primary RamFS (or the Upper layer of CowFS).
+/// The boot-time RamFS of the writable layer (the live system keeps using it; with a disk
+/// the layer is switched to the AeternaFS volume, vfs/persist.rs).
 static SYNCABLE_FS: crate::core::sync::IrqSpinLock<Option<&'static ramfs::RamFs>> =
     crate::core::sync::IrqSpinLock::new("VFS.syncable", crate::core::sync::rank::VFS, None);
 
@@ -44,34 +45,18 @@ fn syncable() -> Option<&'static ramfs::RamFs> {
     *SYNCABLE_FS.lock()
 }
 
-/// Register a RamFS instance as the primary one for disk persistence.
+/// Register the RamFS of the writable layer.
 pub fn set_syncable_fs(fs: &'static ramfs::RamFs) {
     *SYNCABLE_FS.lock() = Some(fs);
 }
 
-/// Helper for disk_sync: find the registered syncable RamFS and get a copy of its tree.
-pub fn get_tree_copy() -> Option<alloc::collections::BTreeMap<String, RamNode>> {
-    syncable().map(|fs| fs.get_tree_copy())
-}
-
-/// Helper for disk_sync: check if the registered syncable FS is dirty.
-pub fn is_syncable_dirty() -> bool {
-    syncable().map(|fs| fs.is_dirty.load(core::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
-}
-
-/// Force a disk sync of the registered syncable FS.
+/// Commit the persistent volume now.
 pub fn sync_now() {
     disk_sync::sync_filesystem();
 }
 
-/// Reset the dirty flag on the syncable FS.
-pub fn clear_syncable_dirty() {
-    if let Some(fs) = syncable() {
-        fs.is_dirty.store(false, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Get the node count of the registered syncable RamFS.
+/// Number of files and directories in the writable layer (counted on the RamFS before a
+/// volume is mounted; the volume's directory entries are not counted).
 pub fn node_count() -> usize {
     syncable().map(|fs| fs.node_count()).unwrap_or(0)
 }

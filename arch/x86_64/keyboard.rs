@@ -332,7 +332,7 @@ pub fn try_read_key() -> Option<char> {
         _ => None,
     };
 
-    base.map(|c| {
+    base.map(layout_base).map(|c| {
         if c.is_ascii_alphabetic() {
             let upper = caps_active ^ shift_active;
             if upper { c.to_ascii_uppercase() } else { c }
@@ -342,6 +342,54 @@ pub fn try_read_key() -> Option<char> {
             c
         }
     })
+}
+
+// ─── Layouts ────────────────────────────────────────────────────────────────
+//
+// The scancode table is US QWERTY. A layout remaps the unshifted character of a key before
+// Shift/CapsLock are applied; for these layouts the shifted symbol is the US shifted symbol of
+// the remapped character, so nothing else is needed. ASCII only (the console font has no
+// accented letters).
+
+/// Layout names accepted by `set_layout` (`/etc/keyboard` holds one of them).
+pub const LAYOUTS: &[&str] = &["us", "dvorak", "colemak", "qwertz"];
+
+static LAYOUT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Select a layout by name; returns false for an unknown name.
+pub fn set_layout(name: &str) -> bool {
+    match LAYOUTS.iter().position(|&l| l == name.trim()) {
+        Some(i) => { LAYOUT.store(i as u8, Ordering::Relaxed); true }
+        None => false,
+    }
+}
+
+/// Read `/etc/keyboard` and apply it (call once the VFS is up).
+pub fn load_layout() {
+    if let Some(d) = crate::fs::read_file("/etc/keyboard") {
+        if let Ok(s) = core::str::from_utf8(&d) { set_layout(s); }
+    }
+}
+
+fn layout_base(c: char) -> char {
+    match LAYOUT.load(Ordering::Relaxed) {
+        1 => match c {
+            '-' => '[', '=' => ']', 'q' => '\'', 'w' => ',', 'e' => '.', 'r' => 'p', 't' => 'y',
+            'y' => 'f', 'u' => 'g', 'i' => 'c', 'o' => 'r', 'p' => 'l', '[' => '/', ']' => '=',
+            's' => 'o', 'd' => 'e', 'f' => 'u', 'g' => 'i', 'h' => 'd', 'j' => 'h', 'k' => 't',
+            'l' => 'n', ';' => 's', '\'' => '-', 'z' => ';', 'x' => 'q', 'c' => 'j', 'v' => 'k',
+            'b' => 'x', 'n' => 'b', ',' => 'w', '.' => 'v', '/' => 'z',
+            _ => c,
+        },
+        2 => match c {
+            'e' => 'f', 'r' => 'p', 't' => 'g', 'y' => 'j', 'u' => 'l', 'i' => 'u', 'o' => 'y',
+            'p' => ';', 's' => 'r', 'd' => 's', 'f' => 't', 'g' => 'd', 'j' => 'n', 'k' => 'e',
+            'l' => 'i', ';' => 'o', 'n' => 'k',
+            _ => c,
+        },
+        3 => match c { 'y' => 'z', 'z' => 'y', _ => c },
+        _ => c,
+    }
 }
 
 fn shift_symbol(c: char) -> char {
