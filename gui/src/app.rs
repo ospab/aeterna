@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Application API — what a GUI program for ospab.os is written against.
+//! Application API: what a GUI program for ospab.os is written against.
 //!
 //! An app implements [`Application`]: it describes itself ([`AppInfo`]),
 //! opens windows in [`Application::start`], and reacts to [`AppEvent`]s.

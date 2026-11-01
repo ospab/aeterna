@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! oos-ui — the ospab.os user-interface toolkit.
+//! oos-ui: the ospab.os user-interface toolkit.
 //!
 //! `no_std + alloc`; everything is rendered in software on the CPU into
 //! premultiplied ARGB8888 surfaces.  Layers, bottom-up:

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! memtest — boot self-test of shared memory through handles (ROADMAP item 12).
-//! Exit 0 = all good, otherwise the number of the check that failed.
+//! memtest: boot self-test of shared memory through handles (ROADMAP item 12).
+//! Exit 0 means all checks passed, otherwise the exit code is the failed check's number.
 //!
 //! Modes (argument 1) and bootstrap handles:
 //!   server        1 = channel (READ). Maps what the client sends, checks and writes back.

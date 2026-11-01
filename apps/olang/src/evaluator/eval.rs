@@ -174,7 +174,7 @@ fn eval_statement(statement: &Statement, env: &mut Environment) -> Object {
                     env.set(module_name, Object::Module(Rc::new(store)));
                     Object::Null
                 }
-                Err(e) => Object::Error(format!("Failed to import '{}': {}", file_path, e)),
+                Err(e) => Object::Error(format!("cannot import '{}': {}", file_path, e)),
             }
         }
         Statement::Struct { name, fields } => {
@@ -370,7 +370,7 @@ fn eval_expression(expr: &Expression, env: &mut Environment) -> Object {
                 if let Object::String(path) = &eval_args[0] {
                     return match read_module_or_file(path) {
                         Ok(content) => Object::String(content),
-                        Err(e) => Object::Error(format!("Failed to read file '{}': {}", path, e)),
+                        Err(e) => Object::Error(format!("cannot read file '{}': {}", path, e)),
                     };
                 }
                 Object::Error("File::read_to_string path must be string".to_string())
@@ -379,7 +379,7 @@ fn eval_expression(expr: &Expression, env: &mut Environment) -> Object {
                 if let (Object::String(path), Object::String(content)) = (&eval_args[0], &eval_args[1]) {
                     return match crate::sys::write_file(path, content) {
                         Ok(_) => Object::Integer(content.len() as i64),
-                        Err(e) => Object::Error(format!("Failed to write file '{}': {}", path, e)),
+                        Err(e) => Object::Error(format!("cannot write file '{}': {}", path, e)),
                     };
                 }
                 Object::Error("File::write_to_string args must be strings".to_string())

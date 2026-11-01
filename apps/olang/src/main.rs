@@ -36,7 +36,7 @@ fn run_source(src: &str, name: &str, env: &mut Environment, repl: bool) -> bool 
     let mut parser = Parser::new(scanner);
     let program = parser.parse_program();
     if !parser.errors.is_empty() {
-        println!("Syntax errors in '{}':", name);
+        println!("ol: syntax errors in '{}':", name);
         for err in &parser.errors {
             println!(" - {}", err);
         }
@@ -45,9 +45,9 @@ fn run_source(src: &str, name: &str, env: &mut Environment, repl: bool) -> bool 
     let (result, line) = eval_program_at(&program, env);
     if let Object::Error(msg) = result {
         if line > 0 {
-            println!("Runtime Error [Line {}] in '{}': {}", line, name, msg);
+            println!("ol: runtime error in '{}' at line {}: {}", name, line, msg);
         } else {
-            println!("Runtime Error: {}", msg);
+            println!("ol: runtime error: {}", msg);
         }
         return false;
     }
@@ -98,7 +98,7 @@ fn needs_more(s: &str) -> bool {
 }
 
 fn repl() -> i32 {
-    println!("olang REPL (ospab.os). Type exit() or press Ctrl+D to quit.");
+    println!("olang REPL (ospab.os). Quit with exit() or Ctrl+D.");
     let mut env = Environment::new();
     loop {
         print!(">>> ");
@@ -188,7 +188,7 @@ fn real_main(args: liboos::Args) -> i32 {
             let code = match argv.get(2) {
                 Some(c) => c,
                 None => {
-                    println!("ol: -e needs code");
+                    println!("ol: -e needs a code argument");
                     return 2;
                 }
             };

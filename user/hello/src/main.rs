@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! hello — the first program built for ospab.os. Exercises the ELF loader
+//! hello: the first program built for ospab.os. It exercises the ELF loader
 //! (text/rodata/data/bss), arguments, the heap and printing.
 #![no_std]
 #![no_main]

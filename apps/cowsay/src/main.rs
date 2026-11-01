@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! cowsay — a cow says what you tell it. `cowsay hello world`
+//! cowsay: a cow says what you tell it. `cowsay hello world`
 #![no_std]
 #![no_main]
 
@@ -51,7 +51,7 @@ fn main(args: liboos::Args) -> i32 {
         text.push_str(a);
     }
     if text.is_empty() {
-        text.push_str("moo! (usage: cowsay <text>)");
+        text.push_str("moo (usage: cowsay <text>)");
     }
     let lines = wrap(&text);
     let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);

@@ -1,11 +1,11 @@
 /*
 SPDX-License-Identifier: AGPL-3.0-only
 Copyright (c) 2026 ospab
-mkimage — build a GPT disk image with one FAT32 EFI System Partition and, with --bios, a BIOS boot
-partition (LBA 34..2047) plus stage 1 in the MBR, so the image boots on BIOS and UEFI.
+mkimage: build a GPT disk image with one FAT32 EFI System Partition. With --bios it adds a BIOS
+boot partition (LBA 34..2047) and puts stage 1 in the MBR, so the image boots on BIOS and UEFI.
 
-No dependencies and no cargo project on purpose: build it with plain rustc on the
-host (Windows or Linux), so it does not inherit the kernel's .cargo/config.toml:
+It has no dependencies and no cargo project, on purpose: build it with plain rustc on the
+host (Windows or Linux), so it does not pick up the kernel's .cargo/config.toml:
 
     rustc -O --edition 2021 tools/mkimage.rs -o target/mkimage(.exe)
     mkimage out.img [--size-mib N] [--bios bios.img] DEST=SRC [DEST=SRC ...]
@@ -59,7 +59,7 @@ fn put16(b: &mut [u8], o: usize, v: u16) { b[o..o + 2].copy_from_slice(&v.to_le_
 fn put32(b: &mut [u8], o: usize, v: u32) { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); }
 fn put64(b: &mut [u8], o: usize, v: u64) { b[o..o + 8].copy_from_slice(&v.to_le_bytes()); }
 
-/// GUID text → on-disk mixed-endian bytes.
+/// GUID text to on-disk mixed-endian bytes.
 fn guid_bytes(s: &str) -> [u8; 16] {
     let hex: Vec<u8> = s
         .chars()

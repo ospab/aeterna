@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! ipcsrv — a tiny IPC server for the boot self-test.
+//! ipcsrv: a tiny IPC server for the boot self-test.
 //!
 //! Bootstrap handles: 1 = channel (READ), 2 = notification (WRITE).
 //! Requests (message tag): 1 echo, 2 signal the notification, 3 reply then signal it a bit

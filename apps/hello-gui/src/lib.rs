@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! hello-gui — the template for ospab.os GUI applications.
+//! hello-gui: the template for ospab.os GUI applications.
 //!
 //! Everything here uses only the public application API of `oos-ui`
 //! (`oos_ui::app`).  The same `HelloGui` runs inside the kernel desktop

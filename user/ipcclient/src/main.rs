@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! ipcclient — drives ipcsrv and checks the IPC rules. Exit 0 = all good, otherwise the
-//! number of the check that failed.
+//! ipcclient: drives ipcsrv and checks the IPC rules. Exit 0 means all checks passed,
+//! otherwise the exit code is the number of the check that failed.
 //!
 //! Bootstrap handles: 1 = channel (WRITE|DUP), 2 = notification (READ), 3 = server process (READ).
 //! With argument `block-recv` or `block-call` it instead blocks forever in the kernel (handle 1

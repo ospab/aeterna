@@ -570,7 +570,7 @@ impl<'a> Parser<'a> {
                 if let Some(expr) = mini_parser.parse_expression(Precedence::Lowest) {
                     parts.push(expr);
                 } else {
-                    self.add_error(format!("Failed to parse f-string expr: {}", expr_str));
+                    self.add_error(format!("cannot parse the f-string expression: {}", expr_str));
                 }
             } else {
                 current_str.push(ch);

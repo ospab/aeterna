@@ -56,3 +56,4 @@ boot/bios/target/
 # BBC Micro emulator: ROMs and disc images are supplied by the user, never committed
 *.ssd
 *.rom
+tools/oosfs/target/

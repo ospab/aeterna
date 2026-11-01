@@ -2,7 +2,7 @@
 # Needs a user heap of about 32 MiB (user/liboos/src/heap.rs) and the framebuffer capability.
 name = "drift"
 version = "0.2.0"
-description = "drift - space trading and combat game with a story campaign, tutorial, Russian and English, procedural sound (c) 2026 ospab, AGPL-3.0-only"
+description = "Space trading and combat game with a story campaign and a tutorial; English and Russian, generated sound"
 arch = "x86_64"
 depends = []
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! calc — command-line calculator. `calc 2+3*4`, `calc "(1+2)^3 / 4"`.
+//! calc: command-line calculator. `calc 2+3*4`, `calc "(1+2)^3 / 4"`.
 //!
 //! Operators: + - * / % ^ (power, right-associative), unary minus, parentheses.
 //! Exit status: 0 on success, 1 on a syntax or arithmetic error, 2 on usage.
@@ -170,7 +170,7 @@ fn main(args: liboos::Args) -> i32 {
             }
             0
         }
-        Ok(_) => { println!("calc: result is not a finite number"); 1 }
+        Ok(_) => { println!("calc: the result is not a finite number"); 1 }
         Err(e) => { println!("calc: {} (at column {})", e, p.pos + 1); 1 }
     }
 }

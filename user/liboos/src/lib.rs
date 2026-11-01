@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ospab
-//! liboos — the runtime library for ospab.os user programs.
+//! liboos: the runtime library for ospab.os user programs.
 //!
-//! Provides the process entry point (`_start`), system call wrappers, a heap for
-//! `alloc`, `print!`/`println!`, and a panic handler. A program looks like:
+//! It supplies the process entry point (`_start`), system call wrappers, a heap for
+//! `alloc`, `print!`/`println!` and a panic handler. A program looks like this:
 //!
 //! ```ignore
 //! #![no_std]

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! hello-gui as a ring-3 program.
 //!
-//! The compositor does not have an IPC front end yet, so this binary runs the
-//! application against an in-process session and renders a few frames into
-//! memory.  It proves the app builds for `x86_64-unknown-oos` and runs on
-//! liboos; once `oos_ui::proto` is carried over a channel, only the host
-//! below changes — `hello_gui::HelloGui` stays as it is.
+//! The compositor has no IPC front end yet, so this binary runs the application
+//! against an in-process session and renders a few frames into memory. It shows
+//! that the app builds for `x86_64-unknown-oos` and runs on liboos. Once
+//! `oos_ui::proto` goes over a channel, only the host below changes;
+//! `hello_gui::HelloGui` stays as it is.
 #![no_std]
 #![no_main]
 

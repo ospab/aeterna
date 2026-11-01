@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! uartdrv — the first ring-3 driver (proof of concept, ROADMAP item 13): a 16550 UART on
+//! uartdrv: the first ring-3 driver (proof of concept, ROADMAP item 13), a 16550 UART on
 //! COM2 (ports 0x2F8..0x2FF, IRQ 3), driven entirely through handles.
 //!
 //! Bootstrap handles: 1 = IoPortRange 0x2F8+8 (READ|WRITE), 2 = Interrupt IRQ 3 (READ|WRITE).

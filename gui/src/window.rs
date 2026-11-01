@@ -3,8 +3,8 @@
 //! the protocol glue (see [`crate::proto`]).
 //!
 //! Chrome: a 38-px title bar in the window's own colour, the title centred,
-//! and three small monochrome round controls on the left — close, minimise,
-//! zoom — that show their glyph only when the pointer is near and turn
+//! and three small monochrome round controls on the left (close, minimise,
+//! zoom) that show their glyph only when the pointer is near and turn
 //! red/grey on hover.  Focus is a brighter hairline border, a stronger shadow
 //! (drawn by the server) and primary-coloured title text.  Double-clicking
 //! the title bar zooms.
