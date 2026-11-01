@@ -1,0 +1,14 @@
+# Driver package: the Intel e1000 network driver, run in ring 3 by devmgr.
+# `tmt pack` adds /usr/lib/drivers/e1000/driver.conf from the [driver] table.
+name = "drv-e1000"
+version = "0.1.0"
+description = "Intel e1000 network driver for ring 3 (installed in /usr/lib/drivers/e1000)"
+arch = "x86_64"
+depends = []
+
+[[files]]
+src = "../target/x86_64-unknown-oos/release/drv-e1000"
+dest = "/usr/lib/drivers/e1000/drv-e1000"
+
+[driver]
+match = ["pci:8086:100e", "pci:8086:100f", "pci:8086:1004", "pci:8086:100c", "pci:8086:1019", "pci:8086:10d3"]

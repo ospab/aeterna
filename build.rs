@@ -111,6 +111,15 @@ fn main() {
     println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/memtest");
     println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/uartdrv");
 
+    // Device manager (user/devmgr): started at boot, also installed as /usr/bin/devctl.
+    let devmgr = Path::new(&manifest).join("user/target/x86_64-unknown-oos/release/devmgr");
+    if devmgr.exists() {
+        println!("cargo:rustc-cfg=user_devmgr");
+        println!("cargo:rustc-env=OOS_USER_DEVMGR={}", devmgr.display());
+    }
+    println!("cargo:rerun-if-changed=user/target/x86_64-unknown-oos/release/devmgr");
+    println!("cargo::rustc-check-cfg=cfg(user_devmgr)");
+
     // Declare custom cfg names so rustc doesn't warn about unexpected_cfgs
     println!("cargo::rustc-check-cfg=cfg(doom_wad_present)");
     println!("cargo::rustc-check-cfg=cfg(doom_supported)");

@@ -8,6 +8,7 @@ pub mod scheduler;
 pub mod syscall;
 pub mod elf;
 pub mod object;
+pub mod pcidev;
 pub mod sync;
 pub mod fd;
 pub mod stdin;

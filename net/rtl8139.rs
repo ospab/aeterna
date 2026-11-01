@@ -238,9 +238,8 @@ fn init_device(bus: u8, dev: u8, func: u8) -> bool {
         outb(io + REG_CMD, 0x0C); // RE + TE
 
         // 9. Enable IRQ on the PIC
-        if irq_line < 16 {
-            crate::arch::x86_64::pic::enable_irq(irq_line);
-        }
+        let _ = irq_line;
+        crate::arch::x86_64::irq::setup_device_intx(bus, dev, func, "rtl8139", crate::arch::x86_64::idt::net_irq_handler);
 
         RX_OFFSET = 0;
         TX_CUR = 0;

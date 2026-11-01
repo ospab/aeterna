@@ -187,8 +187,8 @@ pub fn mem_unmap(addr: u64) -> i64 {
 }
 
 // 243: mem_create_contig(resource, size) -> h (with PHYS)
-pub fn mem_create_contig(res: u64, size: u64) -> i64 {
-    ret(object::mem_create_contig(res as u32, size))
+pub fn mem_create_contig(res: u64, size: u64, flags: u64) -> i64 {
+    ret(object::mem_create_contig(res as u32, size, flags))
 }
 
 // 244: mem_phys(h) -> physical address
@@ -219,4 +219,29 @@ pub fn ioport_enable(h: u64) -> i64 {
 // 253: ioport_disable(h)
 pub fn ioport_disable(h: u64) -> i64 {
     ret_unit(object::ioport_disable(h as u32))
+}
+
+// 254: irq_alloc_msi(pci_device, count, out) -> count
+// Allocates `count` MSI/MSI-X vectors for the PciDevice handle and stores one Interrupt
+// handle per vector (u32, vector order) at `out`.
+pub fn irq_alloc_msi(dev: u64, count: u64, out: u64) -> i64 {
+    if count == 0 || count > 8 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    match object::irq_alloc_msi(dev as u32, count as u32) {
+        Ok(hs) => {
+            let mut buf = [0u8; 32];
+            for (i, h) in hs.iter().enumerate() {
+                buf[i * 4..i * 4 + 4].copy_from_slice(&h.to_le_bytes());
+            }
+            if let Err(e) = usercopy::copy_to_user(out, &buf[..hs.len() * 4]) {
+                for h in hs {
+                    let _ = object::handle_close(h);
+                }
+                return SyscallError::from(e) as i64;
+            }
+            hs.len() as i64
+        }
+        Err(e) => e,
+    }
 }

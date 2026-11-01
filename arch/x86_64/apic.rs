@@ -304,3 +304,48 @@ fn serial_dec(mut v: u64) {
     while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
     for j in (0..i).rev() { crate::arch::x86_64::serial::write_byte(buf[j]); }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Added for IOAPIC / MSI routing and the periodic tick
+
+static PERIODIC: AtomicBool = AtomicBool::new(false);
+
+/// APIC id of the boot processor (the destination of every routed interrupt).
+pub fn id() -> u8 {
+    if !APIC_PRESENT.load(Ordering::Relaxed) && !cpuid_apic_present() { return 0; }
+    (unsafe { reg_r(REG_ID) } >> 24) as u8
+}
+
+/// True once the timer runs in periodic mode (the handler must not re-arm it).
+pub fn is_periodic() -> bool { PERIODIC.load(Ordering::Relaxed) }
+
+/// Switch the timer to periodic mode with a period of `us` microseconds. Returns false
+/// when the timer was not calibrated.
+pub fn start_periodic_us(us: u64) -> bool {
+    if !APIC_PRESENT.load(Ordering::Relaxed) { return false; }
+    let cnt = APIC_CNT_PER_US.load(Ordering::Relaxed) as u64 * us;
+    if cnt == 0 || cnt > 0xFFFF_FFFF { return false; }
+    unsafe {
+        reg_w(REG_INIT_CNT, 0);
+        reg_w(REG_DIV_CFG, DIV_BY_16);
+        reg_w(REG_LVT_TMR, APIC_TIMER_VECTOR as u32 | (1 << 17));
+        reg_w(REG_INIT_CNT, cnt as u32);
+    }
+    PERIODIC.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Program local vector table entry LINT0 (`lint` 0) or LINT1 (1) as NMI.
+/// `flags` are MPS INTI flags (bits 0-1 polarity, 2-3 trigger).
+pub fn set_lint_nmi(lint: u8, flags: u16) {
+    let off = if lint == 0 { 0x350 } else { 0x360 };
+    let mut v: u32 = 0x400; // delivery mode NMI
+    if flags & 3 == 3 { v |= 1 << 13; }
+    if (flags >> 2) & 3 == 3 { v |= 1 << 15; }
+    unsafe { reg_w(off, v); }
+}
+
+/// Mask LINT0 (the ExtINT/virtual-wire input) once the 8259 is silenced.
+pub fn mask_lint0() {
+    unsafe { let v = reg_r(0x350); reg_w(0x350, v | (1 << 16)); }
+}

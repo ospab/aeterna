@@ -118,6 +118,7 @@ pub fn run(name: &str, args: &[String]) -> bool {
         "curl" => net_tools::cmd_curl(&joined()),
         "nslookup" => net_tools::cmd_nslookup(&joined()),
         "lspci" => lspci::run(&joined()),
+        "irqstat" => out(&crate::arch::x86_64::irq::stat_text()),
         "guidemo" => guidemo::run(&joined()),
         "desktop" => desktop::run(&joined()),
         "fdisk" => disk_tools::run_fdisk(&joined()),
@@ -141,7 +142,7 @@ pub fn command_list() -> &'static [&'static str] {
         "find", "tee", "wc", "head", "tail", "grep", "egrep", "sort", "uniq", "cut", "tr", "rev",
         "nl", "xxd", "diff", "awk", "basename", "dirname", "seq", "yes", "printf", "xargs",
         "sleep", "ps", "top", "kill", "netstat", "ping", "traceroute", "ip", "curl", "nslookup",
-        "lspci", "desktop", "fdisk", "lsblk", "mkfs", "mount", "fsck", "snap", "ostp", "clip", "display",
+        "lspci", "irqstat", "desktop", "fdisk", "lsblk", "mkfs", "mount", "fsck", "snap", "ostp", "clip", "display",
         "verify_mem", "verify_sched", "verify_net", "verify_audio",
     ]
 }

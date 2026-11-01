@@ -46,6 +46,11 @@ pub mod rank {
 /// Ranks of the locks held on this CPU (bit n = rank n). Per-CPU once there are more CPUs.
 static HELD: AtomicU64 = AtomicU64::new(0);
 
+/// True if this CPU holds any ranked lock (code that would take OBJ must not run then).
+pub fn locks_held() -> bool {
+    HELD.load(Ordering::Relaxed) != 0
+}
+
 #[inline(always)]
 fn note_acquire(name: &'static str, rank: u8) {
     let bit = 1u64 << rank;

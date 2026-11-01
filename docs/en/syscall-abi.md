@@ -77,6 +77,7 @@ values in the receiver's table.
 | 251 | irq_ack | irq (WRITE) → 0; unmasks the line |
 | 252 | ioport_enable | h (READ+WRITE) → 0; the ports become accessible to IN/OUT |
 | 253 | ioport_disable | h → 0 |
+| 254 | irq_alloc_msi | pci_device (WRITE), count (1 to 8), out → number of vectors; writes one Interrupt handle (u32) per vector to `out` |
 
 `timeout` is in 100 Hz ticks; 0 waits forever. Waiting does not spin: the task becomes Waiting,
 the CPU halts, and the other side (or the deadline) wakes it. When no handle with `READ` is left on
@@ -134,11 +135,23 @@ Interrupt, IoPortRange, MmioRegion and Resource objects cannot be created by any
 are made only by the privileged root (today the kernel boot code, `core::object::kernel_new_*`;
 later `seed`) and given to a driver as bootstrap handles (`core::elf::spawn_with_handles`).
 
-- Interrupt: a legacy (8259) IRQ line, currently only 3, 6 or 8 (lines no kernel driver uses).
-  There is one object per line, and MSI is not supported yet. After `irq_bind` every interrupt
-  masks the line, ORs `bits` into the notification and wakes its waiter. The kernel sends EOI.
-  The driver services the device and calls `irq_ack`, which unmasks the line. The line is masked
-  from creation until the first `irq_ack`, and again when the object goes away.
+- Interrupt: either a legacy ISA IRQ line, currently only 3, 6 or 8 (lines no kernel driver
+  uses), or an MSI/MSI-X vector. There is one object per line or vector.
+  - Legacy line: with the I/O APIC the line is routed through the MADT overrides to vector
+    0x20 + IRQ. After `irq_bind` every interrupt masks the line, ORs `bits` into the notification
+    and wakes its waiter. The kernel sends EOI. The driver services the device and calls
+    `irq_ack`, which unmasks the line. The line is masked from creation until the first
+    `irq_ack`, and again when the object goes away.
+  - MSI/MSI-X vector (call 254): the caller passes a PciDevice handle (claimed with
+    `pci_claim`, WRITE right). The kernel allocates `count` vectors, programs the function's
+    MSI-X capability (preferred) or MSI capability with the local APIC address and the
+    vectors, enables it and returns one Interrupt handle per vector, in vector order. Errors:
+    `NotSupported` (function has neither capability), `Busy` (MSI already enabled, for
+    example by a kernel driver), `OutOfMemory` (no free vectors, 0x40 to 0xEF). `irq_bind`
+    works as for a line, but an MSI interrupt does not mask anything: each interrupt ORs
+    `bits` into the notification, and `irq_ack` does nothing. The driver reads its device to
+    find the cause. When the last handle of a vector closes (or the process exits), the vector
+    is freed and, with the last vector of the function, MSI is disabled on the device.
 - IoPortRange: ports `[base, base+count)`. The mechanism is the I/O permission bitmap in the TSS.
   `IOPL` stays 0. `ioport_enable` builds the process's bitmap (one bit per port, 1 = denied), and
   the scheduler copies it into the TSS on a switch to that process (only the bytes in use, and
@@ -244,3 +257,33 @@ teardown, `screen::process_gone` calls `audio::process_gone`).
 Test: `apps/tone` plays 440 Hz (mono, 48000 Hz) and then a C major chord (stereo, 44100 Hz)
 and exits. Run QEMU with `-audiodev wav,id=a0,path=out.wav` and `intel-hda`/`hda-duplex`, `AC97` or
 `ES1370`, then check the WAV for level and frequency.
+
+## Drivers in ring 3
+
+Implementation: `core/pcidev.rs` (claim table, config space), `core/syscall/drv.rs` (glue), the
+object code in `core/object.rs`; wrappers in `user/libdriver`. Guide: [Drivers in ring 3](dev/drivers.md).
+
+New object type 11, `PciDevice`: one claimed PCI function (rights READ, WRITE, DUP, TRANSFER).
+New Resource kind `PCI` (2): list and claim PCI functions. Only the kernel creates it
+(`devmgr` gets it as bootstrap handle 1).
+
+| No. | Call | Arguments → result |
+|---|---|---|
+| 290 | pci_enum | resource (PCI, READ), index, out* → 0; fills a 168-byte `PciInfo` (bdf, ids, class, IRQ line and pin, owner 0 free / 1 kernel / 2 ring 3, MSI and MSI-X capability offsets, 6 BARs: base, size, flags 1 present, 2 I/O, 4 64-bit, 8 prefetchable). NotFound past the last function |
+| 291 | pci_claim | resource (PCI, WRITE), bdf (bus<<8 \| dev<<3 \| func), flags → PciDevice handle. Flag 1: take the function from an in-kernel driver (it must support release, today the e1000). Busy if owned; NotSupported if the kernel driver cannot let go |
+| 292 | pci_open | device (WRITE), kind, index → handle. Kind 0: memory BAR `index` as MmioRegion (the BAR must be page aligned, not in RAM); 1: I/O BAR as IoPortRange; 2: the legacy interrupt line as Interrupt (Busy if an in-kernel driver of another function shares the line) |
+| 293 | pci_cfg_read | device (READ), offset, size (1, 2, 4) → value |
+| 294 | pci_cfg_write | device (WRITE), offset, size, value → 0. Refused (PermissionDenied) for offsets 0..3, the BARs (0x10..0x27) and the ROM base and capability pointer (0x30..0x34) |
+| 295 | pci_info | device (READ), out* → 0; same `PciInfo` |
+| 296 | proc_spawn | req* → Process handle (READ, WRITE) of the child. `req` is 10 u64 words: path ptr and length, arguments (NUL-separated strings) ptr and length, number of handles (at most 4), 4 handle values, and the child pid written back at offset 72. Needs the Spawn (or System) and FsRead capabilities. The child gets copies of the handles (each needs TRANSFER) as its handles 1, 2, ... and only the Serial capability |
+| 297 | fs_readdir | path*, length, buf*, buf length → bytes; names separated by `\n`, `/` after a directory. Needs FsRead |
+| 298 | klog_write | level, msg*, length (at most 160) → 0; the line goes to the serial log (`[drv] ...`) and to the kernel event log that `dmesg` shows. Needs Serial |
+| 299 | netdrv_ctl | op, a, b, c. Op 0: attach (a device, b notification WRITE, c MemoryRegion that is contiguous DMA memory) the packet ring to the kernel network stack; 1: poll, run the stack's receive path now; 2: detach; 3: status. Ring layout: `net/ext.rs` |
+
+Changed: `mem_create_contig` (243) takes a third argument, `flags` (bit 0: map uncached), and
+accepts a `PciDevice` handle with WRITE in place of the DMA resource, so a driver allocates DMA
+memory for its own device. `irq_alloc_msi` (254) also takes the `PciDevice` handle.
+
+When the last handle to a `PciDevice` is closed (or its holder exits), the function is
+released: bus master is switched off and the owner is "free" again. The claim table marks storage,
+display, audio, bridge and USB functions as kernel-owned, and the NIC the kernel network stack uses.

@@ -14,6 +14,7 @@
 pub mod virtio_net;
 pub mod rtl8139;
 pub mod e1000;
+pub mod ext;
 pub mod rtl8169;
 pub mod pcnet;
 pub mod vmxnet3;
@@ -62,6 +63,8 @@ pub const NIC_E1000: u8 = 2;
 pub const NIC_RTL8169: u8 = 3;
 pub const NIC_PCNET: u8 = 4;
 pub const NIC_VMXNET3: u8 = 5;
+/// A NIC driver in ring 3 feeding the stack through net/ext.rs.
+pub const NIC_EXT: u8 = 6;
 pub const NIC_NONE: u8 = 0xFF;
 static ACTIVE_NIC_ID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(NIC_NONE);
 
@@ -151,7 +154,54 @@ pub fn link_up() -> bool {
         NIC_RTL8169 => rtl8169::link_up(),
         NIC_PCNET   => pcnet::link_up(),
         NIC_VMXNET3 => vmxnet3::link_up(),
+        NIC_EXT     => ext::link_up(),
         _ => false,
+    }
+}
+
+/// Switch the stack to the ring-3 NIC driver (net/ext.rs).
+pub(crate) fn switch_to_ext() {
+    ACTIVE_NIC_ID.store(NIC_EXT, Ordering::Relaxed);
+}
+
+/// Run the receive path unless other network code is in the middle of something
+/// (it polls on its own when it resumes). Used by netdrv_ctl(POLL) with interrupts off.
+pub(crate) fn poll_if_idle() {
+    if NET_BUSY.load(Ordering::Acquire) == 0 {
+        poll_rx();
+    }
+}
+
+/// Release callback for the claim table: stop the in-kernel e1000 so a ring-3 driver can
+/// take the device. The stack then waits for `ext::attach`.
+fn release_e1000() -> bool {
+    if active_nic() != NIC_E1000 {
+        return false;
+    }
+    ACTIVE_NIC_ID.store(NIC_EXT, Ordering::Relaxed);
+    e1000::release()
+}
+
+/// Tell the PCI claim table which function the in-kernel NIC driver uses.
+fn claim_active_nic(nic: u8) {
+    use crate::core::pcidev::kernel_claim;
+    let find = |v: u16, d: u16| crate::pci::find_by_vendor_device(v, d)
+        .map(|x| crate::core::pcidev::bdf_of(x.bus, x.device, x.function));
+    match nic {
+        NIC_E1000 => {
+            let b = e1000::pci_bdf();
+            if b != 0xFFFF { kernel_claim(b, Some(release_e1000)); }
+        }
+        NIC_RTL8139 => if let Some(b) = find(0x10EC, 0x8139) { kernel_claim(b, None) },
+        NIC_RTL8169 => {
+            if let Some(b) = find(0x10EC, 0x8169).or_else(|| find(0x10EC, 0x8168)) { kernel_claim(b, None) }
+        }
+        NIC_VIRTIO => {
+            if let Some(b) = find(0x1AF4, 0x1000).or_else(|| find(0x1AF4, 0x1041)) { kernel_claim(b, None) }
+        }
+        NIC_PCNET => if let Some(b) = find(0x1022, 0x2000) { kernel_claim(b, None) },
+        NIC_VMXNET3 => if let Some(b) = find(0x15AD, 0x07B0) { kernel_claim(b, None) },
+        _ => {}
     }
 }
 
@@ -267,6 +317,7 @@ pub fn init() -> bool {
 
     // Store which NIC is active so poll_rx / send_raw know which to call
     ACTIVE_NIC_ID.store(nic, Ordering::Relaxed);
+    claim_active_nic(nic);
     s("[NET] Using NIC driver: ");
     s(nic_model());
     s("\r\n");
@@ -423,6 +474,7 @@ fn poll_rx_inner() {
         NIC_RTL8169 => drain(rtl8169::receive_packet),
         NIC_PCNET   => drain(pcnet::receive_packet),
         NIC_VMXNET3 => drain(vmxnet3::receive_packet),
+        NIC_EXT     => drain(ext::receive_packet),
         _ => {}
     }
 }
@@ -439,6 +491,7 @@ pub fn send_raw(buf: &[u8], len: usize) {
         NIC_RTL8169 => rtl8169::send_packet(buf, len),
         NIC_PCNET   => pcnet::send_packet(buf, len),
         NIC_VMXNET3 => vmxnet3::send_packet(buf, len),
+        NIC_EXT     => ext::send_packet(buf, len),
         _ => {}
     }
     NET_BUSY.fetch_sub(1, Ordering::Release);
@@ -490,6 +543,7 @@ pub fn nic_name() -> &'static str {
         NIC_RTL8169 => "RTL8169/8111",
         NIC_PCNET   => "AMD PCnet",
         NIC_VMXNET3 => "vmxnet3",
+        NIC_EXT     => "ring-3 driver",
         _           => "none",
     }
 }
@@ -503,6 +557,7 @@ pub fn nic_model() -> &'static str {
         NIC_RTL8169 => "Realtek RTL8169/8111 (10ec:8169/8168)",
         NIC_PCNET   => "AMD PCnet-PCI II Am79C970A (1022:2000, VMware vlance)",
         NIC_VMXNET3 => "VMware vmxnet3 (15ad:07b0)",
+        NIC_EXT     => "NIC driver in ring 3 (net/ext.rs)",
         _           => "none",
     }
 }

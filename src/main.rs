@@ -189,6 +189,15 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
         boot_log!(Status::Warn, "PCI", "no devices found");
     }
 
+    // Interrupt routing: I/O APIC (MADT) instead of the 8259 PIC; MSI/MSI-X for drivers.
+    boot_step("Interrupts");
+    ospab_os::arch::x86_64::irq::init();
+    if ospab_os::arch::x86_64::irq::ioapic_active() {
+        boot_log!(Status::Ok, "Interrupts", "I/O APIC, MSI/MSI-X, LAPIC timer tick");
+    } else {
+        boot_log!(Status::Warn, "Interrupts", "8259 PIC (no MADT or I/O APIC)");
+    }
+
     // ══════════════════════════════════════════════
     // Phase 3: Kernel services
     // ══════════════════════════════════════════════
@@ -346,6 +355,7 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
         framebuffer::clear(COLOR_BG);
     } else {
         ring3_self_test();
+        start_devmgr();
         boot_log!(Status::Ok, "Console", "ready");
         framebuffer::draw_char('\n', COLOR_WHITE, COLOR_BG);
         // System update: the console is up, so tell the loader this kernel started well.
@@ -358,6 +368,41 @@ pub extern "C" fn _start(boot_arg0: u64, boot_arg1: u64, boot_arg2: u64) -> ! {
     }
     klog::boot("Entering terminal");
     terminal::run();
+}
+
+/// Start the device manager (user/devmgr): the one process that may list PCI functions and
+/// claim them for ring-3 drivers (docs/en/dev/drivers.md). The same program is installed
+/// as /usr/bin/devctl. Boot with `devmgr=off` to skip it.
+fn start_devmgr() {
+    #[cfg(user_devmgr)]
+    {
+        use ospab_os::core::object::{self, resource, rights};
+        use ospab_os::core::scheduler::Capability;
+        static DEVMGR: &[u8] = include_bytes!(env!("OOS_USER_DEVMGR"));
+        if ospab_os::arch::x86_64::boot::cmdline_get("devmgr") == "off" {
+            serial_line!("[DEVMGR] disabled by devmgr=off");
+            return;
+        }
+        for d in ["/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib/drivers", "/run"] {
+            if !ospab_os::fs::exists(d) {
+                ospab_os::fs::mkdir(d);
+            }
+        }
+        ospab_os::fs::write_file("/usr/bin/devctl", DEVMGR);
+        ospab_os::fs::write_file("/usr/sbin/devmgr", DEVMGR);
+        let res = match object::kernel_new_resource(resource::PCI) {
+            Some(r) => r,
+            None => return,
+        };
+        let caps = alloc::vec![Capability::Serial, Capability::FsRead, Capability::FsWrite, Capability::Spawn];
+        match ospab_os::core::elf::spawn_with_handles(
+            "devmgr", DEVMGR, &["devmgr"], caps,
+            &[(res, rights::READ | rights::WRITE)],
+        ) {
+            Ok(pid) => serial_line!("[DEVMGR] started, pid {}", pid),
+            Err(e) => serial_line!("[DEVMGR] cannot start: {}", e.as_str()),
+        }
+    }
 }
 
 /// Run the boot-time ring-3 programs and check their exit codes and that every

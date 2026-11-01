@@ -313,9 +313,8 @@ fn init_device(bus: u8, dev: u8, func: u8) -> bool {
     outw(io + REG_IMR, INT_ROK | INT_TOK | INT_RER | INT_TER);
 
     // Enable IRQ in PIC
-    if irq < 16 {
-        crate::arch::x86_64::pic::enable_irq(irq);
-    }
+    let _ = irq;
+    crate::arch::x86_64::irq::setup_device_intx(bus, dev, func, "rtl8169", crate::arch::x86_64::idt::net_irq_handler);
 
     unsafe { INITIALIZED = true; }
     crate::arch::x86_64::serial::write_str("[RTL8169] Initialized OK\r\n");

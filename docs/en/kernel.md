@@ -83,6 +83,41 @@ task control block, which closes every descriptor.
 `SCHED` is held only while the table is read or changed. Never call into the VFS or the
 allocator of another subsystem from inside `with_current_fds`.
 
+## Interrupts
+
+`arch/x86_64/irq.rs` (routing), `apic.rs` (local APIC), `pic.rs` (8259), `src/acpi/` (MADT, `_PRT`).
+
+- Boot starts on the 8259 PIC (needed for the TSC calibration). After ACPI and PCI,
+  `irq::init` reads the MADT. With an I/O APIC it moves every unmasked PIC line to the I/O
+  APIC (ISA IRQ n keeps vector 0x20 + n; the MADT source overrides decide the GSI, trigger and
+  polarity, for example IRQ 0 on GSI 2), masks both PICs and logs `[IRQ] I/O APIC mode`. With
+  no MADT, no I/O APIC or no local APIC it stays on the PIC and logs why.
+- The local APIC timer becomes the tick source: periodic, 1 kHz on vector 0x30; every tenth
+  tick advances the 100 Hz counter. The PIT is masked then (`PIT_ALIVE` false), as it already
+  was on machines without PIT interrupts. A PIT that does not tick through the I/O APIC is
+  reported in the log. There is no HPET code.
+- Vectors: 0x20 to 0x2F ISA IRQs, 0x30 APIC timer, 0x40 to 0xEF dynamic (one 16-byte stub each,
+  all enter `irq_common`, which saves the registers and FPU state like the other IRQ stubs),
+  0xFF spurious. A dynamic vector is a GSI above 15, an MSI or an MSI-X vector.
+- API: `irq::route_gsi(gsi, trigger, polarity)`, `irq::alloc_msi(bus, dev, func, count)`,
+  `irq::register(vector, name, handler, ctx)` (up to four handlers share a vector),
+  `irq::unregister`, `irq::mask_gsi/unmask_gsi`, `irq::eoi`. Kernel drivers usually call
+  `irq::setup_device_irq(bus, dev, func, name, handler)`: it tries MSI-X, then MSI, then INTx
+  and returns the mode. `irq::release_device` undoes it. Handlers run with interrupts off and
+  must not block.
+- MSI/MSI-X: address `0xFEE00000 | apic_id << 12`, data = vector, edge. The MSI-X table is
+  mapped uncached in a kernel window. Ring-3 drivers get vectors through the Interrupt
+  objects of `irq_alloc_msi` ([System call ABI](syscall-abi.md)).
+- INTx: `irq::attach_pci_intx` takes the GSI from a static scan of the DSDT `_PRT` (QEMU) and
+  otherwise from the interrupt line register. The kernel has no AML interpreter, so on most
+  real machines the second path is used and may be wrong; then a driver gets no interrupts
+  and has to poll. Only PCI bus 0 is covered by the `_PRT` scan.
+- Drivers: virtio-net uses MSI-X, e1000, RTL8139, RTL8169 and PCnet use INTx. AHCI, NVMe,
+  xHCI and HDA are polled and do not use interrupts. The PS/2 keyboard and mouse and the COM2
+  ring-3 demo use ISA IRQs through the I/O APIC.
+- `irqstat` (and `/proc/interrupts`) lists vector, source (GSI, MSI or MSIX with the PCI
+  address), CPU (always 0, one CPU), count and name.
+
 ## Objects and handles
 
 `core/object.rs`. Each process has a handle table of up to 256 entries. A handle is

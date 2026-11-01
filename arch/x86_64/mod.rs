@@ -18,6 +18,7 @@ pub mod mouse;
 pub mod mem;
 pub mod tsc;
 pub mod apic;
+pub mod irq;
 pub mod ring;
 pub mod io;
 pub use boot::*;

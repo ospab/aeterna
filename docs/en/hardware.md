@@ -11,7 +11,7 @@ ospab.os is developed and tested in VMware Workstation and QEMU. Real hardware i
 | Audio | Intel HDA, AC97, Ensoniq ES1371/ES1373/CT5880, ES1370 | 16-bit stereo, polled DMA |
 | Input | PS/2 keyboard and mouse, USB keyboard and mouse through xHCI (incl. hubs), VMware absolute mouse | no EHCI/UHCI, no hot-plug |
 | Video | UEFI GOP and BIOS VBE 2.0 (32-bit linear) framebuffer, VMware SVGA II | software rendering |
-| Platform | ACPI (power-off, reset, power button), PCI, CMOS RTC, PIT, local APIC timer | |
+| Platform | ACPI (power-off, reset, power button, MADT), PCI, CMOS RTC, I/O APIC, MSI/MSI-X, local APIC timer, PIT, 8259 PIC fallback | one CPU; no AML interpreter |
 | Host integration | VMware backdoor: clipboard, absolute mouse, autofit (GuestRPC) | |
 
 ## Recommended VMware settings

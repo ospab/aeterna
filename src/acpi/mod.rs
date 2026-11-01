@@ -251,6 +251,22 @@ pub fn init() -> bool {
 
     serial::write_str("[ACPI] FADT found\r\n");
 
+    // Remember the root table so other tables (MADT, ...) can be found later.
+    unsafe {
+        if acpi_v2 {
+            let x = (*(rsdp_ptr as *const Rsdp2)).xsdt_address;
+            if x != 0 {
+                ROOT_PHYS = x;
+                ROOT_XSDT = true;
+            } else {
+                ROOT_PHYS = rsdp.rsdt_address as u64;
+            }
+        } else {
+            ROOT_PHYS = rsdp.rsdt_address as u64;
+        }
+    }
+    parse_madt();
+
     // Extract FADT fields
     let fadt = unsafe { &*(fadt_virt as *const Fadt) };
     unsafe {
@@ -331,6 +347,7 @@ pub fn init() -> bool {
     if dsdt_phys != 0 {
         let dsdt_virt = phys_to_virt(dsdt_phys);
         parse_s5_from_dsdt(dsdt_virt);
+        parse_prt(dsdt_virt);
     } else {
         serial::write_str("[ACPI] No DSDT — using default S5 SLP_TYP=5\r\n");
         unsafe {
@@ -807,6 +824,384 @@ pub fn sci_irq() -> u16 {
 /// Get S5 SLP_TYP values
 pub fn s5_slp_typ() -> (u16, u16) {
     unsafe { (ACPI.slp_typa_s5, ACPI.slp_typb_s5) }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MADT (interrupt controller description)
+// ══════════════════════════════════════════════════════════════════════════════
+
+static mut ROOT_PHYS: u64 = 0;
+static mut ROOT_XSDT: bool = false;
+
+pub const MADT_MAX_IOAPICS: usize = 8;
+pub const MADT_MAX_OVERRIDES: usize = 32;
+pub const MADT_MAX_NMIS: usize = 16;
+
+/// One I/O APIC.
+#[derive(Clone, Copy)]
+pub struct MadtIoApic {
+    pub id: u8,
+    pub addr: u32,
+    pub gsi_base: u32,
+}
+
+/// Interrupt source override: ISA IRQ `source` is wired to global system interrupt `gsi`.
+/// `flags` are the MPS INTI flags: bits 0-1 polarity (1 high, 3 low), bits 2-3 trigger
+/// (1 edge, 3 level), 0 = bus default.
+#[derive(Clone, Copy)]
+pub struct MadtOverride {
+    pub bus: u8,
+    pub source: u8,
+    pub gsi: u32,
+    pub flags: u16,
+}
+
+/// Non-maskable interrupt wired to a local APIC pin (`gsi` unused) or to a GSI (`lint` = 0xFF).
+#[derive(Clone, Copy)]
+pub struct MadtNmi {
+    /// ACPI processor id (0xFF = all processors); 0xFFFF_FFFF for an I/O APIC NMI source.
+    pub cpu: u32,
+    pub flags: u16,
+    pub lint: u8,
+    pub gsi: u32,
+}
+
+pub struct Madt {
+    pub lapic_addr: u64,
+    /// Bit 0: the machine also has dual 8259 PICs.
+    pub flags: u32,
+    pub cpu_count: u32,
+    pub boot_apic_id: u8,
+    pub ioapic_count: usize,
+    pub ioapics: [MadtIoApic; MADT_MAX_IOAPICS],
+    pub override_count: usize,
+    pub overrides: [MadtOverride; MADT_MAX_OVERRIDES],
+    pub nmi_count: usize,
+    pub nmis: [MadtNmi; MADT_MAX_NMIS],
+}
+
+static mut MADT: Madt = Madt {
+    lapic_addr: 0,
+    flags: 0,
+    cpu_count: 0,
+    boot_apic_id: 0,
+    ioapic_count: 0,
+    ioapics: [MadtIoApic { id: 0, addr: 0, gsi_base: 0 }; MADT_MAX_IOAPICS],
+    override_count: 0,
+    overrides: [MadtOverride { bus: 0, source: 0, gsi: 0, flags: 0 }; MADT_MAX_OVERRIDES],
+    nmi_count: 0,
+    nmis: [MadtNmi { cpu: 0, flags: 0, lint: 0, gsi: 0 }; MADT_MAX_NMIS],
+};
+static mut MADT_VALID: bool = false;
+
+/// The parsed MADT, if the firmware has one.
+pub fn madt() -> Option<&'static Madt> {
+    unsafe {
+        if MADT_VALID { Some(&*core::ptr::addr_of!(MADT)) } else { None }
+    }
+}
+
+/// Find an ACPI table by signature in the RSDT/XSDT (after `init`).
+pub fn find_table(signature: &[u8; 4]) -> Option<*const u8> {
+    let (root, xsdt) = unsafe { (ROOT_PHYS, ROOT_XSDT) };
+    if root == 0 {
+        return None;
+    }
+    if xsdt { find_table_xsdt(root, signature) } else { find_table_rsdt(root, signature) }
+}
+
+fn rd8(p: *const u8, off: usize) -> u8 {
+    unsafe { core::ptr::read_unaligned(p.add(off)) }
+}
+fn rd16(p: *const u8, off: usize) -> u16 {
+    unsafe { core::ptr::read_unaligned(p.add(off) as *const u16) }
+}
+fn rd32(p: *const u8, off: usize) -> u32 {
+    unsafe { core::ptr::read_unaligned(p.add(off) as *const u32) }
+}
+fn rd64(p: *const u8, off: usize) -> u64 {
+    unsafe { core::ptr::read_unaligned(p.add(off) as *const u64) }
+}
+
+fn parse_madt() {
+    let t = match find_table(b"APIC") {
+        Some(t) => t,
+        None => {
+            serial::write_str("[ACPI] No MADT: interrupt routing falls back to the 8259 PIC\r\n");
+            return;
+        }
+    };
+    let len = rd32(t, 4) as usize;
+    if len < 44 || len > 0x10000 {
+        serial::write_str("[ACPI] MADT has a bad length\r\n");
+        return;
+    }
+    // SAFETY: single-threaded boot code; MADT is written only here.
+    let m = unsafe { &mut *core::ptr::addr_of_mut!(MADT) };
+    m.lapic_addr = rd32(t, 36) as u64;
+    m.flags = rd32(t, 40);
+    let mut off = 44usize;
+    while off + 2 <= len {
+        let ty = rd8(t, off);
+        let el = rd8(t, off + 1) as usize;
+        if el < 2 || off + el > len {
+            break;
+        }
+        match ty {
+            0 if el >= 8 => {
+                // Processor local APIC: bit 0 enabled, bit 1 online-capable
+                let flags = rd32(t, off + 4);
+                if flags & 3 != 0 {
+                    if m.cpu_count == 0 {
+                        m.boot_apic_id = rd8(t, off + 3);
+                    }
+                    m.cpu_count += 1;
+                }
+            }
+            1 if el >= 12 => {
+                if m.ioapic_count < MADT_MAX_IOAPICS {
+                    m.ioapics[m.ioapic_count] = MadtIoApic {
+                        id: rd8(t, off + 2),
+                        addr: rd32(t, off + 4),
+                        gsi_base: rd32(t, off + 8),
+                    };
+                    m.ioapic_count += 1;
+                }
+            }
+            2 if el >= 10 => {
+                if m.override_count < MADT_MAX_OVERRIDES {
+                    m.overrides[m.override_count] = MadtOverride {
+                        bus: rd8(t, off + 2),
+                        source: rd8(t, off + 3),
+                        gsi: rd32(t, off + 4),
+                        flags: rd16(t, off + 8),
+                    };
+                    m.override_count += 1;
+                }
+            }
+            3 if el >= 8 => {
+                if m.nmi_count < MADT_MAX_NMIS {
+                    m.nmis[m.nmi_count] = MadtNmi {
+                        cpu: 0xFFFF_FFFF,
+                        flags: rd16(t, off + 2),
+                        lint: 0xFF,
+                        gsi: rd32(t, off + 4),
+                    };
+                    m.nmi_count += 1;
+                }
+            }
+            4 if el >= 6 => {
+                if m.nmi_count < MADT_MAX_NMIS {
+                    m.nmis[m.nmi_count] = MadtNmi {
+                        cpu: rd8(t, off + 2) as u32,
+                        flags: rd16(t, off + 3),
+                        lint: rd8(t, off + 5),
+                        gsi: 0,
+                    };
+                    m.nmi_count += 1;
+                }
+            }
+            5 if el >= 12 => {
+                m.lapic_addr = rd64(t, off + 4);
+            }
+            9 if el >= 16 => {
+                // Processor local x2APIC
+                let flags = rd32(t, off + 8);
+                if flags & 3 != 0 {
+                    m.cpu_count += 1;
+                }
+            }
+            _ => {}
+        }
+        off += el;
+    }
+    unsafe { MADT_VALID = true; }
+
+    serial::write_str("[ACPI] MADT: ");
+    serial_dec(m.cpu_count as u64);
+    serial::write_str(" CPU(s), ");
+    serial_dec(m.ioapic_count as u64);
+    serial::write_str(" I/O APIC(s), ");
+    serial_dec(m.override_count as u64);
+    serial::write_str(" override(s), ");
+    serial_dec(m.nmi_count as u64);
+    serial::write_str(" NMI(s), LAPIC at 0x");
+    serial_hex(m.lapic_addr);
+    serial::write_str(if m.flags & 1 != 0 { ", PCAT_COMPAT\r\n" } else { "\r\n" });
+    for i in 0..m.ioapic_count {
+        serial::write_str("[ACPI]   IOAPIC id=");
+        serial_dec(m.ioapics[i].id as u64);
+        serial::write_str(" addr=0x");
+        serial_hex(m.ioapics[i].addr as u64);
+        serial::write_str(" gsi_base=");
+        serial_dec(m.ioapics[i].gsi_base as u64);
+        serial::write_str("\r\n");
+    }
+    for i in 0..m.override_count {
+        let o = m.overrides[i];
+        serial::write_str("[ACPI]   override bus=");
+        serial_dec(o.bus as u64);
+        serial::write_str(" irq=");
+        serial_dec(o.source as u64);
+        serial::write_str(" -> gsi=");
+        serial_dec(o.gsi as u64);
+        serial::write_str(" flags=0x");
+        serial_hex(o.flags as u64);
+        serial::write_str("\r\n");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PCI interrupt routing table (_PRT), static part only
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// There is no AML interpreter. This scans the DSDT for a `Name (PRTA|_PRT, Package ...)` whose
+// entries are {address, pin, 0, GSI} constants (the form QEMU uses for APIC mode). Entries
+// that name a link device (PRTP form) or come from a Method are skipped, so on most real
+// machines the table is empty and INTx falls back to the interrupt line register.
+
+#[derive(Clone, Copy)]
+struct PrtEntry {
+    slot: u8,
+    /// 0-3 = INTA-INTD
+    pin: u8,
+    gsi: u32,
+    /// bit 0: edge, bit 1: active low (default 2 = level, active low)
+    flags: u8,
+}
+const PRT_MAX: usize = 160;
+static mut PRT: [PrtEntry; PRT_MAX] = [PrtEntry { slot: 0, pin: 0, gsi: 0, flags: 2 }; PRT_MAX];
+static mut PRT_N: usize = 0;
+
+/// GSI for INTx pin `pin` (0 = INTA) of device `slot` on PCI bus 0, if the DSDT has a static entry.
+pub fn prt_lookup(slot: u8, pin: u8) -> Option<(u32, u8)> {
+    unsafe {
+        let p = core::slice::from_raw_parts(core::ptr::addr_of!(PRT) as *const PrtEntry, PRT_N);
+        p.iter().find(|e| e.slot == slot && e.pin == pin).map(|e| (e.gsi, e.flags))
+    }
+}
+
+/// AML integer constant at `off`: (value, next offset).
+fn aml_int(a: &[u8], off: usize) -> Option<(u64, usize)> {
+    let b = *a.get(off)?;
+    match b {
+        0x00 => Some((0, off + 1)),
+        0x01 => Some((1, off + 1)),
+        0xFF => Some((u64::MAX, off + 1)),
+        0x0A => Some((*a.get(off + 1)? as u64, off + 2)),
+        0x0B => Some((u16::from_le_bytes([*a.get(off + 1)?, *a.get(off + 2)?]) as u64, off + 3)),
+        0x0C => {
+            let s = a.get(off + 1..off + 5)?;
+            Some((u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64, off + 5))
+        }
+        _ => None,
+    }
+}
+
+/// Skip a NameString at `off`; returns the next offset.
+fn aml_skip_name(a: &[u8], mut off: usize) -> Option<usize> {
+    while matches!(a.get(off), Some(0x5C) | Some(0x5E)) { off += 1; }
+    match *a.get(off)? {
+        0x00 => Some(off + 1),
+        0x2E => Some(off + 9),
+        0x2F => Some(off + 2 + 4 * (*a.get(off + 1)? as usize)),
+        _ => Some(off + 4),
+    }
+}
+
+/// GSI of a link device `Device (name)` whose body holds a single extended interrupt
+/// descriptor (tag 0x89, one interrupt), as in QEMU's GSIA-GSIH.
+fn link_device_gsi(a: &[u8], name: [u8; 4]) -> Option<(u32, u8)> {
+    let mut i = 36;
+    while i + 8 < a.len() {
+        // ExtOpPrefix DeviceOp PkgLength NameSeg
+        if a[i] == 0x5B && a[i + 1] == 0x82 {
+            let (p, plen) = parse_pkg_length(a, i + 2);
+            if a.get(p..p + 4) == Some(&name[..]) {
+                let end = (i + 2 + plen).min(a.len());
+                let mut k = p + 4;
+                while k + 9 <= end {
+                    if a[k] == 0x89 && a[k + 1] == 6 && a[k + 2] == 0 && a[k + 4] == 1 {
+                        return Some((u32::from_le_bytes([a[k + 5], a[k + 6], a[k + 7], a[k + 8]]), a[k + 3]));
+                    }
+                    k += 1;
+                }
+                return None;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_prt(dsdt: *const u8) {
+    let len = rd32(dsdt, 4) as usize;
+    if len < 44 || len > 0x100000 { return; }
+    let a = unsafe { core::slice::from_raw_parts(dsdt, len) };
+    let mut i = 36;
+    let mut found = false;
+    while i + 6 < a.len() && !found {
+        // NameOp "PRTA" | "_PRT" PackageOp|VarPackageOp
+        if a[i] == 0x08 && (&a[i + 1..i + 5] == b"PRTA" || &a[i + 1..i + 5] == b"_PRT")
+            && (a[i + 5] == 0x12 || a[i + 5] == 0x13)
+        {
+            let var = a[i + 5] == 0x13;
+            let (mut p, plen) = parse_pkg_length(a, i + 6);
+            let end = (i + 6 + plen).min(a.len());
+            if var {
+                match aml_int(a, p) { Some((_, n)) => p = n, None => { i += 1; continue; } }
+            } else {
+                p += 1; // NumElements
+            }
+            let mut n = 0;
+            while p < end && a[p] == 0x12 {
+                let (q, elen) = parse_pkg_length(a, p + 1);
+                let eend = (p + 1 + elen).min(end);
+                let mut q = q + 1; // NumElements
+                let addr = aml_int(a, q).map(|(v, n)| { q = n; v });
+                let pin = aml_int(a, q).map(|(v, n)| { q = n; v });
+                // Source: 0 = the next field is the GSI; a NameSeg = link device (QEMU: GSIA-GSIH)
+                // whose _PRS holds one extended interrupt descriptor.
+                let mut gsi: Option<u64> = None;
+                let mut lflags: u8 = 2;
+                let mut src_ok = false;
+                match a.get(q) {
+                    Some(&0x00) => {
+                        q += 1;
+                        gsi = aml_int(a, q).map(|(v, _)| v);
+                        src_ok = true;
+                    }
+                    Some(&c) if c == b'_' || c.is_ascii_uppercase() => {
+                        if let Some(seg) = a.get(q..q + 4) {
+                            let r = link_device_gsi(a, [seg[0], seg[1], seg[2], seg[3]]);
+                            gsi = r.map(|g| g.0 as u64);
+                            if let Some(g) = r { lflags = ((g.1 >> 1) & 1) | (((g.1 >> 2) & 1) << 1); }
+                            src_ok = gsi.is_some();
+                        }
+                    }
+                    _ => {}
+                }
+                if let (Some(addr), Some(pin), true, Some(gsi)) = (addr, pin, src_ok, gsi) {
+                    unsafe {
+                        if PRT_N < PRT_MAX && pin < 4 && addr & 0xFFFF == 0xFFFF {
+                            PRT[PRT_N] = PrtEntry { slot: (addr >> 16) as u8, pin: pin as u8, gsi: gsi as u32, flags: lflags };
+                            PRT_N += 1;
+                            n += 1;
+                        }
+                    }
+                }
+                if eend <= p { break; }
+                p = eend;
+            }
+            if n > 0 { found = true; }
+        }
+        i += 1;
+    }
+    unsafe {
+        serial::write_str("[ACPI] _PRT: ");
+        serial_dec(PRT_N as u64);
+        serial::write_str(" static GSI entries from the DSDT\r\n");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

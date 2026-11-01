@@ -1,0 +1,10 @@
+[package]
+name = "devmgr"
+description = "Device manager: matches PCI functions to installed driver packages and runs the drivers in ring 3 (also installed as devctl)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }
+libdriver = { path = "../libdriver" }

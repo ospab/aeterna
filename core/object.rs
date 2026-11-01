@@ -88,6 +88,8 @@ pub mod prot {
 pub mod resource {
     /// May create physically contiguous regions with a known physical address.
     pub const DMA: u32 = 1;
+    /// May list PCI functions and claim one (the device manager).
+    pub const PCI: u32 = 2;
 }
 
 /// Largest anonymous region (`mem_create`).
@@ -119,6 +121,8 @@ pub enum ObjType {
     Interrupt = 8,
     IoPortRange = 9,
     Resource = 10,
+    /// One claimed PCI function (core/pcidev.rs).
+    PciDevice = 11,
 }
 
 /// A message as user space sees it (same layout in liboos). 160 bytes.
@@ -205,6 +209,8 @@ enum Backing {
 struct MemRegion {
     pages: u64,
     backing: Backing,
+    /// Map with caching disabled (DMA buffers a driver wants uncached).
+    uncached: bool,
 }
 
 impl MemRegion {
@@ -224,7 +230,21 @@ struct Interrupt {
     count: u64,
 }
 
+/// An MSI/MSI-X vector owned by a ring-3 driver (shows up as an Interrupt object).
+/// Not masked on delivery: the notification bits just accumulate.
+struct MsiIrq {
+    vector: u8,
+    target: Option<(ObjId, u32)>,
+    count: u64,
+}
+
+/// Vectors owned by an MsiIrq object (bit n = vector n): lock-free pre-check for the IRQ path.
+static MSI_OWNED: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+/// Vector -> owning object + 1. Only touched under the OBJ lock.
+static mut MSI_OWNER: [u32; 256] = [0; 256];
+
 enum Kind {
+    MsiIrq(MsiIrq),
     Process(u32),
     Thread(u32),
     Channel(Channel),
@@ -234,6 +254,8 @@ enum Kind {
     Interrupt(Interrupt),
     IoPorts { base: u16, count: u32 },
     Resource(u32),
+    /// A claimed PCI function (bus/device/function packed as in pcidev::bdf_of).
+    PciDev(u16),
 }
 
 struct Object {
@@ -305,9 +327,10 @@ fn obj_type(o: &Object) -> ObjType {
         Kind::Reply(_) => ObjType::Reply,
         Kind::Memory(MemRegion { backing: Backing::Device(_), .. }) => ObjType::MmioRegion,
         Kind::Memory(_) => ObjType::MemoryRegion,
-        Kind::Interrupt(_) => ObjType::Interrupt,
+        Kind::Interrupt(_) | Kind::MsiIrq(_) => ObjType::Interrupt,
         Kind::IoPorts { .. } => ObjType::IoPortRange,
         Kind::Resource(_) => ObjType::Resource,
+        Kind::PciDev(_) => ObjType::PciDevice,
     }
 }
 
@@ -396,6 +419,16 @@ fn take_object(id: ObjId, work: &mut Vec<(ObjId, u32)>) {
             Backing::Contig(base) => crate::mm::physical::free_frames(base, m.pages),
             Backing::Device(_) => {}
         },
+        Kind::PciDev(bdf) => crate::core::pcidev::user_released(bdf),
+        Kind::MsiIrq(m) => {
+            // SAFETY: OBJ lock held.
+            unsafe { (*core::ptr::addr_of_mut!(MSI_OWNER))[m.vector as usize] = 0 };
+            MSI_OWNED[(m.vector >> 6) as usize].fetch_and(!(1u64 << (m.vector & 63)), Ordering::Relaxed);
+            crate::arch::x86_64::irq::free_msi_vector(m.vector);
+            if let Some((n, _)) = m.target {
+                work.push((n, 0));
+            }
+        }
         Kind::Interrupt(i) => {
             crate::arch::x86_64::pic::disable_irq(i.line);
             set_irq_owner(i.line, 0);
@@ -945,7 +978,7 @@ fn new_anon_region(pages: u64) -> Res<ObjId> {
         return Err(E::OutOfMemory as i64);
     }
     // Create the object first, then fill it: on failure free_object returns every frame.
-    let id = new_object(Kind::Memory(MemRegion { pages: 0, backing: Backing::Pages(frames) }))?;
+    let id = new_object(Kind::Memory(MemRegion { pages: 0, backing: Backing::Pages(frames), uncached: false }))?;
     for _ in 0..pages {
         let f = match crate::mm::physical::alloc_frame() {
             Some(f) => f,
@@ -954,7 +987,7 @@ fn new_anon_region(pages: u64) -> Res<ObjId> {
                 return Err(E::OutOfMemory as i64);
             }
         };
-        if let Kind::Memory(MemRegion { pages: n, backing: Backing::Pages(v) }) = &mut obj(id).kind {
+        if let Kind::Memory(MemRegion { pages: n, backing: Backing::Pages(v), .. }) = &mut obj(id).kind {
             v.push(f); // capacity reserved above
             *n += 1;
         }
@@ -972,15 +1005,22 @@ pub fn mem_create(size: u64) -> Res<Handle> {
 
 /// mem_create_contig(resource, size): physically contiguous region for DMA. Needs a
 /// Resource handle of kind DMA with WRITE; the new handle also carries PHYS.
-pub fn mem_create_contig(res: Handle, size: u64) -> Res<Handle> {
+pub fn mem_create_contig(res: Handle, size: u64, flags: u64) -> Res<Handle> {
     let _g = OBJ.lock();
-    let (rid, _) = lookup(res, ObjType::Resource, WRITE)?;
-    if !matches!(obj(rid).kind, Kind::Resource(k) if k & resource::DMA != 0) {
+    // The authority is a DMA Resource, or a claimed PciDevice with WRITE (its own DMA).
+    let e = cur_table().get(res)?;
+    let ok = match obj(e.obj).kind {
+        Kind::Resource(k) => k & resource::DMA != 0,
+        Kind::PciDev(_) => true,
+        _ => return Err(E::WrongType as i64),
+    };
+    if !ok || e.rights & WRITE == 0 {
         return Err(E::PermissionDenied as i64);
     }
     let pages = pages_for(size, MEM_CONTIG_MAX_BYTES)?;
     let base = crate::mm::physical::alloc_frames(pages).ok_or(E::OutOfMemory as i64)?;
-    let id = match new_object(Kind::Memory(MemRegion { pages, backing: Backing::Contig(base) })) {
+    let uncached = flags & 1 != 0;
+    let id = match new_object(Kind::Memory(MemRegion { pages, backing: Backing::Contig(base), uncached })) {
         Ok(id) => id,
         Err(e) => {
             crate::mm::physical::free_frames(base, pages);
@@ -1051,7 +1091,8 @@ pub fn mem_map(h: Handle, _hint: u64, p: u32) -> Res<u64> {
     let m = mem_of(id);
     let pages = m.pages;
     let device = matches!(m.backing, Backing::Device(_));
-    let va = scheduler::reserve_user_range(pages).ok_or(E::OutOfMemory as i64)?;
+    let uncached = device || m.uncached;
+    let va =scheduler::reserve_user_range(pages).ok_or(E::OutOfMemory as i64)?;
     cur_table().maps.try_reserve(1).map_err(|_| E::OutOfMemory as i64)?;
 
     // Not FLAG_OWNED: the frames belong to the object, not to the address space.
@@ -1062,7 +1103,7 @@ pub fn mem_map(h: Handle, _hint: u64, p: u32) -> Res<u64> {
     if p & prot::EXEC == 0 {
         flags |= vmm::nx_flag();
     }
-    if device {
+    if uncached {
         flags |= vmm::FLAG_PCD | vmm::FLAG_PWT;
     }
     for i in 0..pages {
@@ -1119,6 +1160,7 @@ pub fn irq_bind(irq: Handle, notif: Handle, bits: u32) -> Res<()> {
     ref_add(nid, 0);
     let old = match &mut obj(iid).kind {
         Kind::Interrupt(i) => i.target.replace((nid, bits)),
+        Kind::MsiIrq(m) => m.target.replace((nid, bits)),
         _ => unreachable!(),
     };
     if let Some((o, _)) = old {
@@ -1132,7 +1174,7 @@ pub fn irq_ack(irq: Handle) -> Res<()> {
     let _g = OBJ.lock();
     let (iid, _) = lookup(irq, ObjType::Interrupt, WRITE)?;
     if let Kind::Interrupt(i) = &obj(iid).kind {
-        crate::arch::x86_64::pic::enable_irq(i.line);
+        crate::arch::x86_64::pic::enable_irq_level(i.line);
     }
     Ok(())
 }
@@ -1161,6 +1203,86 @@ pub fn irq_fire(line: u8) -> bool {
         signal_obj(n, bits);
     }
     true
+}
+
+/// Registry handler for the vectors of MsiIrq objects: signal the bound notification.
+fn msi_fire(vector: u8, _ctx: usize) {
+    if MSI_OWNED[(vector >> 6) as usize].load(Ordering::Relaxed) & (1u64 << (vector & 63)) == 0 {
+        return;
+    }
+    let _g = OBJ.lock();
+    // SAFETY: OBJ lock held.
+    let owner = unsafe { (*core::ptr::addr_of!(MSI_OWNER))[vector as usize] };
+    if owner == 0 {
+        return;
+    }
+    let target = match &mut obj(owner - 1).kind {
+        Kind::MsiIrq(m) => {
+            m.count += 1;
+            m.target
+        }
+        _ => None,
+    };
+    if let Some((n, bits)) = target {
+        signal_obj(n, bits);
+    }
+}
+
+/// irq_alloc_msi(dev, count, out): allocate `count` MSI/MSI-X vectors for the claimed PCI
+/// function behind the PciDevice handle `dev` (needs WRITE) and return one Interrupt
+/// handle per vector, in vector order. Fails with Busy if the function already has MSI
+/// enabled (a kernel driver owns it) and NotSupported if it has neither MSI nor MSI-X.
+pub fn irq_alloc_msi(dev: Handle, count: u32) -> Res<alloc::vec::Vec<Handle>> {
+    if count == 0 || count > 8 {
+        return Err(E::InvalidArgument as i64);
+    }
+    let _g = OBJ.lock();
+    let (id, _) = lookup(dev, ObjType::PciDevice, WRITE)?;
+    let bdf = match obj(id).kind {
+        Kind::PciDev(b) => b,
+        _ => unreachable!(),
+    };
+    let (bus, d, f) = ((bdf >> 8) as u8, ((bdf >> 3) & 31) as u8, (bdf & 7) as u8);
+    let (has_x, has_m, enabled) = crate::arch::x86_64::irq::msi_state(bus, d, f);
+    if !has_x && !has_m {
+        return Err(E::NotSupported as i64);
+    }
+    if enabled {
+        return Err(E::Busy as i64);
+    }
+    let a = crate::arch::x86_64::irq::alloc_msi(bus, d, f, count as u8).ok_or(E::OutOfMemory as i64)?;
+    let mut hs = alloc::vec::Vec::new();
+    for i in 0..count as u8 {
+        let vector = a.vector + i;
+        let made = new_object(Kind::MsiIrq(MsiIrq { vector, target: None, count: 0 }))
+            .and_then(|oid| install_current(oid, READ | WRITE | DUP | TRANSFER).map(|h| (oid, h)));
+        match made {
+            Ok((oid, h)) => {
+                // SAFETY: OBJ lock held.
+                unsafe { (*core::ptr::addr_of_mut!(MSI_OWNER))[vector as usize] = oid + 1 };
+                MSI_OWNED[(vector >> 6) as usize].fetch_or(1u64 << (vector & 63), Ordering::Relaxed);
+                crate::arch::x86_64::irq::register(vector, "ring-3 driver", msi_fire, 0);
+                hs.push(h);
+            }
+            Err(e) => {
+                // Close the handles made so far (their drop frees those vectors), free the rest.
+                for h in hs {
+                    if let Ok(e) = cur_table().take(h) {
+                        unref(e.obj, e.rights);
+                    }
+                }
+                for j in i..a.count {
+                    crate::arch::x86_64::irq::free_msi_vector(a.vector + j);
+                }
+                return Err(e);
+            }
+        }
+    }
+    // MSI blocks are rounded up to a power of two: give back the unused tail.
+    for j in count as u8..a.count {
+        crate::arch::x86_64::irq::free_msi_vector(a.vector + j);
+    }
+    Ok(hs)
 }
 
 // ─── I/O ports ───────────────────────────────────────────────────────────────────────
@@ -1338,7 +1460,7 @@ pub fn kernel_new_mmio(phys: u64, size: u64) -> Option<ObjId> {
         return None;
     }
     locked(|| {
-        new_object(Kind::Memory(MemRegion { pages, backing: Backing::Device(phys) })).ok()
+        new_object(Kind::Memory(MemRegion { pages, backing: Backing::Device(phys), uncached: false })).ok()
     })
 }
 
@@ -1353,7 +1475,7 @@ pub fn kernel_new_interrupt(line: u8) -> Option<ObjId> {
             return None;
         }
         let id = new_object(Kind::Interrupt(Interrupt { line, target: None, count: 0 })).ok()?;
-        crate::arch::x86_64::pic::disable_irq(line);
+        crate::arch::x86_64::pic::mask_irq_level(line);
         set_irq_owner(line, id + 1);
         Some(id)
     })
@@ -1410,4 +1532,133 @@ pub fn kernel_release(id: ObjId) {
 
 fn exists(id: ObjId) -> bool {
     objects().get(id as usize).map_or(false, |o| o.is_some())
+}
+
+// ─── PCI devices (core/pcidev.rs) ────────────────────────────────────────────────────
+
+/// The caller holds a Resource of kind PCI with the rights `need`.
+pub fn pci_resource_check(res: Handle, need: u32) -> Res<()> {
+    let _g = OBJ.lock();
+    let (rid, _) = lookup(res, ObjType::Resource, need)?;
+    if !matches!(obj(rid).kind, Kind::Resource(k) if k & resource::PCI != 0) {
+        return Err(E::PermissionDenied as i64);
+    }
+    Ok(())
+}
+
+/// A PciDevice object for a function already claimed in the claim table.
+pub fn pci_dev_install(bdf: u16) -> Res<Handle> {
+    let _g = OBJ.lock();
+    let id = new_object(Kind::PciDev(bdf))?;
+    install_current(id, READ | WRITE | DUP | TRANSFER)
+}
+
+/// The function behind a PciDevice handle that has the rights `need`.
+pub fn pci_dev_bdf(h: Handle, need: u32) -> Res<u16> {
+    let _g = OBJ.lock();
+    let (id, _) = lookup(h, ObjType::PciDevice, need)?;
+    match obj(id).kind {
+        Kind::PciDev(b) => Ok(b),
+        _ => unreachable!(),
+    }
+}
+
+/// A device memory range derived from a PciDevice handle (needs WRITE on it).
+pub fn pci_make_mmio(dev: Handle, phys: u64, size: u64) -> Res<Handle> {
+    let _g = OBJ.lock();
+    lookup(dev, ObjType::PciDevice, WRITE)?;
+    if phys % PAGE != 0 || size == 0 {
+        return Err(E::NotSupported as i64);
+    }
+    let size = (size + PAGE - 1) & !(PAGE - 1);
+    let in_ram = crate::mm::physical::get_usable_regions()
+        .iter()
+        .any(|r| phys < r.base + r.length && r.base < phys + size);
+    if in_ram {
+        return Err(E::PermissionDenied as i64);
+    }
+    let id = new_object(Kind::Memory(MemRegion { pages: size / PAGE, backing: Backing::Device(phys), uncached: false }))?;
+    install_current(id, READ | WRITE | MAP | DUP | TRANSFER)
+}
+
+pub fn pci_make_ioports(dev: Handle, base: u16, count: u32) -> Res<Handle> {
+    let _g = OBJ.lock();
+    lookup(dev, ObjType::PciDevice, WRITE)?;
+    if count == 0 || base as u32 + count > 0x1_0000 {
+        return Err(E::InvalidArgument as i64);
+    }
+    let id = new_object(Kind::IoPorts { base, count })?;
+    install_current(id, READ | WRITE | DUP | TRANSFER)
+}
+
+/// An Interrupt object for the legacy line `line` of the function behind `dev`.
+pub fn pci_make_interrupt(dev: Handle, line: u8) -> Res<Handle> {
+    let _g = OBJ.lock();
+    lookup(dev, ObjType::PciDevice, WRITE)?;
+    if line >= 16 || crate::acpi::is_sci_irq(line) {
+        return Err(E::NotSupported as i64);
+    }
+    if irq_owner()[line as usize] != 0 {
+        return Err(E::Busy as i64);
+    }
+    let id = new_object(Kind::Interrupt(Interrupt { line, target: None, count: 0 }))?;
+    crate::arch::x86_64::pic::mask_irq_level(line);
+    set_irq_owner(line, id + 1);
+    install_current(id, READ | WRITE | DUP | TRANSFER)
+}
+
+/// Resolve the caller's handles (each needs TRANSFER) to (object, rights) pairs so a new
+/// process can start with copies of them (`proc_spawn`).
+pub fn handles_to_objects(hs: &[u32]) -> Res<alloc::vec::Vec<(ObjId, u32)>> {
+    let _g = OBJ.lock();
+    let mut v = alloc::vec::Vec::new();
+    for &h in hs {
+        let e = cur_table().get(h)?;
+        if e.rights & TRANSFER == 0 {
+            return Err(E::PermissionDenied as i64);
+        }
+        v.push((e.obj, e.rights));
+    }
+    Ok(v)
+}
+
+/// OR `bits` into a notification from kernel code (task context, no other lock held
+/// with a rank above OBJ).
+pub fn kernel_signal(id: ObjId, bits: u32) {
+    locked(|| {
+        if exists(id) {
+            signal_obj(id, bits)
+        }
+    });
+}
+
+/// Objects an external NIC driver handed to the kernel (see net/ext.rs). Each holds a
+/// reference until `ext_drop`.
+pub struct ExtGrab {
+    pub notif: ObjId,
+    pub region: ObjId,
+    pub phys: u64,
+    pub size: u64,
+}
+
+pub fn ext_grab(dev: Handle, notif: Handle, region: Handle) -> Res<ExtGrab> {
+    let _g = OBJ.lock();
+    lookup(dev, ObjType::PciDevice, WRITE)?;
+    let (nid, _) = lookup(notif, ObjType::Notification, WRITE)?;
+    let e = cur_table().get(region)?;
+    let (phys, pages) = match &obj(e.obj).kind {
+        Kind::Memory(MemRegion { backing: Backing::Contig(b), pages, .. }) => (*b, *pages),
+        Kind::Memory(_) => return Err(E::NotSupported as i64),
+        _ => return Err(E::WrongType as i64),
+    };
+    ref_add(nid, 0);
+    ref_add(e.obj, 0);
+    Ok(ExtGrab { notif: nid, region: e.obj, phys, size: pages * PAGE })
+}
+
+pub fn ext_drop(g: &ExtGrab) {
+    locked(|| {
+        unref(g.notif, 0);
+        unref(g.region, 0);
+    });
 }

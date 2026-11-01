@@ -17,6 +17,7 @@ instruction to jump to our handler entry point.
 extern crate alloc;
 
 pub mod audio;
+pub mod drv;
 pub mod objects;
 pub mod screen;
 
@@ -207,13 +208,25 @@ static DISPATCH_TABLE: &[(u64, SyscallFn)] = &[
     (240, |a| objects::mem_create(a.arg1)),
     (241, |a| objects::mem_map(a.arg1, a.arg2, a.arg3)),
     (242, |a| objects::mem_unmap(a.arg1)),
-    (243, |a| objects::mem_create_contig(a.arg1, a.arg2)),
+    (243, |a| objects::mem_create_contig(a.arg1, a.arg2, a.arg3)),
     (244, |a| objects::mem_phys(a.arg1)),
     (245, |a| objects::mem_size(a.arg1)),
     (250, |a| objects::irq_bind(a.arg1, a.arg2, a.arg3)),
     (251, |a| objects::irq_ack(a.arg1)),
     (252, |a| objects::ioport_enable(a.arg1)),
     (253, |a| objects::ioport_disable(a.arg1)),
+    (254, |a| objects::irq_alloc_msi(a.arg1, a.arg2, a.arg3)),
+    // Drivers in ring 3 (docs/en/syscall-abi.md)
+    (290, |a| drv::pci_enum(a.arg1, a.arg2, a.arg3)),
+    (291, |a| drv::pci_claim(a.arg1, a.arg2, a.arg3)),
+    (292, |a| drv::pci_open(a.arg1, a.arg2, a.arg3)),
+    (293, |a| drv::pci_cfg_read(a.arg1, a.arg2, a.arg3)),
+    (294, |a| drv::pci_cfg_write(a.arg1, a.arg2, a.arg3, a.arg4)),
+    (295, |a| drv::pci_info(a.arg1, a.arg2)),
+    (296, |a| drv::proc_spawn(a.arg1)),
+    (297, |a| drv::fs_readdir(a.arg1, a.arg2, a.arg3, a.arg4)),
+    (298, |a| drv::klog_write(a.arg1, a.arg2, a.arg3)),
+    (299, |a| drv::netdrv_ctl(a.arg1, a.arg2, a.arg3, a.arg4)),
 ];
 
 /// Dispatch a syscall by looking up the number in the dispatch table

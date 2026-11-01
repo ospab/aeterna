@@ -214,14 +214,13 @@ pub fn probe_and_init() -> bool {
         // Clear IDON, start, enable interrupts
         csr_write(io, 0, CSR0_IDON | CSR0_STRT | CSR0_IENA);
 
-        let irq = crate::pci::interrupt_line(bus, dev, func);
-        if irq != 0 && irq < 16 { crate::arch::x86_64::pic::enable_irq(irq); }
+        crate::arch::x86_64::irq::setup_device_intx(bus, dev, func, "pcnet", crate::arch::x86_64::idt::net_irq_handler);
 
         let csr0 = csr_read(io, 0);
         s("[PCnet] I/O 0x");
         super::serial_hex16(io);
         s(", IRQ ");
-        super::serial_dec(irq as u64);
+        super::serial_dec(crate::pci::interrupt_line(bus, dev, func) as u64);
         s(", CSR0=0x");
         super::serial_hex16(csr0 as u16);
         s(if csr0 & (CSR0_RXON | CSR0_TXON) == (CSR0_RXON | CSR0_TXON) { " (RX/TX on)\r\n" } else { " (RX/TX NOT running)\r\n" });

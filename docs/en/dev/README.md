@@ -10,6 +10,7 @@ shell command, or a change in the kernel. It is written for someone who has used
 | [liboos reference](liboos.md) | Every public function of the ring 3 runtime, with examples. |
 | [Writing a game](games.md) | Screen, raw keyboard, sound, frame pacing, heap size. |
 | [Kernel hacking](kernel-hacking.md) | Code map; adding a shell command, a system call or a driver. |
+| [Drivers in ring 3](drivers.md) | Driver packages, `devmgr`, `libdriver`, writing a driver (e1000 example). |
 | [Testing](testing.md) | Build commands, the smoke test, QEMU command lines, host tests, tools. |
 | [Contributing](../../../CONTRIBUTIONS.md) | Workflow, commit style, license, bug reports, rules for AI agents. |
 
@@ -22,7 +23,8 @@ shell command, or a change in the kernel. It is written for someone who has used
 | GUI application | `apps/<name>/` against `gui/` (`oos-ui`) | desktop in the kernel; ring 3 build only paints into memory | Partly. See [GUI applications](../gui-apps.md). |
 | Shell script | any file on `$PATH`, or `bash file.sh` | the shell (ring 0) | Works. See [Shell](../shell.md). |
 | Shell command | `src/userspace/axon/`, `src/userspace/plum/`, `src/terminal.rs` | ring 0 | Works. Needs a rebuild of the kernel. |
-| Driver | `drivers/`, `net/`, `src/xhci/` | ring 0 | Works. Needs a rebuild of the kernel. |
+| Driver (package) | `apps/drivers/<name>/` | ring 3 | Works for PCI devices; `drv-e1000` is the example. No kernel rebuild. See [Drivers in ring 3](drivers.md). |
+| Driver (in the kernel) | `drivers/`, `net/`, `src/xhci/` | ring 0 | Works. Needs a rebuild of the kernel. |
 | Kernel subsystem | `core/`, `mm/`, `vfs/`, `arch/`, `fs/aeternafs/` | ring 0 | Works. |
 | Boot loader | `boot/` | firmware, then long mode | Works. See [Boot](../boot.md). |
 | Host tool | `tools/` | your PC | `tmt` (packages) and `oosfs` (AeternaFS images). |

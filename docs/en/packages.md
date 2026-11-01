@@ -32,6 +32,18 @@ A `.tmt` file is a package: a header with name, version, architecture, dependenc
 description, followed by the files with their destination paths and checksums. Build them with
 the host tool `tmt`, or inside the system with `tomato --tmt pack`.
 
+### Driver packages
+
+A package with a `[driver]` table in its manifest is a driver for the device manager. Its files
+are installed under `/usr/lib/drivers/<name>/` and `tmt pack` adds a `driver.conf` there. Old
+packages and old `tomato` are not affected. Format and rules: [Drivers in ring 3](dev/drivers.md).
+
+```toml
+[driver]
+match = ["pci:8086:100e", "pci-class:02:00"]   # vendor:device, or class:subclass (hex)
+exec = "/usr/lib/drivers/e1000/drv-e1000"      # optional, default: the first file
+```
+
 ## Updating the system
 
 The package `ospab-base` is the system itself: the kernel, the UEFI loader and the BIOS loader.

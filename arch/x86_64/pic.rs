@@ -95,6 +95,10 @@ pub fn init() {
 
 /// Send End-of-Interrupt to the appropriate PIC(s)
 pub fn send_eoi(irq: u8) {
+    if super::irq::ioapic_active() {
+        super::irq::eoi();
+        return;
+    }
     unsafe {
         if irq >= 8 {
             // IRQ came from slave PIC, send EOI to both
@@ -107,6 +111,10 @@ pub fn send_eoi(irq: u8) {
 /// Enable a specific IRQ line.
 /// For slave IRQs (8-15), also ensures the cascade (IRQ2) on the master is enabled.
 pub fn enable_irq(irq: u8) {
+    if super::irq::ioapic_active() {
+        super::irq::legacy_unmask(irq);
+        return;
+    }
     unsafe {
         if irq < 8 {
             let mask = inb(PIC1_DATA);
@@ -126,6 +134,10 @@ pub fn enable_irq(irq: u8) {
 
 /// Disable a specific IRQ line
 pub fn disable_irq(irq: u8) {
+    if super::irq::ioapic_active() {
+        super::irq::legacy_mask(irq);
+        return;
+    }
     unsafe {
         if irq < 8 {
             let mask = inb(PIC1_DATA);
@@ -180,4 +192,25 @@ pub fn init_pit_100hz() {
         outb(0x40, ((DIVISOR >> 8) & 0xFF) as u8);   // divisor high byte
     }
     crate::arch::x86_64::serial::write_str("[PIT] Channel 0 → 100 Hz (divisor=11931)\r\n");
+}
+
+/// Unmask a line owned by a ring-3 driver (level-triggered with the I/O APIC, see
+/// `irq::legacy_unmask_level`); the same as `enable_irq` on the PIC.
+pub fn enable_irq_level(irq: u8) {
+    if super::irq::ioapic_active() {
+        super::irq::legacy_unmask_level(irq);
+    } else {
+        enable_irq(irq);
+    }
+}
+
+/// Mask a line that is about to be owned by a ring-3 driver. With the I/O APIC the pin is
+/// also switched to level mode now, so a device event that arrives while the pin is masked is
+/// still pending when the driver unmasks it (see `irq::legacy_unmask_level`).
+pub fn mask_irq_level(irq: u8) {
+    if super::irq::ioapic_active() {
+        super::irq::legacy_prepare_level(irq);
+    } else {
+        disable_irq(irq);
+    }
 }

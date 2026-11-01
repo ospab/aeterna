@@ -156,6 +156,10 @@ struct Manifest {
     /// loaders), dest is one of esp:kernel, esp:loader, esp:bios.
     kind: String,
     files: Vec<(String, String)>, // (src, dest)
+    /// `[driver]` table: match rules (`pci:VVVV:DDDD`, `pci-class:CC:SS`, hex) and the
+    /// executable (default: the first file). A package with rules is a driver package.
+    driver_match: Vec<String>,
+    driver_exec: String,
 }
 
 const ESP_ROLES: [&str; 3] = ["esp:kernel", "esp:loader", "esp:bios"];
@@ -228,6 +232,7 @@ fn parse_manifest(text: &str) -> Res<Manifest> {
         Ok(())
     };
     let mut in_files = false;
+    let mut in_driver = false;
     for (n, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
         if line.is_empty() {
@@ -238,6 +243,13 @@ fn parse_manifest(text: &str) -> Res<Manifest> {
             flush(&mut cur, &mut m).map_err(ctx)?;
             cur = Some((String::new(), String::new()));
             in_files = true;
+            in_driver = false;
+            continue;
+        }
+        if line == "[driver]" {
+            flush(&mut cur, &mut m).map_err(ctx)?;
+            in_files = false;
+            in_driver = true;
             continue;
         }
         if line.starts_with('[') {
@@ -245,7 +257,13 @@ fn parse_manifest(text: &str) -> Res<Manifest> {
         }
         let (k, v) = line.split_once('=').ok_or_else(|| ctx("expected key = value".into()))?;
         let (k, v) = (k.trim(), v.trim());
-        if in_files {
+        if in_driver {
+            match k {
+                "match" => m.driver_match = parse_str_array(v).map_err(ctx)?,
+                "exec" => m.driver_exec = unquote(v).map_err(ctx)?,
+                _ => return Err(ctx(format!("unknown key `{}` in [driver]", k))),
+            }
+        } else if in_files {
             let c = cur.as_mut().unwrap();
             match k {
                 "src" => c.0 = unquote(v).map_err(ctx)?,
@@ -280,6 +298,17 @@ fn parse_manifest(text: &str) -> Res<Manifest> {
         m.arch = "x86_64".into();
     }
     Ok(m)
+}
+
+/// `pci:VVVV:DDDD` or `pci-class:CC:SS`, hex fields.
+fn valid_driver_match(r: &str) -> bool {
+    let p: Vec<&str> = r.split(':').collect();
+    let hex = |s: &str, max: usize| !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match p.as_slice() {
+        ["pci", v, d] => hex(v, 4) && hex(d, 4),
+        ["pci-class", c, s] => hex(c, 2) && hex(s, 2),
+        _ => false,
+    }
 }
 
 fn valid_name(n: &str) -> bool {
@@ -455,6 +484,28 @@ fn cmd_pack(args: &[String]) -> Res<()> {
     if files.is_empty() {
         return Err("manifest lists no files".into());
     }
+    if !m.driver_match.is_empty() {
+        if m.kind == "system" {
+            return Err("a system package cannot be a driver package".into());
+        }
+        for r in &m.driver_match {
+            if !valid_driver_match(r) {
+                return Err(format!("driver match `{}`: use pci:VVVV:DDDD or pci-class:CC:SS (hex)", r));
+            }
+        }
+        // Driver name = package name without the `drv-` prefix (drv-e1000 -> e1000).
+        let dname = m.name.strip_prefix("drv-").unwrap_or(&m.name);
+        let dir = format!("/usr/lib/drivers/{}/", dname);
+        if let Some((d, _)) = files.iter().find(|(d, _)| !d.starts_with(&dir)) {
+            return Err(format!("dest `{}`: files of a driver package go to {}", d, dir));
+        }
+        let exec = if m.driver_exec.is_empty() { files[0].0.clone() } else { m.driver_exec.clone() };
+        if !files.iter().any(|(d, _)| *d == exec) {
+            return Err(format!("[driver] exec `{}` is not one of the package files", exec));
+        }
+        let conf = format!("name={}\nexec={}\nmatch={}\n", dname, exec, m.driver_match.join(","));
+        files.push((format!("{}driver.conf", dir), conf.into_bytes()));
+    }
     if m.kind == "system" && !files.iter().any(|(d, _)| d == "esp:kernel") {
         return Err("a system package needs a file with dest esp:kernel".into());
     }
@@ -464,6 +515,9 @@ fn cmd_pack(args: &[String]) -> Res<()> {
     }
     if !m.depends.is_empty() {
         meta.push(("depends", m.depends.join(",")));
+    }
+    if !m.driver_match.is_empty() {
+        meta.push(("driver_match", m.driver_match.join(",")));
     }
     let blob = pack_tmt(&m.name, &m.version, arch, &meta, &files)?;
     let outdir = opt(args, "-o").map(PathBuf::from).unwrap_or_else(|| base.to_path_buf());

@@ -1,0 +1,10 @@
+[package]
+name = "drv-e1000"
+description = "Intel e1000 network driver in ring 3: DMA rings, packets to the kernel network stack through a shared ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../../../user/liboos" }
+libdriver = { path = "../../../user/libdriver" }

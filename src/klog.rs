@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Maximum length of a single event message
 const EVENT_MSG_LEN: usize = 80;
 /// Number of events stored in the ring buffer
-const EVENT_COUNT: usize = 32;
+const EVENT_COUNT: usize = 128;
 
 /// Single event entry
 #[derive(Clone, Copy)]

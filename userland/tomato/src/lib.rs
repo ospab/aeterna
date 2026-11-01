@@ -1149,8 +1149,13 @@ fn install_blob(data: &[u8], source: &str, trusted: bool) -> bool {
     let mut n = 0;
     for (p, d) in &entries {
         if let Some(slash) = p.rfind('/') {
-            if slash > 0 && !crate::fs::exists(&p[..slash]) {
-                crate::fs::mkdir(&p[..slash]);
+            // Every missing parent, outermost first (driver packages go to /usr/lib/drivers/<name>/).
+            let mut at = 0;
+            while at < slash {
+                at = p[at + 1..slash].find('/').map_or(slash, |i| at + 1 + i);
+                if at > 0 && !crate::fs::exists(&p[..at]) {
+                    crate::fs::mkdir(&p[..at]);
+                }
             }
         }
         if !crate::fs::write_file(p, d) {

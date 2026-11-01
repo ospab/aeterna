@@ -180,7 +180,31 @@ pub fn probe_and_init() -> bool {
         outw(io + REG_QUEUE_NOTIFY, 0);
 
         let irq = crate::pci::interrupt_line(dev.bus, dev.device, dev.function);
-        if irq < 16 { crate::arch::x86_64::pic::enable_irq(irq); }
+        // MSI-X first. Enabling it moves the device-specific config (the MAC, read above)
+        // from offset 0x14 to 0x18 and adds the vector registers at 0x14 (config) and 0x16
+        // (per selected queue). Both queues share vector 0; the config vector stays unused.
+        let hnd = crate::arch::x86_64::idt::net_irq_handler;
+        let mut mode = crate::arch::x86_64::irq::setup_device_irq(dev.bus, dev.device, dev.function, "virtio-net", hnd);
+        if mode == crate::arch::x86_64::irq::Mode::MsiX {
+            outw(io + 0x14, 0xFFFF);
+            let mut ok = true;
+            for q in 0..2u16 {
+                outw(io + REG_QUEUE_SEL, q);
+                outw(io + 0x16, 0);
+                if inw(io + 0x16) == 0xFFFF { ok = false; }
+            }
+            if !ok {
+                crate::arch::x86_64::irq::release_device(dev.bus, dev.device, dev.function);
+                mode = crate::arch::x86_64::irq::setup_device_intx(dev.bus, dev.device, dev.function, "virtio-net", hnd);
+            }
+        } else if mode == crate::arch::x86_64::irq::Mode::Msi {
+            // Legacy virtio has no plain-MSI vector registers: use INTx.
+            crate::arch::x86_64::irq::release_device(dev.bus, dev.device, dev.function);
+            mode = crate::arch::x86_64::irq::setup_device_intx(dev.bus, dev.device, dev.function, "virtio-net", hnd);
+        }
+        s("[VirtIO-Net] interrupts: ");
+        s(mode.name());
+        s("\r\n");
 
         s("[VirtIO-Net] ready, rx/tx queue size ");
         serial_dec(rxq.size as u64);

@@ -303,6 +303,8 @@ fn init_device(bus: u8, dev: u8, func: u8, vendor: u16, device: u16) -> bool {
 
     unsafe {
         MMIO_BASE = phys_to_virt(mmio_phys);
+        PCI_BDF = crate::core::pcidev::bdf_of(bus, dev, func);
+        IRQ_LINE = irq;
     }
 
     s("[e1000] Found ");
@@ -482,16 +484,12 @@ fn init_device(bus: u8, dev: u8, func: u8, vendor: u16, device: u16) -> bool {
     write_reg(REG_IMS, 0x01 | 0x04 | 0x10 | 0x40 | 0x80);
     let _ = read_reg(REG_ICR); // clear any pending
 
-    if irq < 16 {
-        crate::arch::x86_64::pic::enable_irq(irq);
-        s("[e1000] PIC IRQ ");
-        serial_dec(irq as u64);
-        s(" enabled\r\n");
-    } else {
-        s("[e1000] No legacy IRQ (");
-        serial_dec(irq as u64);
-        s(") — using poll mode\r\n");
-    }
+    let mode = crate::arch::x86_64::irq::setup_device_irq(bus, dev, func, "e1000", crate::arch::x86_64::idt::net_irq_handler);
+    s("[e1000] Interrupts: ");
+    s(mode.name());
+    s(" (PCI interrupt line ");
+    serial_dec(irq as u64);
+    s(")\r\n");
 
     // --- Verification: read back critical registers ---
     let status = read_reg(REG_STATUS);
@@ -531,6 +529,42 @@ fn init_device(bus: u8, dev: u8, func: u8, vendor: u16, device: u16) -> bool {
 pub fn mac_address() -> [u8; 6] {
     unsafe { MAC }
 }
+
+/// PCI address (pcidev::bdf_of) of the function this driver initialised, 0xFFFF if none.
+static mut PCI_BDF: u16 = 0xFFFF;
+
+pub fn pci_bdf() -> u16 {
+    unsafe { PCI_BDF }
+}
+
+/// Let go of the device so a ring-3 driver can take it: no interrupts, no DMA, no
+/// more kernel traffic through this driver. The device is reset and left idle.
+pub fn release() -> bool {
+    if !is_initialized() {
+        return true;
+    }
+    unsafe { INITIALIZED = false; }
+    write_reg(REG_IMC, 0xFFFF_FFFF);
+    write_reg(REG_RCTL, 0);
+    write_reg(REG_TCTL, 0);
+    let ctrl = read_reg(REG_CTRL);
+    write_reg(REG_CTRL, ctrl | CTRL_RST);
+    // Interrupts are off here (syscall context), so the tick counter does not advance:
+    // spin on the reset bit instead of using delay_ms.
+    for _ in 0..2_000_000u32 {
+        if read_reg(REG_CTRL) & CTRL_RST == 0 { break; }
+        unsafe { core::arch::asm!("pause"); }
+    }
+    write_reg(REG_IMC, 0xFFFF_FFFF);
+    let _ = read_reg(REG_ICR);
+    let bdf = unsafe { PCI_BDF };
+    if bdf != 0xFFFF {
+        crate::arch::x86_64::irq::release_device((bdf >> 8) as u8, ((bdf >> 3) & 31) as u8, (bdf & 7) as u8);
+    }
+    true
+}
+
+static mut IRQ_LINE: u8 = 0xFF;
 
 pub fn is_initialized() -> bool {
     unsafe { INITIALIZED }

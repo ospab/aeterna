@@ -1,0 +1,9 @@
+[package]
+name = "libdriver"
+description = "Library for drivers that run in ring 3: PCI, interrupts, DMA, logging, device manager protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liboos = { path = "../liboos" }

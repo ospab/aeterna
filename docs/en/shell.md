@@ -31,7 +31,7 @@ one after another, not concurrently.
   `sort`, `uniq`, `cut`, `tr`, `rev`, `nl`, `xxd`, `diff`, `awk` (subset), `seq`, `printf`,
   `xargs`, `yes`.
 - System: `uname`, `date`, `uptime`, `hostname`, `free`, `lsmem`, `ps`, `top`, `kill`, `dmesg`,
-  `lspci`, `shutdown`, `reboot`.
+  `lspci`, `irqstat`, `shutdown`, `reboot`.
 - Disks: `lsblk`, `fdisk -l`, `mkfs`, `mount`, `fsck`, `snap`, `install`.
 - Network: `ip`, `ifconfig`, `ping`, `nslookup`, `curl`, `traceroute`, `netstat`, `ntpdate`,
   `ostp`. See [Networking](networking.md).

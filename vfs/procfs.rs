@@ -41,6 +41,7 @@ const PROC_FILES: &[&str] = &[
     "tasks",
     "mounts",
     "cmdline",
+    "interrupts",
 ];
 
 /// CPUID feature bits worth showing: (leaf, register, bit, name).
@@ -86,6 +87,7 @@ impl ProcFsInstance {
             "tasks"   => Some(self.gen_tasks()),
             "mounts"  => Some(self.gen_mounts()),
             "cmdline" => Some(self.gen_cmdline()),
+            "interrupts" => Some(crate::arch::x86_64::irq::stat_text().into_bytes()),
             _ => None,
         }
     }

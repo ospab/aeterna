@@ -110,7 +110,7 @@ Numbers in use:
 | 40, 41 | mmap, munmap |
 | 50 to 52 | sysinfo, uptime, get_tasks |
 | 70, 80, 110 | cap_delegate, med_assign, dev_detach |
-| 200 to 253 | handles, channels, notifications, processes, memory regions, interrupts, ports |
+| 200 to 254 | handles, channels, notifications, processes, memory regions, interrupts (254: MSI), ports |
 | 260 to 264, 270 | screen, raw keyboard, clock |
 | 271 to 275 | audio |
 

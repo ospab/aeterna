@@ -32,7 +32,7 @@
   `sort`, `uniq`, `cut`, `tr`, `rev`, `nl`, `xxd`, `diff`, `awk` (подмножество), `seq`, `printf`,
   `xargs`, `yes`.
 - Система: `uname`, `date`, `uptime`, `hostname`, `free`, `lsmem`, `ps`, `top`, `kill`, `dmesg`,
-  `lspci`, `shutdown`, `reboot`.
+  `lspci`, `irqstat`, `shutdown`, `reboot`.
 - Диски: `lsblk`, `fdisk -l`, `mkfs`, `mount`, `fsck`, `snap`, `install`.
 - Сеть: `ip`, `ifconfig`, `ping`, `nslookup`, `curl`, `traceroute`, `netstat`, `ntpdate`, `ostp`.
   См. [Сеть и OSTP](networking.md).

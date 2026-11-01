@@ -489,7 +489,10 @@ extern "C" fn apic_timer_dispatch(saved_state: *mut u8, fx_area: *mut u8) {
 
     // Re-arm: fire again in 1 ms (gives 1 kHz preemption rate when idle,
     // but NIC IRQs will still land on separate PIC-routed vectors).
-    crate::arch::x86_64::apic::one_shot_us(1_000);
+    if !crate::arch::x86_64::apic::is_periodic() {
+        crate::arch::x86_64::apic::one_shot_us(1_000);
+    }
+    crate::arch::x86_64::irq::count_timer();
 
     // No PIT on this machine: keep the 100 Hz tick counter going from here.
     if !PIT_ALIVE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -676,6 +679,13 @@ extern "C" fn irq_dispatch(saved_state: *const u8, irq: u64, fx_area: *mut u8) {
     // A line handed to a ring-3 driver (Interrupt object): masked and delivered as a
     // notification; the driver unmasks it with irq_ack.
     if crate::core::object::irq_fire(irq as u8) {
+        crate::arch::x86_64::irq::count_legacy(32 + irq as u8);
+        crate::arch::x86_64::pic::send_eoi(irq as u8);
+        return;
+    }
+
+    // Handlers registered through the irq registry (NIC INTx, ...) replace the static arms below.
+    if crate::arch::x86_64::irq::dispatch(32 + irq as u8) {
         crate::arch::x86_64::pic::send_eoi(irq as u8);
         return;
     }
@@ -929,9 +939,18 @@ pub fn init() {
         // APIC one-shot timer (vector 48) — set here; only fires after apic::init_timer()
         idt.set_handler(48, apic_timer_isr as *const () as u64, 0x08, &flags);
 
+        // Dynamic vectors (PCI INTx above GSI 15, MSI, MSI-X) and the spurious vector
+        crate::arch::x86_64::irq::install(&mut |v, addr| idt.set_handler(v, addr, 0x08, &flags));
+
         // Load IDT
         idt.load();
     }
     
     crate::arch::x86_64::serial::write_str("[CPU] IDT loaded (exceptions 0-31, IRQ 0-15)\r\n");
+}
+/// Registry handler for NIC interrupts (INTx or MSI): run the active driver's handler
+/// and wake the network wait loops.
+pub fn net_irq_handler(_vector: u8, _ctx: usize) {
+    crate::userspace::net::handle_net_irq();
+    NET_IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }

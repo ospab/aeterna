@@ -853,6 +853,7 @@ const HELP: &[HelpSection] = &[
         ("ps / top / kill",  "scheduler tasks"),
         ("dmesg",            "kernel event log"),
         ("lspci",            "PCI devices"),
+        ("irqstat",          "interrupt vectors, sources and counts"),
         ("changelog",        "release notes"),
     ]},
     HelpSection { title: "Storage", cmds: &[
@@ -1285,8 +1286,8 @@ fn count_tasks() -> usize {
 }
 
 fn cmd_dmesg() {
-    let mut buf = [klog::Event::empty_pub(); 32];
-    let count = klog::last_events(&mut buf, 32);
+    let mut buf = [klog::Event::empty_pub(); 128];
+    let count = klog::last_events(&mut buf, 128);
     if count == 0 {
         dim_print("(no events recorded)\n");
         return;
