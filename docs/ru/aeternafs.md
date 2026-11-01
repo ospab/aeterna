@@ -299,11 +299,25 @@ oosfs ls|cat|get|put|rm|mkdir|mv|stat|info <image> ...
 oosfs put <image> <src> <dest> [-r]
 oosfs snap create|list|delete|rollback <image> [name]
 oosfs fsck <image> [--deep]
+oosfs shell <image>                       интерактивно: cd, ls, cat, get, put, rm, mv, fsck
 ```
 
-Параметр `--offset <байты>` или `--part N` (GPT, секторы по 512 байт) позволяет
-работать с разделом внутри образа диска. `fsck --deep` читает и все страницы
-данных.
+С параметром `--offset <байты>` или `--part N` (GPT или MBR, секторы по 512 байт)
+утилита работает с разделом внутри образа диска. В разделе `AETERNA` установленной системы
+том лежит после области старого снимка, `--part` находит его сам. `fsck --deep` читает и все
+страницы данных. `-v` показывает область и первые прочитанные блоки.
+
+Образ может быть обычным файлом или диском VMware: `.vmdk`-описанием с частями (split или
+flat) либо однофайловым sparse `.vmdk`. Работают и чтение, и запись: новые grain'ы
+добавляются в конец файла части и записываются в обе таблицы. Сначала выключите VM: диск с
+каталогом блокировки `.vmdk.lck` не открывается (`--force` отключает проверку). Сжатые
+(stream-optimized) VMDK из экспорта OVA не поддерживаются. Положить файлы в установленную
+систему в VMware:
+
+```
+oosfs put "C:\VMs\ospab\ospab.vmdk" --part 2 os12.rom /usr/share/beeb/os12.rom
+oosfs put "C:\VMs\ospab\ospab.vmdk" --part 2 games /home/me/games -r
+```
 
 Сборка: `cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-pc-windows-gnu` в
 `tools/oosfs` (явная цель перекрывает цель ядра из `.cargo/config.toml` репозитория).

@@ -18,12 +18,20 @@ param(
     [string]$Upload,
     [string]$RemoteDir = '/var/www/tmt.ospab.org/x86_64',
     [string[]]$Only,
-    # Also pack the system package ospab-base (kernel + loaders) from the build outputs of
-    # ./build.sh (kernel, boot\uefi, boot\bios\target\bios.img). Version = kernel version + build number.
+    # Also pack the system package ospab-base (kernel + loaders); `-Only ospab-base` means the
+    # same. The files come from isos\ospab-os-v2-<Build>.iso (extracted with xorriso in WSL), so
+    # the package is exactly the tested ISO; without that ISO, from ./build.sh outputs, which must
+    # be built with OSPAB_BUILD=<Build>. Version = Cargo version + build number (1.1.0.194).
     [switch]$Base,
     # Build number for -Base (default: the number of the newest isos\ospab-os-v2-N.iso).
     [string]$Build
 )
+
+if ($Only -contains 'ospab-base') {
+    $Base = $true
+    $Only = @($Only | Where-Object { $_ -ne 'ospab-base' })
+    $baseOnly = $Only.Count -eq 0
+} else { $baseOnly = $false }
 
 $ErrorActionPreference = 'Stop'
 $Apps = $PSScriptRoot
@@ -64,10 +72,12 @@ try {
     $nightly = 'nightly'
     rustc +nightly-x86_64-pc-windows-gnu -V *> $null
     if ($LASTEXITCODE -eq 0) { $nightly = 'nightly-x86_64-pc-windows-gnu' }
-    Push-Location $Apps
-    $pkgArgs = @()
-    foreach ($n in $Only) { $pkgArgs += @('-p', $n) }
-    try { Run 'Building programs' { cargo "+$nightly" build --release @pkgArgs } } finally { Pop-Location }
+    if (-not $baseOnly) {
+        Push-Location $Apps
+        $pkgArgs = @()
+        foreach ($n in $Only) { $pkgArgs += @('-p', $n) }
+        try { Run 'Building programs' { cargo "+$nightly" build --release @pkgArgs } } finally { Pop-Location }
+    }
 
     # 3. Packages (manifests use paths relative to apps\).
     $dist = Join-Path $Apps 'dist'
@@ -77,7 +87,8 @@ try {
     try {
         # ospab-base.toml is a template for -Base, not a package of its own.
         $manifests = Get-ChildItem (Join-Path $Apps 'pkg\*.toml') | Where-Object { $_.BaseName -ne 'ospab-base' }
-        if ($Only) { $manifests = $manifests | Where-Object { $Only -contains $_.BaseName } }
+        if ($baseOnly) { $manifests = @() }
+        elseif ($Only) { $manifests = $manifests | Where-Object { $Only -contains $_.BaseName } }
         foreach ($m in $manifests) {
             Run "Packing $($m.Name)" { & $Tmt pack $m.FullName -o $dist }
         }
@@ -87,12 +98,32 @@ try {
                 $Build = (Get-ChildItem (Join-Path $Root 'isos\ospab-os-v2-*.iso') | ForEach-Object { [int]($_.BaseName -replace '.*-', '') } | Sort-Object | Select-Object -Last 1)
             }
             if (-not $Build) { throw 'no build number: pass -Build N' }
-            $kernel = Join-Path $Root 'target\x86_64-ospab\release\ospab_os'
-            $loader = Join-Path $Root 'boot\uefi\target\x86_64-unknown-uefi\release\ospab_boot.efi'
-            $bios = Join-Path $Root 'boot\bios\target\bios.img'
-            foreach ($f in $kernel, $loader, $bios) { if (-not (Test-Path $f)) { throw "missing $f (run ./build.sh first)" } }
+            $iso = Join-Path $Root "isos\ospab-os-v2-$Build.iso"
+            if (Test-Path $iso) {
+                # Take the files from the ISO, so the package is exactly what was tested.
+                $src = Join-Path $dist 'base-src'
+                New-Item -ItemType Directory -Force $src | Out-Null
+                $wsl = { param($p) '/mnt/' + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/') }
+                $kernel = Join-Path $src 'KERNEL'; $loader = Join-Path $src 'BOOTX64.EFI'; $bios = Join-Path $src 'bios.img'
+                $extract = "xorriso -osirrox on -indev '$(& $wsl $iso)' -extract /boot/KERNEL '$(& $wsl $kernel)' " +
+                       "-extract /EFI/BOOT/BOOTX64.EFI '$(& $wsl $loader)' -extract /boot/bios.img '$(& $wsl $bios)'"
+                Run "Extracting kernel and loaders from $(Split-Path $iso -Leaf)" { wsl -d Ubuntu -- bash -lc "$extract >/dev/null 2>&1" }
+            } else {
+                $kernel = Join-Path $Root 'target\x86_64-ospab\release\ospab_os'
+                $loader = Join-Path $Root 'boot\uefi\target\x86_64-unknown-uefi\release\ospab_boot.efi'
+                $bios = Join-Path $Root 'boot\bios\target\bios.img'
+                foreach ($f in $kernel, $loader, $bios) { if (-not (Test-Path $f)) { throw "missing $f (run ./build.sh first)" } }
+                # The kernel must carry this build number ("#194 ..."), not a dev build.
+                $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($kernel))
+                if (-not $text.Contains("#$Build ")) {
+                    throw "target\x86_64-ospab\release\ospab_os is not build ${Build}: build it with OSPAB_BUILD=$Build ./build.sh, or keep isos\ospab-os-v2-$Build.iso"
+                }
+            }
+            foreach ($f in $kernel, $loader, $bios) { if (-not (Test-Path $f)) { throw "missing $f" } }
             Write-Host "ospab-base $ver.$Build"
-            Run 'Packing ospab-base' { & $Tmt pack (Join-Path $Apps 'pkg\ospab-base.toml') -o $dist --set "VERSION=$ver.$Build" --set "KERNEL=$kernel" --set "LOADER=$loader" --set "BIOS=$bios" }
+            # The values are substituted into TOML strings, where a backslash starts an escape.
+            $k, $l, $b = ($kernel, $loader, $bios) | ForEach-Object { $_ -replace '\\', '/' }
+            Run 'Packing ospab-base' { & $Tmt pack (Join-Path $Apps 'pkg\ospab-base.toml') -o $dist --set "VERSION=$ver.$Build" --set "KERNEL=$k" --set "LOADER=$l" --set "BIOS=$b" }
         }
     } finally { Pop-Location }
 

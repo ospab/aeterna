@@ -298,10 +298,25 @@ oosfs ls|cat|get|put|rm|mkdir|mv|stat|info <image> ...
 oosfs put <image> <src> <dest> [-r]
 oosfs snap create|list|delete|rollback <image> [name]
 oosfs fsck <image> [--deep]
+oosfs shell <image>                       interactive: cd, ls, cat, get, put, rm, mv, fsck
 ```
 
-Add `--offset <bytes>` or `--part N` (GPT, 512-byte sectors) to work on a
-partition inside a disk image. `fsck --deep` also reads every data page.
+Add `--offset <bytes>` or `--part N` (GPT or MBR, 512-byte sectors) to work on a
+partition inside a disk image. In the `AETERNA` partition of an installed system the volume
+sits after the old snapshot area; `--part` finds it. `fsck --deep` also reads every data page.
+`-v` shows the region and the first blocks read.
+
+The image can be a raw file or a VMware disk: a `.vmdk` descriptor with split or flat extents,
+or a single-file sparse `.vmdk`. Reading and writing both work; new grains are added at the end
+of the extent file and recorded in both grain tables. Power the VM off first: a disk with a
+`.vmdk.lck` lock directory is refused (`--force` skips the check). Compressed
+(stream-optimized) VMDKs from OVA exports are not supported. To put files into an installed
+system in VMware:
+
+```
+oosfs put "C:\VMs\ospab\ospab.vmdk" --part 2 os12.rom /usr/share/beeb/os12.rom
+oosfs put "C:\VMs\ospab\ospab.vmdk" --part 2 games /home/me/games -r
+```
 
 Build: `cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-pc-windows-gnu` in
 `tools/oosfs` (the explicit target overrides the kernel target of the repository's
