@@ -540,9 +540,12 @@ fn syscall_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
 }
 
 /// sys_open(path_ptr, path_len, flags) — open a file, returning fd.
-/// flags: 0=read, 1=write, 2=read+write
+/// flags: 0 read, 1 write (create, empty), 2 read+write (create, keep); +4 append for 1 and 2.
 fn syscall_open(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
-    match flags {
+    if flags & crate::fs::OPEN_APPEND != 0 && flags & 3 == 0 {
+        return SyscallError::InvalidArgument as i64;
+    }
+    match flags & !crate::fs::OPEN_APPEND {
         0 => {
             if !can_fs_read() {
                 return SyscallError::PermissionDenied as i64;

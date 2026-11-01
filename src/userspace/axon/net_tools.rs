@@ -776,8 +776,9 @@ pub fn cmd_curl(args: &str) {
     let args = args.trim();
     if args.is_empty() {
         err("curl: missing URL\n");
-        dim("Usage: curl [-IiLvs] [-H hdr] [-X method] [-d data] <URL>\n");
-        dim("  -I / --head      HEAD request — print headers only\n");
+        dim("Usage: curl [-IiLvs] [-o file] [-H hdr] [-X method] [-d data] <URL>\n");
+        dim("  -o / --output    write the body to a file (up to 512 KiB)\n");
+        dim("  -I / --head      HEAD request: print headers only\n");
         dim("  -i / --include   Include response headers in output\n");
         dim("  -v / --verbose   Verbose (show request + response)\n");
         dim("  -L / --location  Follow redirects\n");

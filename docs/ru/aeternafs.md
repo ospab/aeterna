@@ -305,4 +305,5 @@ oosfs fsck <image> [--deep]
 работать с разделом внутри образа диска. `fsck --deep` читает и все страницы
 данных.
 
-Сборка: `cargo +stable-x86_64-pc-windows-gnu build --release` в `tools/oosfs`.
+Сборка: `cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-pc-windows-gnu` в
+`tools/oosfs` (явная цель перекрывает цель ядра из `.cargo/config.toml` репозитория).

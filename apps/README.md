@@ -18,15 +18,16 @@ fn main(args: liboos::Args) -> i32 { println!("hi {}", args.len()); 0 }
 
 ## Build and package
 ```
-bash apps/build.sh                 # nightly cargo; -> apps/dist/*.tmt via tools/tmt
+bash apps/build.sh                 # nightly cargo (GNU nightly on Windows); -> apps/dist/*.tmt via tools/tmt
 bash apps/build.sh repo DIR        # also builds a signed repo in DIR (needs ~/.ospab/tmt.key)
 ```
 Package manifest (`apps/pkg/<name>.toml`): name, version, description, arch, depends, and `[[files]]` with `src` (relative to the manifest) and `dest` (absolute path in the OS, e.g. `/usr/bin/<name>`).
 
 ## Run
-`tomato -U dist/x.tmt` (or `tomato -S x` from a repository), then type the name: plum looks in `$PATH`
-(`/bin:/sbin:/usr/bin`) and runs ELF files as ring-3 processes; Ctrl+C kills them.
-Current limits: program stdout goes to the serial port (not the screen), no stdin, capabilities: serial + fs.
+`tomato install dist/x.tmt` (or `tomato install x` from a repository), then type the name: plum
+looks in `$PATH` and runs ELF files as ring-3 processes; Ctrl+C kills them. Programs write to the
+console, read the keyboard as standard input, and can take over the screen, the raw keyboard and
+the sound card (see docs/en/dev/liboos.md).
 
 ## GUI programs
 GUI apps use the `oos-ui` application API (`gui/`, module `oos_ui::app`), not liboos directly.

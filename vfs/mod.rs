@@ -397,23 +397,36 @@ use crate::core::scheduler::with_current_fds;
 /// Open a file for the current task, returning a file descriptor number.
 /// flags: 0 = read, 1 = write, 2 = read+write
 /// Returns -1 on error.
+/// Open flags: the low two bits are the mode, bit 2 adds append.
+pub const OPEN_READ: u64 = 0;
+/// Write only: creates the file, or empties an existing one.
+pub const OPEN_WRITE: u64 = 1;
+/// Read and write: creates the file if missing, keeps its contents.
+pub const OPEN_READ_WRITE: u64 = 2;
+/// With a write mode: start at the end of the file and keep its contents.
+pub const OPEN_APPEND: u64 = 4;
+
 pub fn sys_open(path: &str, flags: u64) -> i64 {
-    // Verify file exists (or create if write mode)
-    let writable = flags & 1 != 0;
-    let readable = flags & 2 != 0 || flags == 0; // default is read-only
+    let mode = flags & 3;
+    let append = flags & OPEN_APPEND != 0;
+    if mode == 3 || flags & !7 != 0 {
+        return -1;
+    }
+    let readable = mode == OPEN_READ || mode == OPEN_READ_WRITE;
+    let writable = mode != OPEN_READ;
 
     if !exists(path) {
-        if writable {
-            // Create the file
-            if !touch(path) {
-                return -1;
-            }
-        } else {
-            return -1; // File not found
+        if !writable || !touch(path) {
+            return -1;
+        }
+    } else if mode == OPEN_WRITE && !append {
+        if !write_file(path, &[]) {
+            return -1;
         }
     }
 
-    let file = OpenFile { path: String::from(path), offset: 0, readable, writable, dirty: false };
+    let offset = if append { stat(path).map_or(0, |e| e.size) } else { 0 };
+    let file = OpenFile { path: String::from(path), offset, readable, writable, dirty: false };
     match with_current_fds(|t| t.alloc(file)) {
         Some(fd) => fd as i64,
         None => -1, // No FDs available

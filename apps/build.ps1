@@ -59,10 +59,15 @@ try {
     }
 
     # 2. Programs for x86_64-unknown-oos (apps\.cargo\config.toml selects target and linker script).
+    #    Like the kernel's build.sh: the GNU nightly when installed, since the msvc one needs
+    #    Visual C++ Build Tools to build compiler_builtins.
+    $nightly = 'nightly'
+    rustc +nightly-x86_64-pc-windows-gnu -V *> $null
+    if ($LASTEXITCODE -eq 0) { $nightly = 'nightly-x86_64-pc-windows-gnu' }
     Push-Location $Apps
     $pkgArgs = @()
     foreach ($n in $Only) { $pkgArgs += @('-p', $n) }
-    try { Run 'Building programs' { cargo +nightly build --release @pkgArgs } } finally { Pop-Location }
+    try { Run 'Building programs' { cargo "+$nightly" build --release @pkgArgs } } finally { Pop-Location }
 
     # 3. Packages (manifests use paths relative to apps\).
     $dist = Join-Path $Apps 'dist'

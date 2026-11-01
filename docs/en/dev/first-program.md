@@ -179,11 +179,10 @@ cd apps && ../tools/tmt/bin/tmt pack pkg/wordcount.toml -o dist
 Useful checks: `tmt list apps/dist/wordcount-0.1.0.tmt` lists the files, `tmt verify` checks the
 checksum.
 
-`build.sh` and `build.ps1` call `cargo +nightly`. On a Windows PC without the C++ Build Tools,
-`nightly` is the MSVC toolchain and the build stops in `compiler_builtins`. Make `nightly` mean the
-GNU one with `rustup set default-host x86_64-pc-windows-gnu` (and install the GNU nightly), or
-build with the GNU toolchain by hand as in step 2 and run `tmt pack` yourself. The kernel's
-`./build.sh` already prefers the GNU nightly on Windows; the scripts in `apps/` do not yet.
+On Windows `build.sh` and `build.ps1` use `nightly-x86_64-pc-windows-gnu` when it is installed,
+like the kernel's `./build.sh`. The MSVC nightly needs the Visual C++ Build Tools to build
+`compiler_builtins`; without them install the GNU one:
+`rustup toolchain install nightly-x86_64-pc-windows-gnu --profile minimal -c rust-src`.
 
 ## 5. Get it into the VM
 

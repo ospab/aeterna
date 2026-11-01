@@ -303,4 +303,6 @@ oosfs fsck <image> [--deep]
 Add `--offset <bytes>` or `--part N` (GPT, 512-byte sectors) to work on a
 partition inside a disk image. `fsck --deep` also reads every data page.
 
-Build: `cargo +stable-x86_64-pc-windows-gnu build --release` in `tools/oosfs`.
+Build: `cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-pc-windows-gnu` in
+`tools/oosfs` (the explicit target overrides the kernel target of the repository's
+`.cargo/config.toml`).

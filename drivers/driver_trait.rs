@@ -1,10 +1,8 @@
 /*
  * AETERNA Driver Trait
  *
- * Common interface for all hardware drivers in the AETERNA microkernel.
- * In Phase 5, drivers implementing this trait will run as isolated
- * userspace processes communicating via IPC. Currently they run in
- * ring 0 but are wrapped in catch_unwind for fault isolation.
+ * Common interface for the hardware drivers that run in the kernel (ring 0). Drivers that run
+ * as ring-3 processes use user/libdriver instead.
  */
 
 /// Status of a driver within the driver registry.
@@ -23,9 +21,8 @@ pub enum DriverStatus {
 /// Common interface for AETERNA drivers.
 ///
 /// Every hardware driver should implement this trait. The registry
-/// calls `probe()` first; if it returns `true`, `init()` is invoked
-/// inside a `catch_unwind` boundary to prevent driver panics from
-/// killing the kernel.
+/// calls `probe()` first; if it returns `true`, `init()` is invoked.
+/// A panic stops the kernel (panic = "abort"); return `false` on failure instead.
 pub trait Driver {
     /// Human-readable driver name for logging and `lsmod`.
     fn name(&self) -> &'static str;
@@ -35,7 +32,7 @@ pub trait Driver {
     fn probe(&self) -> bool;
 
     /// Initialize the driver. Called only if `probe()` returned true.
-    /// May panic — the registry wraps this in `catch_unwind`.
+    /// Returns false on failure; must not panic.
     fn init(&self) -> bool;
 
     /// Current status of the driver (queried via registry).

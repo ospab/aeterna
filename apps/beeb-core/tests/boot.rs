@@ -124,7 +124,6 @@ fn boot_and_shoot() {
     if let Ok(d) = std::env::var("BEEB_SSD") { b.insert_disc(std::fs::read(d).unwrap()); }
     b.reset(sb);
     let tf: u64 = std::env::var("BEEB_TRACEFRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let tf: u64 = std::env::var("BEEB_TRACEFRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let jit: u64 = std::env::var("BEEB_JITTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut prev: Option<Vec<u32>> = None;
     for f in 1..=frames {
@@ -144,7 +143,6 @@ fn boot_and_shoot() {
             png(&out.join(format!("beeb_{:05}.png", f)), b.screen());
         }
     }
-    if tf != 0 { for (c, r, v) in b.trace() { eprintln!("TR {} {:02X} {:02X}", c, r, v); } }
     if tf != 0 { for (c, r, v) in b.trace() { eprintln!("TR {} {:02X} {:02X}", c, r, v); } }
     let lg = b.disc_log(); let lg = &lg[lg.len().saturating_sub(25)..]; eprintln!("log {:?} 256={:02X} vec={:02X}{:02X} v212={:02X?}", lg, b.peek(0x256), b.peek(0x217), b.peek(0x216), (0x212..0x220).map(|a| b.peek(a)).collect::<Vec<_>>());
     eprintln!("done, frames={} pc={:04X}", b.frames(), b.pc());

@@ -334,9 +334,10 @@ There is no GPU interface and no SIMD beyond SSE2 in generated code (the target 
 
 Files work as described in the liboos reference: absolute paths, no directory listing. `drift`
 writes `drift-slotN.sav` and `drift.cfg` to `/home` and, if that fails, to `/tmp`, and tries the
-same directories to read them. Use a fixed size for save files, because opening an existing file
-for writing does not truncate it. Files reach the disk after about ten seconds. The program
-should write when something important changes, not only at exit.
+same directories to read them. `O_WRITE` empties an existing file, so a save never keeps stale
+bytes from a longer one. On an installed system files reach the disk a few seconds after the last
+change (AeternaFS commits from a kernel thread, also while a game runs). The program should
+write when something important changes, not only at exit.
 `beeb` reads `/etc/beeb.conf` for defaults.
 
 Never put third-party game data in the repository. `beeb` asks the user for the MOS ROM and the

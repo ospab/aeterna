@@ -158,16 +158,14 @@ pub fn close(fd: u64) -> i64;
 `open` returns a descriptor of 3 or more, or a negative value. The calls work on the same virtual
 filesystem the shell uses (`/`, `/tmp`, `/home`, the saved upper layer, mounted disks).
 
-| `flags` | Meaning |
-|---|---|
-| 0 | read |
-| 1 | write; creates the file if it does not exist. Does not truncate an existing file: writing starts at offset 0 and overwrites. |
-| 2 | meant as read and write. **Today the descriptor is read-only** (see below). |
+| `flags` | Constant | Meaning |
+|---|---|---|
+| 0 | `O_READ` | read |
+| 1 | `O_WRITE` | write; creates the file, or empties an existing one |
+| 2 | `O_READ_WRITE` | read and write; creates the file if missing, keeps its contents |
+| +4 | `O_APPEND` | with 1 or 2: start at the end of the file and keep its contents |
 
-Any other value is refused with -3. Flag 2 needs both FsRead and FsWrite. This is a bug in the
-kernel: `sys_open` in `vfs/mod.rs` tests the bits 1 and 2 separately, so flag 2 yields a
-descriptor that can read but not write. Until it is fixed, use flag 1 for writing and flag 0
-for reading, with separate descriptors.
+Any other value is refused with -3. Flag 2 needs both FsRead and FsWrite.
 
 - `whence` for `seek`: 0 from the start, 1 from the current offset, 2 from the end. It returns
   the new offset, or -3. There are no named constants.

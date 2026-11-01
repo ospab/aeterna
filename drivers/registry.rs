@@ -1,15 +1,11 @@
 /*
  * AETERNA Driver Registry
  *
- * Central registry for all kernel drivers. Manages initialization
- * with fault isolation: each driver's init() is wrapped in
- * catch_unwind so that a panicking driver does NOT crash the kernel.
- *
- * Philosophy (from tech-manifest):
- *   "Падение драйвера звука не приводит к Kernel Panic."
- * While drivers still run in ring 0 (full userspace migration is Phase 5),
- * the registry ensures that a panic in any driver is caught, logged,
- * and the kernel continues booting with the driver marked as Failed.
+ * Central registry for the drivers that still run in the kernel: probes them, calls init()
+ * and records the status. The kernel is built with panic = "abort", so a panicking driver
+ * stops the system; real isolation comes from drivers running as ring-3 processes
+ * (devmgr, docs/en/dev/drivers.md). A driver whose init() returns false is marked Failed and
+ * boot continues.
  */
 
 extern crate alloc;

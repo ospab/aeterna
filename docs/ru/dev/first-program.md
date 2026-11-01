@@ -180,11 +180,10 @@ cd apps && ../tools/tmt/bin/tmt pack pkg/wordcount.toml -o dist
 Полезные проверки: `tmt list apps/dist/wordcount-0.1.0.tmt` показывает файлы, `tmt verify`
 проверяет контрольную сумму.
 
-`build.sh` и `build.ps1` вызывают `cargo +nightly`. На Windows без C++ Build Tools `nightly` —
-это набор MSVC, и сборка останавливается в `compiler_builtins`. Сделайте так, чтобы `nightly`
-означал GNU-набор: `rustup set default-host x86_64-pc-windows-gnu` (и поставьте GNU nightly),
-либо соберите вручную GNU-набором, как на шаге 2, и запустите `tmt pack` сами. `./build.sh`
-в корне на Windows уже предпочитает GNU nightly; скрипты в `apps/` пока нет.
+На Windows `build.sh` и `build.ps1` берут `nightly-x86_64-pc-windows-gnu`, если он установлен,
+как и `./build.sh` ядра. MSVC-версии nightly для сборки `compiler_builtins` нужны Visual C++
+Build Tools; если их нет, поставьте GNU-версию:
+`rustup toolchain install nightly-x86_64-pc-windows-gnu --profile minimal -c rust-src`.
 
 ## 5. Доставьте в ВМ
 

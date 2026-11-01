@@ -602,8 +602,8 @@ fn exec_file(name: &str, path: &str, args: &[String]) -> i32 {
 }
 
 /// Spawn an ELF program, wait for it and return its exit code. Ctrl+C kills it.
-/// Note: ring-3 stdout currently goes to the serial port (the write syscall), so the
-/// program's output is neither shown on the framebuffer console nor capturable.
+/// The program's stdout and stderr go to the console (and the serial port); its stdin is the
+/// console line discipline (core/stdin.rs). Output is not yet capturable by pipes.
 fn run_elf(name: &str, image: &[u8], args: &[String]) -> i32 {
     use crate::core::scheduler::{self, Capability};
     let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);

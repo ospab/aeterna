@@ -575,17 +575,8 @@ pub extern "C" fn rust_vfs_open(path_ptr: *const u8, path_len: usize, flags: u64
         crate::arch::x86_64::serial::write_str("\r\n");
     }
 
-    if flags == 1 {
-        // Write-only (e.g. "wb"): always truncate so stale bytes from a
-        // previous, larger save don't corrupt the new one.
-        crate::fs::write_file(path, &[]);
-    } else if flags & 1 != 0 {
-        // Read+write: create if absent, but don't truncate.
-        if crate::fs::read_file(path).is_none() {
-            crate::fs::write_file(path, &[]);
-        }
-    }
-
+    // sys_open creates the file for both write modes and empties it for write-only ("wb"),
+    // so a shorter save never keeps stale bytes from a larger one.
     let fd = crate::fs::sys_open(path, flags);
     // Confirm open result for save files
     if path.ends_with(".dsg") || path.contains("doom") {

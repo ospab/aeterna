@@ -92,7 +92,7 @@ unchanged:
 | 0 | exit | code |
 | 1 | write | fd, buf*, len → bytes written |
 | 2 | read | fd, buf*, len → bytes read, 0 at end of input |
-| 3 | open | path*, path_len, flags (0 read, 1 write/create, 2 read+write) → fd ≥ 3 |
+| 3 | open | path*, path_len, flags (0 read, 1 write: create or empty, 2 read+write: create, keep; +4 append) → fd ≥ 3 |
 | 4 | close | fd → 0 |
 | 5 | seek | fd, offset, whence (0 set, 1 current, 2 end) → new offset |
 

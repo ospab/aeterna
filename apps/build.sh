@@ -16,8 +16,14 @@ EXE=tmt; case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=tmt.exe;; esac
 [ -x "$ROOT/tools/tmt/bin/$EXE" ] || bash "$ROOT/tools/tmt/build.sh"
 TMT="$ROOT/tools/tmt/bin/$EXE"
 
-# 2. programs (RUSTFLAGS must be unset: it would override .cargo/config.toml, which carries the linker script)
-env -u RUSTFLAGS cargo +nightly build --release
+# 2. programs (RUSTFLAGS must be unset: it would override .cargo/config.toml, which carries the linker script).
+#    On Windows the GNU nightly is used when installed, as in the kernel's build.sh.
+NIGHTLY="${NIGHTLY:-nightly}"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        rustc +nightly-x86_64-pc-windows-gnu -V >/dev/null 2>&1 && NIGHTLY=nightly-x86_64-pc-windows-gnu ;;
+esac
+env -u RUSTFLAGS cargo +$NIGHTLY build --release
 
 # 3. packages
 rm -rf dist && mkdir -p dist

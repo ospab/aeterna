@@ -34,7 +34,17 @@ pub fn write(fd: u64, bytes: &[u8]) -> i64 {
     unsafe { sys::syscall3(sys::nr::WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }
 }
 
-/// Open a file (flags: 0 read, 1 write, 2 read+write). Returns a descriptor >= 3 or a negative error.
+/// `open` flags: read only.
+pub const O_READ: u64 = 0;
+/// `open` flags: write only; creates the file or empties an existing one.
+pub const O_WRITE: u64 = 1;
+/// `open` flags: read and write; creates the file if missing and keeps its contents.
+pub const O_READ_WRITE: u64 = 2;
+/// Add to `O_WRITE` or `O_READ_WRITE`: start at the end and keep the contents.
+pub const O_APPEND: u64 = 4;
+
+/// Open a file (flags: `O_READ`, `O_WRITE`, `O_READ_WRITE`, optionally `| O_APPEND`).
+/// Returns a descriptor >= 3 or a negative error.
 pub fn open(path: &str, flags: u64) -> i64 {
     unsafe { sys::syscall3(sys::nr::OPEN, path.as_ptr() as u64, path.len() as u64, flags) }
 }

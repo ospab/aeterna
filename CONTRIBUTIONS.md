@@ -152,7 +152,6 @@ of ring 0, one at a time.
 - Ring 3 services: `seed`, console, storage, network, sound as separate processes.
 - Gaps in the ring 3 API ([liboos reference](docs/en/dev/liboos.md), "What does not exist yet"):
   directory listing, `stat`, `mkdir`, `unlink`, environment, starting programs, mouse input.
-- Known bug: `open` with flag 2 (read and write) gives a read-only descriptor.
 - Drivers: USB beyond xHCI, more NICs and audio codecs.
 - Host tests for more `no_std` code, and tests for the shell and the VFS.
 - Documentation: Russian pages that are missing (`drift`, `olang`, `kernel`), checks of the

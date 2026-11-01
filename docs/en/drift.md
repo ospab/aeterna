@@ -19,9 +19,8 @@ at run time, see below.
 ```
 
 Needs: the framebuffer and raw keyboard calls (see [System call ABI](syscall-abi.md), "Screen,
-keyboard, clock"), a user heap of about 32 MiB for the 1080p default (`HEAP_SIZE` in
-`user/liboos/src/heap.rs`; the program prints a message and exits if the heap is too small),
-and under 1 MB of disk for the package. Run it from the console, not over ssh or serial: it takes
+keyboard, clock"), about 32 MiB of memory at 1080p (the liboos heap grows on demand) and under
+1 MB of disk for the package. Run it from the console, not over ssh or serial: it takes
 over the screen and the keyboard until you quit it. Ctrl+C always kills it.
 
 Commanders and settings are stored as small files (`drift-slotN.sav`, `drift.cfg`) in `/home`,
@@ -223,12 +222,13 @@ scripted input (menus, launch, beacon, docking computer, trading, combat, bounty
 missiles, hyperspace, saving, death, ending) and writes screenshots as PPM files:
 
 ```
-cargo +nightly test --manifest-path apps/drift-core/Cargo.toml --target x86_64-pc-windows-msvc --release -- --nocapture
+cd <a directory outside the repository>
+cargo +stable-x86_64-pc-windows-gnu test --release --manifest-path D:/ospab-projects/ospab.os-v2/apps/drift-core/Cargo.toml -- --nocapture
 ```
 
-Run it from the repository root: the ring 3 target in `apps/.cargo/config.toml` applies only to
-cargo runs started inside `apps/`, and `--target` overrides the kernel target of the root
-configuration. Screenshots are written to the directory in the environment variable
+Run it from outside the repository: the `.cargo/config.toml` files of the repository root and of
+`apps/` select the kernel and ring 3 targets for any cargo started inside them. On Linux use the
+host stable toolchain the same way. Screenshots are written to the directory in the environment variable
 `DRIFT_SHOTS` (default `apps/drift-core/target/drift-shots` when run from the crate directory).
 
 ## Known limits
@@ -239,4 +239,3 @@ configuration. Screenshots are written to the directory in the environment varia
   original Cyrillic glyphs, so text is UTF-8 and monospaced.
 - The commander is saved only when docked, and a loaded game starts docked.
 - The story lives in the first galaxy; using the galactic drive leaves it behind.
-- Heap: the stock liboos heap of 4 MiB is too small; see the install section.

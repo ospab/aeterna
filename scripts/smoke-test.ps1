@@ -7,7 +7,7 @@
     types shell commands through the QEMU monitor (sendkey), takes a PNG screendump,
     and with -Shutdown types `shutdown` and expects QEMU to exit. Prints the guest's
     status lines and a PASS/FAIL verdict. Outputs go to
-    <scratchpad>\smoke\<timestamp>\. Building the ISO is not part of this script.
+    target\smoke\<timestamp>\ (or $env:OSPAB_SMOKE_OUT). Building the ISO is not part of this script.
 
     Usage (PowerShell 7, any directory):
       scripts\smoke-test.ps1                                  # newest isos\ospab-os-v2-*.iso, BIOS, no disk
@@ -55,11 +55,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$QemuExe         = 'D:\Toolz\qemu\qemu-system-x86_64.exe'
-$QemuImg         = 'D:\Toolz\qemu\qemu-img.exe'
-$PflashFw        = 'C:\Users\gvopr\AppData\Local\Temp\claude\D--ospab-projects-ospab-os-v2\cd885465-e879-446b-8f97-b11f8da57d17\scratchpad\net\code.fd'
-$OutRoot         = 'C:\Users\gvopr\AppData\Local\Temp\claude\D--ospab-projects-ospab-os-v2\cd885465-e879-446b-8f97-b11f8da57d17\scratchpad\smoke'
+# Tool locations; override with the environment variables OSPAB_QEMU, OSPAB_QEMU_IMG,
+# OSPAB_UEFI_FW and OSPAB_SMOKE_OUT.
+$QemuExe         = if ($env:OSPAB_QEMU) { $env:OSPAB_QEMU } else { 'D:\Toolz\qemu\qemu-system-x86_64.exe' }
+$QemuImg         = if ($env:OSPAB_QEMU_IMG) { $env:OSPAB_QEMU_IMG } else { Join-Path (Split-Path $QemuExe) 'qemu-img.exe' }
+$PflashFw        = if ($env:OSPAB_UEFI_FW) { $env:OSPAB_UEFI_FW } else { Join-Path (Split-Path $QemuExe) 'share\edk2-x86_64-code.fd' }
 $RepoRoot        = Split-Path -Parent $PSScriptRoot
+$OutRoot         = if ($env:OSPAB_SMOKE_OUT) { $env:OSPAB_SMOKE_OUT } else { Join-Path $RepoRoot 'target\smoke' }
 $ReadyLine       = '[  OK  ] Console: ready'
 $KeyDelayMs      = 60     # gap between keystrokes
 $CommandGapMs    = 1500   # time for the shell to run each typed command

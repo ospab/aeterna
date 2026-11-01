@@ -11,7 +11,12 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/boot/bios/target/bios.img}"
-( cd "$ROOT/boot/bios" && env -u RUSTFLAGS cargo +nightly build --release )
+NIGHTLY="${NIGHTLY:-nightly}"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        rustc +nightly-x86_64-pc-windows-gnu -V >/dev/null 2>&1 && NIGHTLY=nightly-x86_64-pc-windows-gnu ;;
+esac
+( cd "$ROOT/boot/bios" && env -u RUSTFLAGS cargo +$NIGHTLY build --release )
 RAW="$ROOT/boot/bios/target/x86_64-unknown-none/release/ospab_bios"
 mkdir -p "$(dirname "$OUT")"
 dd if=/dev/zero of="$OUT" bs=512 count=4 status=none
