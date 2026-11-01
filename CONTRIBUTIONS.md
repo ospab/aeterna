@@ -1,202 +1,283 @@
-﻿# Contributing to AETERNA / ospab.os
+﻿# Contributing to ospab.os
 
-Thank you for your interest in contributing. This document covers the build environment,
-code conventions, and contribution workflow.
+This file covers the workflow for patches, code conventions, licensing, bug reports and the rules
+for AI agents. For how to write programs and drivers see the
+[developer guide](docs/en/dev/README.md); for build and test commands see
+[Building](docs/en/building.md) and [Testing](docs/en/dev/testing.md).
 
 ---
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
-| Tool | Purpose | Install |
-|---|---|---|
-| Rust nightly | Kernel and userland compilation | `rustup default nightly` |
-| `xorriso` | Hybrid ISO generation | `apt install xorriso` |
-| `mtools` | FAT32 image manipulation | `apt install mtools` |
-| LLVM toolchain | `llvm-objcopy` for strip, `clang` for C | `apt install llvm clang` |
-| QEMU | Testing | `apt install qemu-system-x86` |
+| Tool | Purpose |
+|---|---|
+| Rust nightly with `rust-src` | Kernel, loaders, ring 3 programs (`build-std`, JSON targets) |
+| Rust stable | Host tools (`tools/tmt`, `tools/oosfs`) and host tests |
+| `xorriso`, `mtools`, `mkfs.vfat` | Hybrid ISO. On Windows they come from WSL |
+| QEMU | Testing. VMware Workstation is the main test target |
+| `dd`, a C compiler in WSL/Linux | BIOS loader image, DOOM (optional) |
 
-The kernel targets the custom `x86_64-ospab` Rust target defined in `x86_64-ospab.json`.
-Run `rustup target add` is not needed — cargo picks up the JSON target automatically with the
-`-Z build-std` flag in `.cargo/config.toml`.
+On Windows without the Visual C++ Build Tools use the GNU toolchain
+(`nightly-x86_64-pc-windows-gnu`). The kernel uses the custom target `x86_64-ospab.json`; cargo
+picks it up from `.cargo/config.toml`, and `rustup target add` is not needed.
 
-### Clone and Build
+### Clone and build
 
 ```bash
 git clone https://github.com/ospab/aeterna.git
 cd aeterna
-bash build.sh
+git submodule update --init      # doom_engine
+./build.sh kernel                # fast compile check
+./build.sh                       # ISO: isos/ospab-os-v2-N.iso (in WSL/Linux)
 ```
+
+`./build.sh image` makes a GPT disk image without WSL. Details: [Building](docs/en/building.md).
 
 ### Run
 
 ```bash
-# Minimal QEMU boot
-qemu-system-x86_64 -cdrom isos/ospab-os-v2-103.iso -m 256M -serial stdio
-
-# With RTL8139 networking
-qemu-system-x86_64 \
-  -cdrom isos/ospab-os-v2-103.iso \
-  -m 256M -serial stdio \
-  -device rtl8139,netdev=net0 \
-  -netdev user,id=net0
-
-# With IDE storage
-qemu-system-x86_64 \
-  -cdrom isos/ospab-os-v2-103.iso \
-  -m 256M -serial stdio \
-  -drive file=disk.img,format=raw,if=ide
+qemu-system-x86_64 -m 512M -cpu max -cdrom isos/ospab-os-v2-N.iso -serial stdio
 ```
+
+`N` is the number of your build (`ls isos`). More devices (disk, network, sound, UEFI): the
+scripts `scripts/run-qemu.ps1` and `scripts/run-qemu.sh`, and the command lines in
+[Testing](docs/en/dev/testing.md).
 
 ---
 
-## Codebase Layout
+## Codebase layout
+
+The full map is in [Kernel hacking](docs/en/dev/kernel-hacking.md). In short:
 
 | Path | Description |
 |---|---|
-| `src/main.rs` | Boot entry point — 5-phase init sequence |
-| `src/lib.rs` | Crate root — all module declarations |
-| `src/terminal.rs` | Interactive terminal, command dispatch |
-| `src/installer.rs` | UEFI disk installer (GPT + FAT32 + LFN) |
-| `src/doom.rs` | DOOM engine Rust FFI layer |
-| `src/fs/` | VFS + RamFS + deferred disk persistence |
-| `src/net/` | RTL8139, e1000, Ethernet, ARP, IPv4, ICMP, UDP, SNTP |
-| `src/drivers/` | ATA PIO, AHCI SATA, NVMe, AC97, ES1371 |
-| `arch/x86_64/` | GDT, IDT, PIC, keyboard, framebuffer, serial, panic |
-| `core/` | Scheduler, IPC, syscall dispatch, capability model |
-| `mm/` | Physical allocator, heap, VMM |
-| `drivers/` | PCI enumeration, storage/video/VirtIO trait stubs |
-| `userland/grape/` | Text editor |
-| `userland/tomato/` | Package manager |
-| `userland/plum/` | Shell |
-| `userland/seed/` | Init system |
-| `doom_engine/` | doomgeneric C source + freestanding libc shim |
+| `src/main.rs` | `_start`, boot sequence, boot log, boot self-tests |
+| `src/lib.rs` | library root, module declarations |
+| `src/terminal.rs` | the console and its commands |
+| `src/userspace/plum/` | the shell |
+| `src/userspace/axon/` | coreutils and tools |
+| `src/installer.rs`, `src/installer/` | disk installer |
+| `src/pci.rs`, `src/acpi/`, `src/xhci/` | PCI, ACPI, USB |
+| `arch/x86_64/` | GDT, IDT, PIC/APIC, keyboard, framebuffer, serial, panic |
+| `core/` | scheduler, system calls, objects and handles, ELF loader, locks |
+| `mm/` | physical memory, page tables, heap, user copies |
+| `vfs/` | virtual filesystem, RamFS, overlay, `/proc`, persistence |
+| `drivers/` | storage, audio, GPU, driver registry |
+| `net/` | network drivers and stack, TLS, OSTP |
+| `userland/grape/`, `userland/tomato/`, `userland/seed/` | editor, package manager, service table |
+| `fs/aeternafs/` | AeternaFS v2 filesystem crate |
+| `gui/` | `oos-ui` toolkit |
+| `user/` | `liboos` and ring 3 test programs |
+| `apps/` | ring 3 programs and packages (the SDK) |
+| `boot/` | ospab-boot loader (BIOS, UEFI) |
+| `tools/` | host tools: `tmt`, `oosfs`, `mkimage.rs` |
+| `doom_engine/` | doomgeneric (git submodule) |
 
 ---
 
-## Code Conventions
+## Code conventions
 
 ### Rust
 
-- `#![no_std]` everywhere — no standard library. Use `extern crate alloc` for `Vec`, `String`, `BTreeMap`.
-- All public functions and types require doc comments (`///`).
-- Unsafe blocks require a `// SAFETY:` comment explaining the invariant being upheld.
-- Use `crate::` for internal paths, not `ospab_os::` (except from outside the crate).
-- Hardware access functions should be marked `unsafe` and called from a single initialisation site.
+- `#![no_std]` in the kernel, `liboos` and the game cores. Use `extern crate alloc` for `Vec`,
+  `String` and `BTreeMap`.
+- Every public function and type gets a doc comment (`///`).
+- Every `unsafe` block gets a `// SAFETY:` comment that states the invariant it relies on.
+- Use `crate::` for internal paths.
+- Do not use `static mut` for shared state in new code; follow the
+  [locking rules](docs/en/kernel.md). Do not panic on bad input from ring 3 or from hardware.
+- A driver that does not find its device returns `false`.
 
 ### Naming
 
 | Item | Style | Example |
 |---|---|---|
 | Modules, functions, variables | `snake_case` | `init_driver`, `send_packet` |
-| Types, traits, enums | `PascalCase` | `PacketBuffer`, `ServiceState` |
+| Types, traits, enums | `PascalCase` | `PacketBuffer`, `NetDriver` |
 | Constants | `SCREAMING_SNAKE_CASE` | `MAX_PACKET_SIZE` |
 | Files | `snake_case.rs` | `rtl8139.rs`, `ramfs.rs` |
 
-### File Organisation
+### File organisation
 
-- Each subsystem has its own directory with a `mod.rs` entry point.
-- Trait definitions go in a separate `trait.rs` within the same directory.
-- Userland tools live in `userland/<tool>/src/lib.rs`.
-- Architecture-specific code belongs in `arch/x86_64/`.
+- Each subsystem has its own directory with a `mod.rs`. Trait definitions may go in `trait.rs`.
+- New files must be included by a `mod` line, or they are not compiled.
+- Ring 3 programs go in `apps/<name>/`; the shell and coreutils are in `src/userspace/`.
+- Architecture-specific code goes in `arch/x86_64/`.
 
 ### Logging
 
-- All subsystem log messages use a prefix: `[NET]`, `[FS]`, `[ATA]`, `[DOOM]`, etc.
-- Messages are terminated with `\r\n` for serial compatibility.
-- Boot-phase messages use `klog::boot()` / `klog::err()` for the `dmesg` ring buffer.
-- Debug-only traces use `serial::write_str()` directly and should be removed before merging.
+- Subsystem messages start with a bracketed tag: `[NET]`, `[AHCI]`, `[AUDIO]`.
+- Serial messages end with `\r\n`.
+- A driver reports its result with one boot status line (`boot_log!` in `src/main.rs`):
+  `Ok`, `Warn`, `Fail`, `Absent` (optional hardware is not there), `Info`.
+- Kernel event log entries go through `klog` and show up in `dmesg`.
+- Remove debug traces before you send the change.
+
+### License headers
+
+The project is **AGPL-3.0-only** ([LICENSE](LICENSE)). Every source file starts with:
+
+```rust
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Your Name
+```
+
+Kernel files use the block form (`/* SPDX-License-Identifier: AGPL-3.0-only ... */`). New crates
+set `license = "AGPL-3.0-only"` in `Cargo.toml`.
 
 ---
 
-## Contribution Areas
+## Third-party code and files
 
-### High Priority
+- Use code only if its license is compatible with AGPL-3.0-only and you can say where it comes
+  from. Keep its notice and license text, and keep it in its own directory (`doom_engine/` is a
+  git submodule with its own GPL-2.0 license).
+- No third-party binaries in the repository: ROMs, disc images, game data (`*.rom`, `*.ssd`,
+  `*.wad`), firmware, 6502 test suites. `.gitignore` already excludes them, together with `*.tmt`,
+  `dist/`, `isos/` and `target/`. Programs ask the user for such files; tests read them from
+  environment variables.
+- Do not commit ISO images, logs or compiler crash dumps (`rustc-ice-*.txt`).
+- Never commit or print signing keys. The package signing key `%USERPROFILE%\.ospab\tmt.key`
+  belongs to the maintainers; test with your own keys.
 
-- **Process isolation** — ELF loader, Ring 3 execution, syscall ABI, `fork`/`exec`/`wait`
-- **TCP/IP** — SYN/ACK state machine, connection table, retransmit timer
-- **Capability enforcement** — capability table per process, syscall dispatcher integration
+---
 
-### Medium Priority
+## Where help is needed
 
-- **Preemptive scheduler** — TCB, IRQ 0 context switch, priority classes, timer wheel
-- **USB stack** — xHCI, HID keyboard, Mass Storage / BOT
-- **ext2/FAT32 mount** — read existing filesystems from disk into the VFS
+The plan is in [ROADMAP.md](ROADMAP.md) (in Russian). Stage 3 is the main work: move services out
+of ring 0, one at a time.
 
-### Good First Contributions
+- Ring 3 services: `seed`, console, storage, network, sound as separate processes.
+- Gaps in the ring 3 API ([liboos reference](docs/en/dev/liboos.md), "What does not exist yet"):
+  directory listing, `stat`, `mkdir`, `unlink`, environment, starting programs, mouse input.
+- Known bug: `open` with flag 2 (read and write) gives a read-only descriptor.
+- Drivers: USB beyond xHCI, more NICs and audio codecs.
+- Host tests for more `no_std` code, and tests for the shell and the VFS.
+- Documentation: Russian pages that are missing (`drift`, `olang`, `kernel`), checks of the
+  guides against the source.
 
-- Add a new terminal command (see `src/terminal.rs` — search for the `match cmd_name` block)
-- Improve `tutor` topics with more technical depth
-- Add packages to the `tomato` built-in repository
-- Write VFS unit tests (no hardware required — RamFS is pure Rust)
-- Fix linting: `cargo clippy` and address any new warnings
+### Good first contributions
+
+- Add a coreutils-style command ([Kernel hacking](docs/en/dev/kernel-hacking.md), "Add a shell
+  command").
+- Write a small program or game as a package ([Your first program](docs/en/dev/first-program.md)).
+- Add depth to the `tutor` topics.
+- Add tests for `beeb-core`, `drift-core` or `aeternafs`.
+- Fix an error in the docs.
 
 ---
 
 ## Workflow
 
-### 1. Fork and create a branch
+1. **Branch** from `master`. One branch, one subject.
+2. **Develop and test.** [Testing](docs/en/dev/testing.md) has the commands.
+   - `./build.sh kernel` passes for every kernel change; the host tests pass for the crate you
+     touched (`beeb-core`, `drift-core`, `aeternafs`).
+   - Boot a build in QEMU, and in VMware if you touched boot, display, input or sound. Look at
+     the serial log for `[ FAIL ]`, `[CRITICAL]` and `[FATAL]`.
+   - The kernel build runs with warnings off, so for `apps/`, host crates and tools leave no new
+     warnings.
+   - Test builds must not take an ISO number: set `ISO_PATH` outside `isos/`.
+3. **Commit.** Small, focused commits that build. Do not mix a refactor with a feature, and do not
+   reformat files you do not change.
+4. **Open a pull request** that says what changed and why, how you tested it (build, VM,
+   firmware, devices), and includes the relevant serial log. Add screenshots if the screen
+   output changes.
 
-```bash
-git checkout -b feat/my-feature
+### Commit messages
+
+The history uses one line per commit:
+
+```
+area: what changed, lower case, no full stop
 ```
 
-### 2. Develop
-
-- Test with QEMU after every meaningful change.
-- Verify `bash build.sh` completes with zero warnings and zero errors.
-- Check `dmesg` in the running OS for unexpected log output.
-
-### 3. Commit messages
-
-Use the [Conventional Commits](https://www.conventionalcommits.org/) format:
-
 ```
-feat(net): implement TCP SYN/ACK state machine
-fix(vfs): handle concurrent readdir during deferred sync
-refactor(terminal): extract command dispatch to dedicated module
-docs: update ROADMAP with Phase 9 progress
-chore(build): add strip step with llvm-objcopy
+apps/build.ps1: -Only to build, pack and upload selected packages; beeb 0.1.1
+ring 3: sound output syscalls (audio_open/write/queued/close/volume)
+fs/aeternafs: AeternaFS v2, a copy-on-write filesystem; tools/oosfs
+boot: ospab-boot for BIOS, own hybrid ISO, Limine removed
+tomato: apt-style commands (update, upgrade, install, remove, search, list, show, files)
 ```
 
-Scope examples: `kernel`, `net`, `vfs`, `fs`, `mm`, `arch`, `installer`, `doom`, `terminal`,
-`plum`, `grape`, `tomato`, `seed`, `drivers`, `build`, `docs`.
+- The area is the directory, crate, program or subsystem (`boot`, `apps`, `tomato`, `drift`,
+  `ring 3`, `docs`). Use the word earlier commits in that area used.
+- Put the reason and details in the body after an empty line.
+- Older commits use `feat(scope):` and `fix(scope):`. Do not mix both styles in one pull request.
+- Raise the version in `apps/pkg/<name>.toml` when the content of a package changes.
 
-### 4. Open a pull request
+### Documentation
 
-Include:
-- A clear description of what the change does and why.
-- Steps to reproduce / test the behaviour.
-- Serial log output (`-serial stdio`) showing the relevant boot phases succeeding.
-- Screenshots if the framebuffer output changes.
+- English in `docs/en` is primary and `docs/ru` is the translation. A change in a command, a
+  system call or a file format changes the English page in the same pull request; the Russian page
+  follows. If you cannot write Russian, say in the pull request that the translation is missing.
+- Keep `README.md` and `README_ru.md` in step with the docs tables.
+- Style: plain technical language, short sentences, no marketing, no emoji. Say what does not
+  exist yet. Verify commands and names against the source.
 
 ---
 
-## Testing
+## Acceptance checklist
 
-Since AETERNA is a bare-metal kernel, all testing is done through QEMU:
+Boot a build and check at least:
 
-```bash
-# Build and run
-bash build.sh
-qemu-system-x86_64 -cdrom isos/ospab-os-v2-103.iso -m 256M -serial stdio
-```
-
-**Minimum acceptance checklist before submitting a PR:**
-
-- [ ] All 5 boot phases complete with `[OK]`
-- [ ] Shell prompt appears (`root@ospab:~# `)
-- [ ] `version` shows correct kernel version
+- [ ] Boot ends with `[  OK  ] Console: ready` and no `[ FAIL ]` line (the smoke test checks this)
+- [ ] `uname -a` shows the build you expect
 - [ ] `ls /` returns the standard directory tree
-- [ ] `ping 10.0.2.2` returns RTT in microseconds (if network changed)
-- [ ] `grape /tmp/test.txt` opens, accepts text, saves, exits cleanly (if editor changed)
-- [ ] `seed status` shows all 9 services (if init changed)
-- [ ] `bash build.sh` produces zero warnings
+- [ ] `ping 10.0.2.2` works in QEMU (if you changed network code)
+- [ ] `grape /tmp/test.txt` opens, saves and exits cleanly (if you changed the editor)
+- [ ] `seed status` runs (if you changed init)
+- [ ] `tomato install` of a local `.tmt` and running the program (if you changed packages or `liboos`)
+- [ ] `./build.sh kernel` passes
+
+---
+
+## Rules for AI agents
+
+The rules in `CLAUDE.md` apply to every agent that works in this repository. A person who uses
+an agent is responsible for what it does.
+
+- Change files with the editor tools (Edit and Write), not with scripts that rewrite source
+  (no Python, sed, awk or PowerShell edit scripts), and leave no helper scripts in the repository.
+  If an edit does not apply, find out why: CRLF line endings, tabs, control characters.
+- Agents do not run `git commit` or `git push`. The person in charge does.
+- Stay inside the files the task names; others may be editing the rest.
+- Do not read, print or copy the signing key `%USERPROFILE%\.ospab\tmt.key`.
+- ROMs, disc images and other third-party binaries never go into the repository.
+- Do not consume ISO numbers in `isos/`: test builds set `ISO_PATH` outside it.
+- Never kill all QEMU processes, only the one you started.
+
+---
+
+## Reporting a bug
+
+Open an issue in the GitHub repository (`github.com/ospab/aeterna`). Include:
+
+1. **The build.** Output of `uname -a`:
+
+   ```
+   # uname -a
+   AETERNA ospab 1.1.0 #181 e8f4f4f+ 2026-10-09 x86_64 ospab.os
+   ```
+
+   A `+` after the commit means local changes. Say how you got the ISO.
+2. **The machine.** VMware or QEMU and its version, BIOS or UEFI, disk controller, network card,
+   sound card, display mode, RAM. For real hardware, the model.
+3. **What you did**, step by step from boot. For a program: package and version (`tomato list`).
+4. **What you expected and what happened.** For a program, the exit status (`echo $?`).
+5. **The serial log**, whole, from boot to the problem ([Testing](docs/en/dev/testing.md),
+   "Reading the serial log"). `[ WARN ]`, `[ FAIL ]`, `[CRITICAL]` and `[FATAL]` lines matter
+   most. `dmesg` shows the kernel event log.
+6. **A screenshot** if the screen looks wrong; the panic screen shows the fault address.
+7. **Whether it repeats**, and whether the previous build had the same problem.
+
+Remove personal data from logs before you attach them.
 
 ---
 
 ## License
 
-By contributing to AETERNA / ospab.os, you agree that your contributions will be
-licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0-only) (see [LICENSE](LICENSE)).
+By contributing to ospab.os you agree to license your contributions under the
+GNU Affero General Public License v3.0 (AGPL-3.0-only), see [LICENSE](LICENSE).
