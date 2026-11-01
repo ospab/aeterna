@@ -36,18 +36,18 @@ duplicated), `TRANSFER`=8 (may be sent in a message). Memory objects add `MAP`=1
 mapped), `EXEC`=32 (may be mapped executable; not handed out by any call yet) and `PHYS`=64 (the
 physical address may be read). A duplicate can only lose rights.
 
-Objects: **Process**, **Thread** (one thread per process for now), **Channel**, **Notification**,
-**Reply** (the right to answer one call; created by the kernel on `call` and handed to the
-receiver in `recv`), **MemoryRegion**, **MmioRegion**, **Interrupt**, **IoPortRange**,
-**Resource** (see below). An object lives while at least one handle or in-flight message refers to it.
-When a process exits all its handles are closed, objects are freed and waiters are woken.
+Objects: Process, Thread (one thread per process for now), Channel, Notification, Reply (the
+right to answer one call; the kernel creates it on `call` and hands it to the receiver in
+`recv`), MemoryRegion, MmioRegion, Interrupt, IoPortRange and Resource (see below). An object
+lives while at least one handle or in-flight message refers to it. When a process exits, all its
+handles are closed, its objects are freed and its waiters are woken.
 
 ## Message
 
 160 bytes: `tag: u64`, `len: u32` (≤ 128), `nhandles: u32` (≤ 4), `handles: [u32; 4]`,
-`data: [u8; 128]`. Handles in a message are **moved** (removed from the sender, the `TRANSFER`
-right is required); the receiver gets new values, and on return `handles[]` holds the values in
-the receiver's table.
+`data: [u8; 128]`. Handles in a message are moved: they are removed from the sender, and the
+`TRANSFER` right is required. The receiver gets new values, and on return `handles[]` holds the
+values in the receiver's table.
 
 ## Calls
 
@@ -104,29 +104,29 @@ FsWrite capabilities.
 
 ## Shared memory (stage 2, item 12)
 
-A **MemoryRegion** is a set of physical pages owned by the kernel object. `mem_create` makes an
-anonymous region; the handle is passed to another process in a message (usually a duplicate with
-fewer rights). Each process maps it with `mem_map` and sees the other's writes.
+A MemoryRegion is a set of physical pages owned by a kernel object. `mem_create` makes an
+anonymous region. The handle goes to another process in a message, usually as a duplicate with
+fewer rights. Each process maps the region with `mem_map` and sees the other's writes.
 
 - `prot` for `mem_map`: `READ`=1, `WRITE`=2, `EXEC`=4. `READ` is required; `WRITE|EXEC` together
   is refused (W^X) with `InvalidArgument`. Rights needed: `MAP`+`READ`, plus `WRITE` for a
-  writable mapping and `EXEC` for an executable one. **Pages are no-execute by default**; `EXEC`
-  is granted by no call yet, so shared memory is never executable. A process that writes through
+  writable mapping and `EXEC` for an executable one. Pages are no-execute by default, and no call
+  grants `EXEC` yet, so shared memory is never executable. A process that writes through
   a read-only mapping gets a page fault and is killed.
 - `hint` is reserved (pass 0): the kernel picks the address in the process's mmap area.
 - The whole region is mapped; `mem_unmap` takes exactly the address `mem_map` returned (partial
   unmaps are not supported).
 - A mapping holds its own reference: closing the handle does not unmap. The pages are freed when
-  the last handle is closed **and** the last mapping is gone. Process exit closes the handles and
+  the last handle is closed and the last mapping is gone. Process exit closes the handles and
   drops the mappings.
 - Removed: the old SMR mechanism (calls 120–122, raw physical addresses with no owner),
   `dma_alloc` (130), which returned a physical address to ring 3, raw port I/O (60/61),
   `irq_wait` (62) and `vfs_register` (100).
 
-**DMA.** `mem_create_contig(resource, size)` allocates physically contiguous pages and the handle
-carries `PHYS`; `mem_phys` returns the address to program into a device. Only a process with a
-**Resource** handle of kind DMA (with `WRITE`) can do this; a duplicate without `PHYS` can be
-handed to clients so they do not learn the address.
+DMA: `mem_create_contig(resource, size)` allocates physically contiguous pages and the handle
+carries `PHYS`. `mem_phys` returns the address to program into a device. Only a process with a
+Resource handle of kind DMA (with `WRITE`) can do this. A duplicate without `PHYS` can be handed
+to clients so they never learn the address.
 
 ## Hardware as handles (stage 2, item 13)
 
@@ -134,22 +134,22 @@ Interrupt, IoPortRange, MmioRegion and Resource objects cannot be created by any
 are made only by the privileged root (today the kernel boot code, `core::object::kernel_new_*`;
 later `seed`) and given to a driver as bootstrap handles (`core::elf::spawn_with_handles`).
 
-- **Interrupt**: a legacy (8259) IRQ line, currently only 3, 6 or 8 (lines no kernel driver
-  uses); one object per line; MSI is not supported yet. After `irq_bind` every interrupt **masks
-  the line**, ORs `bits` into the notification and wakes its waiter; the kernel sends EOI. The
-  driver services the device and calls `irq_ack`, which unmasks the line. The line is masked from
-  creation until the first `irq_ack`, and again when the object goes away.
-- **IoPortRange**: ports `[base, base+count)`. Mechanism: the **I/O permission bitmap in the
-  TSS**. `IOPL` stays 0; `ioport_enable` builds the process's bitmap (one bit per port, 1 =
-  denied) and the scheduler copies it into the TSS on a switch to that process (only the bytes in
-  use, and only when another process's bitmap is loaded). For processes without ports the bitmap
-  is switched off (`iopb_offset` beyond the TSS limit), so any IN/OUT raises #GP and the process
-  is killed. Port access itself costs nothing (no system call per access). Like a mapping, an
-  enabled range holds a reference and lasts until `ioport_disable` or exit.
-- **MmioRegion**: a device physical range (e.g. a PCI BAR); `mem_map` works on it as on a
-  MemoryRegion, but the pages are mapped **uncached** (PCD|PWT) and never freed. RAM managed by
-  the frame allocator cannot be wrapped as MMIO.
-- **Resource**: authority to create special objects; kind DMA allows `mem_create_contig`.
+- Interrupt: a legacy (8259) IRQ line, currently only 3, 6 or 8 (lines no kernel driver uses).
+  There is one object per line, and MSI is not supported yet. After `irq_bind` every interrupt
+  masks the line, ORs `bits` into the notification and wakes its waiter. The kernel sends EOI.
+  The driver services the device and calls `irq_ack`, which unmasks the line. The line is masked
+  from creation until the first `irq_ack`, and again when the object goes away.
+- IoPortRange: ports `[base, base+count)`. The mechanism is the I/O permission bitmap in the TSS.
+  `IOPL` stays 0. `ioport_enable` builds the process's bitmap (one bit per port, 1 = denied), and
+  the scheduler copies it into the TSS on a switch to that process (only the bytes in use, and
+  only when another process's bitmap is loaded). For processes without ports the bitmap is
+  switched off (`iopb_offset` beyond the TSS limit), so any IN/OUT raises #GP and the process is
+  killed. Port access itself costs nothing, since there is no system call per access. Like a
+  mapping, an enabled range holds a reference and lasts until `ioport_disable` or exit.
+- MmioRegion: a device physical range (for example a PCI BAR). `mem_map` works on it as on a
+  MemoryRegion, but the pages are mapped uncached (PCD|PWT) and never freed. RAM managed by the
+  frame allocator cannot be wrapped as MMIO.
+- Resource: authority to create special objects. Kind DMA allows `mem_create_contig`.
 
 Tests: boot with the kernel parameter `selftest=mem` (`user/memtest`, `user/uartdrv`). The COM2
 driver (`uartdrv`) needs a second serial port in QEMU: `-serial file:com1.log -serial file:com2.log`.
@@ -169,7 +169,7 @@ needs the Framebuf capability (the shell gives it to every program it starts).
 | 264 | kbd_event | → event, 0 if the queue is empty |
 | 270 | clock_ns | → monotonic nanoseconds since boot |
 
-**screen_acquire.** Maps the boot framebuffer into the caller (read/write, no-execute, uncached,
+screen_acquire: maps the boot framebuffer into the caller (read/write, no-execute, uncached,
 as an MmioRegion mapping) and writes 32 bytes to `info*`: `addr: u64`, `width: u32`,
 `height: u32`, `pitch: u32` (bytes per line), `bpp: u32`, `red_shift`, `green_shift`,
 `blue_shift` (one byte each), one pad byte. `addr` already includes the offset inside the first
@@ -180,22 +180,22 @@ caller gets -5 (Busy). -2 without the Framebuf capability, -7 without a framebuf
 until the process exits but must not be used. When the owner exits or is killed the kernel
 releases the screen itself (scheduler teardown, `screen::process_gone`).
 
-**screen_flush.** On VMware SVGA II a framebuffer write is not shown until an update command is
+screen_flush: on VMware SVGA II a framebuffer write is not shown until an update command is
 sent; this call sends one for the whole screen. Call it once per frame. It does nothing on
 plain framebuffers.
 
-**kbd_mode / kbd_event.** In raw mode the program gets PC set-1 scancodes as events instead of
+kbd_mode and kbd_event: in raw mode the program gets PC set-1 scancodes as events instead of
 the console line discipline (`core/stdin.rs`). Event value: bits 0..7 the scancode (1..0x7F),
 bit 8 set if the key had the 0xE0 prefix, bit 9 set for a release. 0 means no event. Only one
 process can be in raw mode (another caller gets -5). The kernel leaves raw mode and flushes the
-queue when the owner exits. **Ctrl+C still works**: the keyboard interrupt sets the interrupt
-flag before the scancode is queued. A program that owns the screen or the raw keyboard is ended
-by the kernel itself at its next `kbd_event`, `screen_flush` or `sleep_ms` call (exit code 130),
-because a program that never blocks would starve the shell, which normally does the killing. The
-screen and the keyboard are then released. Text pasted with Ctrl+V and serial input
-are not delivered in raw mode.
+queue when the owner exits. Ctrl+C still works: the keyboard interrupt sets the interrupt flag
+before the scancode is queued. The shell normally does the killing, but a program that never
+blocks would starve it. So the kernel itself ends a program that owns the screen or the raw
+keyboard at its next `kbd_event`, `screen_flush` or `sleep_ms` call (exit code 130), and releases
+the screen and the keyboard. Text pasted with Ctrl+V and serial input are not delivered in raw
+mode.
 
-**clock_ns.** Monotonic, from the TSC when it is calibrated (otherwise the 100 Hz tick).
+clock_ns: monotonic, from the TSC when it is calibrated (otherwise the 100 Hz tick).
 
 ## Audio (sound output)
 
@@ -211,35 +211,35 @@ program needs the Framebuf capability (the same one as for the screen calls).
 | 274 | audio_close | stream → 0 |
 | 275 | audio_volume | stream, percent (0..100) → 0 |
 
-**audio_open.** `rate` is 48000, 44100 or 22050 Hz, `channels` is 1 or 2. Samples are signed
+audio_open: `rate` is 48000, 44100 or 22050 Hz, `channels` is 1 or 2. Samples are signed
 16-bit little endian, interleaved. The kernel resamples to the rate of the sound device (linear
 interpolation) and turns mono into stereo. Errors: -2 without the Framebuf capability, -3 for
 any other format, -7 if there is no sound device (the program should carry on silently), -14 if
 all 4 streams (all processes together) are in use, -6 out of memory.
 
-**audio_write.** Copies whole frames (`channels * 2` bytes) into the stream's kernel ring, which
+audio_write: copies whole frames (`channels * 2` bytes) into the stream's kernel ring, which
 holds 200 ms (`rate / 5` frames). Returns the bytes accepted, 0 when the ring is full; the rest
 must be written again later. A trailing partial frame is ignored. At most 256 KiB are taken per
 call. -11 if `stream` is not an open stream of the caller, -10 for a bad pointer.
 
-**audio_queued.** Frames (at the stream's own rate) that the mixer has not consumed yet. Keep it
+audio_queued: frames (at the stream's own rate) that the mixer has not consumed yet. Keep it
 above about 50 ms worth to avoid gaps; poll it (with `sleep_ms`) to pace a producer. The device
 holds up to about 60 ms more after a frame has left the stream. When it reads 0 the stream is
 empty; wait about 100 ms more for the tail to be heard (`Audio::drain` does this).
 
-**audio_volume.** Per-stream gain, default 100. The curve is `(percent / 100)^2`. The master volume
+audio_volume: per-stream gain, default 100. The curve is `(percent / 100)^2`. The master volume
 of the device (shell `volume`) applies on top.
 
-**Mixing and pumping.** The kernel feeds the device from the 100 Hz audio timer tick
+Mixing: the kernel feeds the device from the 100 Hz audio timer tick
 (`audio::timer_tick`): every tick it keeps about 60 ms in the device ring, summing all streams,
 and applies a soft knee above 3/4 of full scale (as the DOOM mixer does) before clipping at
 16 bits. A program only has to keep its stream buffer topped up. While no stream has data
 nothing is written, so the device is silent and other users of `audio::submit` (DOOM,
-`soundtest`) are not disturbed; but ring-3 streams and DOOM are not summed with each other: if
-DOOM keeps the device queue full, the streams wait.
+`soundtest`) are not disturbed. Ring-3 streams and DOOM are not summed with each other, though:
+if DOOM keeps the device queue full, the streams wait.
 
-**Cleanup.** Streams are closed when the program calls `audio_close`, exits or is killed
-(scheduler teardown, `screen::process_gone` -> `audio::process_gone`).
+Cleanup: a stream is closed when the program calls `audio_close`, exits or is killed (scheduler
+teardown, `screen::process_gone` calls `audio::process_gone`).
 
 Test: `apps/tone` plays 440 Hz (mono, 48000 Hz) and then a C major chord (stereo, 44100 Hz)
 and exits. Run QEMU with `-audiodev wav,id=a0,path=out.wav` and `intel-hda`/`hda-duplex`, `AC97` or

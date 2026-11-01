@@ -20,8 +20,8 @@ Log out (launcher menu) returns to the console.
 | Protocol | `proto` | Messages between apps and the window manager |
 | Window manager | `desktop`, `session` | Compositor, stacking, focus, top bar, dock, launcher, Alt+Tab |
 
-The split that matters: **apps use only `app` (plus the widget types it re-exports)**.
-The window manager (`desktop`) and the session loop never appear in app code.
+The split that matters: apps use only `app` and the widget types it re-exports. The window
+manager (`desktop`) and the session loop never appear in app code.
 
 ## Processes today
 
@@ -105,7 +105,7 @@ Implemented in `gui/src/desktop.rs`.
 ### Display changes
 
 The session reads `display::generation()` every frame (`drivers/gpu/display.rs`). When it changes
-(Settings → Display, `display` in a terminal window, VMware autofit) the desktop takes the new
+(Settings > Display, `display` in a terminal window, VMware autofit) the desktop takes the new
 framebuffer (size, pitch), recreates the back buffer and calls `Desktop::resize_screen`: windows
 larger than the work area shrink, all windows are moved back on screen, maximized windows follow
 the work area, and the top bar and dock are laid out for the new width. Apps receive a normal
@@ -135,7 +135,7 @@ serial port). Measured in QEMU TCG without KVM (a slow emulated CPU), 1280x800, 
 | Average repainted area | 127k px (12% of the screen) |
 
 On the host (native, `gui/examples/mockups.rs`) the first frame takes 3.2 ms and a full
-recomposite 1.7 ms. Expect real hardware to be close to the host numbers.
+recomposite 1.7 ms. Real hardware has not been measured.
 
 ## Moving the compositor to ring 3
 

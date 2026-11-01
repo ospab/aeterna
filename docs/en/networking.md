@@ -43,17 +43,17 @@ client whose commands follow the Linux `ostp` client.
 # ostp gk -n 2                              generate access keys
 ```
 
-The configuration is stored in `/etc/ostp/config.json`; on an installed system it survives a
+The configuration is stored in `/etc/ostp/config.json`. On an installed system it survives a
 reboot once it has been written to disk (`sync`, or automatically after a few seconds).
 
-Transports: **UDP** and **UoT** (UDP over TCP). Links that require TLS are reported as
-unsupported. While the console waits for input it keeps an established session alive with
-keepalives; if the session dies, the next `ostp` command reconnects.
+Transports: UDP and UoT (UDP over TCP). Links that require TLS are reported as unsupported. While
+the console waits for input it keeps an established session alive with keepalives. If the session
+dies, the next `ostp` command reconnects.
 
-Entropy for the handshake comes from the CPU's RDRAND instruction. On a CPU without RDRAND
-`connect` refuses unless `--weak-rng` is given (in QEMU use `-cpu max`).
+The handshake takes its random numbers from the CPU's RDRAND instruction. On a CPU without RDRAND
+`connect` refuses unless you pass `--weak-rng` (in QEMU use `-cpu max`).
 
-Typing a long link by hand is not necessary: in VMware use Ctrl+V or `ostp import $(clip)`, see
+You do not have to type a long link by hand. In VMware use Ctrl+V or `ostp import $(clip)`, see
 [Shell and tools](shell.md).
 
 Not yet: routing all system traffic through the tunnel (a tunnel network interface).

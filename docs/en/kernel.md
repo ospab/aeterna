@@ -1,7 +1,7 @@
 # Kernel internals
 
-This page describes how the kernel keeps its shared state consistent, and how tasks, handles,
-file descriptors and console input work. Source: `core/`, `mm/`, `vfs/`.
+This page covers how the kernel keeps shared state consistent, and how tasks, handles, file
+descriptors and console input work. Source: `core/`, `mm/`, `vfs/`.
 
 ## Locks
 
@@ -144,6 +144,6 @@ line editor (history, completion, Ctrl+A/E/K/W). The two paths do not share stat
 
 ## Boot tests
 
-`core/selftest.rs` runs with the kernel parameter `selftest=sched` (or `selftest=all`): lock
-rules, and several tasks working on their own descriptor tables under preemption. Ring-3 tests in `src/main.rs` check that no
-frames are left allocated after the test processes exit.
+`core/selftest.rs` runs with the kernel parameter `selftest=sched` (or `selftest=all`). It checks
+the lock rules and runs several tasks on their own descriptor tables under preemption. The
+ring-3 tests in `src/main.rs` check that no frames stay allocated after the test processes exit.

@@ -11,20 +11,26 @@
 
 | Настройка | Значение | Зачем |
 |---|---|---|
-| Гостевая ОС | **Other**, версия **Other 64-bit** | при «Other» (32-bit) запускается 32-битная прошивка UEFI, которая не умеет загрузить 64-битный загрузчик |
-| Прошивка | **UEFI**, Secure Boot **выключен** | установленная система грузится через UEFI; наш загрузчик не подписан |
-| USB-контроллер | **USB 3.x** | USB-клавиатуре и мыши нужен драйвер xHCI; USB 2 (EHCI/UHCI) пока не поддерживается |
-| Жёсткий диск | NVMe, SATA или IDE, от 2 ГБ | поддерживаются все три |
-| Сеть | NAT | работают e1000, vlance и vmxnet3 |
+| Гостевая ОС | Other, версия Other 64-bit | Обычный «Other» (32-bit) запускает 32-битную прошивку UEFI, она не умеет загружать 64-битный загрузчик |
+| Прошивка | BIOS или UEFI (Secure Boot выключен) | У ospab-boot есть BIOS- и UEFI-вариант. Загрузчик не подписан, поэтому Secure Boot должен быть выключен |
+| USB-контроллер | USB 3.x | USB-клавиатуре и мыши нужен драйвер xHCI. USB 2 (EHCI/UHCI) пока не поддерживается |
+| Жёсткий диск | NVMe, SATA или IDE, от 2 ГБ | Работают все три |
+| Сеть | NAT | Работают e1000, vlance и vmxnet3 |
 | Звуковая карта | по умолчанию | ES1371 |
-| Guest Isolation | копирование и вставка **разрешены** | тогда Ctrl+V вставляет буфер обмена Windows |
-| SCSI-контроллер | нет или LSI Logic | контроллер BusLogic не работает с 64-битными гостями |
+| Guest isolation | копирование и вставка разрешены | Тогда Ctrl+V вставляет буфер обмена Windows |
+| SCSI-контроллер | нет или LSI Logic | Контроллер BusLogic не работает с 64-битными гостями |
 
-Подключите ISO к приводу CD/DVD и включите ВМ. Limine 5 секунд показывает меню:
+Подключите ISO к приводу CD/DVD и включите ВМ. В любом режиме прошивки ospab-boot 5 секунд
+показывает меню:
 
-- **ospab.os Live** — полная система, работающая с CD.
-- **ospab.os Installer** — сразу запускает установщик.
-- **ospab.os Live (ospab loader, test)** — та же система, запущенная нашим собственным загрузчиком.
+- ospab.os Live: полная система, работает прямо с CD.
+- ospab.os Desktop: сеанс с рабочим столом.
+- ospab.os Installer: сразу запускает установщик.
+- ospab.os (debug), Memory test, Reboot, Power off, а на UEFI ещё Firmware settings.
+
+Режим установщика «Erase entire disk» делает диск, который грузится и в BIOS, и в UEFI. Режим
+«Install alongside other systems» работает только в UEFI; если живая система запущена в BIOS,
+установщик его не даёт.
 
 ## QEMU
 
@@ -32,8 +38,11 @@
 qemu-system-x86_64 -cdrom isos/ospab-os-v2-N.iso -m 512M -serial stdio
 ```
 
-Полезные добавки: `-cpu max` (AVX, SMEP/SMAP, RDRAND), `-device intel-hda -device hda-duplex` для
-звука, `-device qemu-xhci -device usb-kbd` для USB-клавиатуры и прошивка UEFI, например OVMF:
+Так запускается путь через BIOS (SeaBIOS). Чтобы грузиться с USB-флешки, а не с CD, используйте
+`-drive file=isos/ospab-os-v2-N.iso,format=raw,if=none,id=u -device qemu-xhci -device usb-storage,drive=u`.
+
+Что ещё может пригодиться: `-cpu max` (AVX, SMEP/SMAP, RDRAND), `-device intel-hda -device hda-duplex`
+для звука, `-device qemu-xhci -device usb-kbd` для USB-клавиатуры и прошивка UEFI, например OVMF:
 `-drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd`.
 
 ## Лог загрузки
@@ -47,7 +56,7 @@ qemu-system-x86_64 -cdrom isos/ospab-os-v2-N.iso -m 512M -serial stdio
 [ FAIL ] ...
 ```
 
-`--` означает, что необязательного устройства нет, это нормально. Загрузка заканчивается строками
+`--` значит, что необязательного устройства нет, и это нормально. Загрузка заканчивается строками
 `[  OK  ] Ring 3 self-test: N checks passed` и `[  OK  ] Console: ready`.
 
 ## Первые команды

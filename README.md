@@ -12,16 +12,16 @@
 
 </div>
 
-**ospab.os** is a closed, vertically integrated operating system built from scratch in Rust.
-Its kernel is called **AETERNA**. The system does not try to be compatible with Linux or Windows:
-the bootloader, kernel, drivers, network stack, shell, package manager and tools are written
-together and designed as one whole. It is part of the ospab ecosystem and has native support for
-the [OSTP](https://github.com/ospab/ostp) transport.
+ospab.os is a closed, vertically integrated operating system written from scratch in Rust.
+Its kernel is called AETERNA. It makes no attempt to run Linux or Windows programs: the
+bootloader, kernel, drivers, network stack, shell, package manager and tools are written
+together and fit each other. It belongs to the ospab ecosystem and speaks the
+[OSTP](https://github.com/ospab/ostp) transport natively.
 
 > **Status: research system, mid-redesign.** The kernel is moving from a single-address-space
 > monolith to a real microkernel. Ring-3 processes, kernel objects, capabilities and IPC already
-> work; most drivers and the shell still run inside the kernel. See [ROADMAP.md](ROADMAP.md)
-> for the plan and [AUDIT.md](AUDIT.md) for an honest state of the code.
+> work. Most drivers and the shell still run inside the kernel. The plan is in
+> [ROADMAP.md](ROADMAP.md), the unflattering state of the code is in [AUDIT.md](AUDIT.md).
 
 ---
 
@@ -29,11 +29,11 @@ the [OSTP](https://github.com/ospab/ostp) transport.
 
 | Area | State |
 |---|---|
-| Boot | Own loader **ospab-boot** for BIOS and UEFI (menu, memory test, FAT and ISO9660 readers); hybrid ISO that boots from CD and USB on both |
-| Install | Full-screen installer: erase a disk, or **install alongside** Windows and Linux on the existing ESP |
+| Boot | Own loader ospab-boot for BIOS and UEFI (menu, memory test, FAT and ISO9660 readers); hybrid ISO that boots from CD and USB on both |
+| Install | Full-screen installer: erase a disk, or install alongside Windows and Linux on the existing ESP |
 | CPU | GDT/TSS, IDT, APIC timer, preemptive scheduler, per-task kernel stacks, XSAVE (AVX state) |
 | Memory | Bitmap frame allocator, 4-level paging, per-process address spaces, NX, SMEP/SMAP |
-| Ring 3 | ELF programs on the `x86_64-unknown-oos` target with the **liboos** runtime |
+| Ring 3 | ELF programs on the `x86_64-unknown-oos` target with the liboos runtime |
 | Microkernel | Kernel objects, per-process handle tables with rights, synchronous IPC, notifications |
 | Storage | ATA PIO, AHCI, NVMe, virtio-blk; GPT; persistence of the writable filesystem layer |
 | Network | e1000, RTL8139/8169, virtio-net, AMD PCnet (VMware vlance), vmxnet3; IPv4, TCP, UDP, DHCP, DNS, NTP, TLS 1.3 client |
@@ -42,17 +42,17 @@ the [OSTP](https://github.com/ospab/ostp) transport.
 | Input / video | PS/2 and USB (xHCI) keyboard and mouse, VMware mouse, UEFI framebuffer, VMware SVGA II |
 | Host integration | VMware clipboard (Ctrl+V, `clip`), console input over the serial port |
 | Shell | `plum`: variables, pipes, redirects, control flow, functions, scripts; coreutils; Ctrl+C |
-| Packages | `tomato` with the signed repository **tmt.ospab.org**; SDK for your own programs |
+| Packages | `tomato` with the signed repository tmt.ospab.org; SDK for your own programs |
 | Power and time | ACPI power-off and reset; system clock counts from the ospab epoch, 2012-08-09 |
 
-Apart from ring-3 programs, everything above currently runs in ring 0. Moving drivers, the
-network stack and the console into isolated servers is the next stage of the roadmap.
+Apart from ring-3 programs, everything above runs in ring 0 today. Moving drivers, the network
+stack and the console into isolated servers is the next roadmap stage.
 
 ## Quick start
 
 1. Download an ISO from the releases or build one (see below).
-2. In VMware Workstation create a VM: **Other 64-bit**, firmware **UEFI** (Secure Boot off),
-   USB controller **USB 3.x**. Attach the ISO and boot.
+2. In VMware Workstation create a VM: Other 64-bit, firmware UEFI (Secure Boot off),
+   USB controller USB 3.x. Attach the ISO and boot.
 3. In the console try `help`, `tutor`, `uname -a`, `tomato update`, `install`.
 
 Full guide: [docs/en/getting-started.md](docs/en/getting-started.md).
@@ -82,12 +82,13 @@ The build number `N` appears in `uname -a`. Details: [docs/en/building.md](docs/
 | [Packages](docs/en/packages.md) | tomato, the `.tmt` format, the repository, the SDK |
 | [Networking and OSTP](docs/en/networking.md) | Network stack, `ip`, `curl`, `ostp` |
 | [Hardware](docs/en/hardware.md) | Supported devices and VM settings |
+| [Developing for ospab.os](docs/en/dev/README.md) | Write a program, a game, a driver; liboos API, testing, contributing |
 
 ## Project layout
 
 ```
 arch/x86_64/   CPU setup, interrupts, TSS, framebuffer, serial, keyboard, mouse, boot protocols
-boot/          ospab-boot UEFI loader and its config
+boot/          ospab-boot loader (BIOS and UEFI) and its config
 core/          scheduler, syscalls, kernel objects, IPC, ELF loader
 mm/            frame allocator, page tables, user copies, heap
 drivers/       storage, audio, GPU, VMware integration

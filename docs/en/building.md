@@ -2,15 +2,14 @@
 
 ## Requirements
 
-- Rust **nightly** with the `rust-src` component (the kernel and user programs use `build-std`
-  and JSON target specifications).
-- Stable Rust for the host tools (`tools/tmt`), selected automatically by its
-  `rust-toolchain.toml`.
-- For the ISO: `xorriso`, `mtools` and `mkfs.vfat`. On Windows these come from WSL; the kernel,
+- Rust nightly with the `rust-src` component (the kernel and user programs use `build-std` and
+  JSON target specifications).
+- Stable Rust for the host tools (`tools/tmt`). Its `rust-toolchain.toml` selects it.
+- For the ISO: `xorriso`, `mtools` and `mkfs.vfat`. On Windows they come from WSL. The kernel,
   user programs, both loaders and the disk image build natively in Git Bash.
-- No assembler is needed: the BIOS loader's real-mode code is `global_asm!` in Rust (see
-  [Boot](boot.md)). Only `dd` is used to place the BIOS stage 2 in `bios.img`.
-- For the DOOM build: a C compiler in WSL/Linux (`target/doom/libdoom.a` is reused once built).
+- No assembler. The BIOS loader's real-mode code is `global_asm!` in Rust (see [Boot](boot.md)).
+  Only `dd` is used, to place the BIOS stage 2 in `bios.img`.
+- For the DOOM build: a C compiler in WSL/Linux. `target/doom/libdoom.a` is reused once built.
 
 ## Build targets
 
@@ -26,12 +25,17 @@ On Windows run the ISO build through WSL:
 wsl.exe -d Debian -e bash -lc 'cd /mnt/d/ospab-projects/ospab.os-v2 && ./build.sh'
 ```
 
-What `build.sh` does, in order: builds the ring-3 programs in `user/` (without `RUSTFLAGS`, which
-would override their linker script), builds the kernel for `x86_64-ospab.json`, builds the
-ospab-boot UEFI loader in `boot/uefi` and the BIOS loader in `boot/bios` (`scripts/bios-image.sh`),
-then assembles the hybrid ISO with `scripts/mkiso.sh` (xorriso: El Torito BIOS and UEFI, MBR and GPT
-for USB sticks), or the disk image with `tools/mkimage.rs`. The ISO boots on BIOS and UEFI machines,
-from a CD and from a USB stick (`dd if=ospab-os-v2-N.iso of=/dev/sdX bs=4M`).
+`build.sh` does this, in order:
+
+1. Builds the ring-3 programs in `user/`, without `RUSTFLAGS`, which would override their linker script.
+2. Builds the kernel for `x86_64-ospab.json`.
+3. Builds the ospab-boot UEFI loader in `boot/uefi` and the BIOS loader in `boot/bios`
+   (`scripts/bios-image.sh`).
+4. Assembles the hybrid ISO with `scripts/mkiso.sh` (xorriso: El Torito for BIOS and UEFI, MBR and
+   GPT for USB sticks), or the disk image with `tools/mkimage.rs`.
+
+The ISO boots on BIOS and UEFI machines, from a CD and from a USB stick
+(`dd if=ospab-os-v2-N.iso of=/dev/sdX bs=4M`).
 
 ## Build number
 
@@ -48,7 +52,7 @@ Environment overrides:
 | Variable | Effect |
 |---|---|
 | `ISO_PATH` | write the ISO to this path instead of the numbered name (the build number becomes `dev`) |
-| `ISO_ROOT` | staging directory for the ISO tree; give parallel builds different ones |
+| `ISO_ROOT` | staging directory for the ISO tree; parallel builds need different ones |
 | `OSPAB_BUILD` | force the build number |
 
 ## Other parts
@@ -64,8 +68,8 @@ Environment overrides:
 
 ## Smoke test
 
-`scripts/smoke-test.ps1` boots an ISO headless in QEMU, waits for `Console: ready`, types
-commands, takes a screenshot and fails on any `[ FAIL ]`, panic or exception:
+`scripts/smoke-test.ps1` boots an ISO headless in QEMU and waits for `Console: ready`. Then it
+types commands, takes a screenshot, and fails on any `[ FAIL ]`, panic or exception:
 
 ```powershell
 & scripts\smoke-test.ps1 -Firmware uefi -Disk ide -Audio hda -Commands "uname -a","date -e" -Shutdown
@@ -77,13 +81,13 @@ Parameters: `-Iso`, `-Firmware bios|uefi`, `-Disk none|ide|ahci|nvme`,
 
 ## Boot-time self-test
 
-Every boot runs ring-3 checks (process round trip, two tasks with blocking system calls,
-user-pointer validation, AVX state, an ELF program, frame leaks). The IPC checks are slower and
+Every boot runs ring-3 checks: a process round trip, two tasks with blocking system calls,
+user-pointer validation, AVX state, an ELF program and frame leaks. The IPC checks are slower and
 run only with the kernel command line option `selftest=ipc`.
 
 ## Tips
 
-- If a Windows build and a WSL build share `target/`, WSL may reuse a stale kernel; check the
+- If a Windows build and a WSL build share `target/`, WSL may reuse a stale kernel. Check the
   build number in the boot log.
-- Some sources use CRLF line endings. Git Bash `sed` and `grep` strip carriage returns, so prefer
-  an editor or `perl` for scripted edits.
+- Some sources use CRLF line endings. Git Bash `sed` and `grep` strip carriage returns, so use an
+  editor or `perl` for scripted edits.

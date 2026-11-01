@@ -6,11 +6,10 @@ It is a ring-3 program: the CPU, video, VIA and disc code is the `beeb-core` cra
 
 ## Legal note
 
-ospab.os does **not** contain any BBC ROM or any game. The MOS ROM and the disc images are
-copyrighted by their owners. You must supply your own copies, for example dumped from a machine
-you own. Nothing of this kind is in the repository, in the ISO or in the package repository.
-The `.gitignore` of the project excludes `*.rom` and `*.ssd` so they are not committed by
-accident.
+ospab.os contains no BBC ROM and no game. The MOS ROM and the disc images are copyrighted by
+their owners, so you must supply your own copies, for example dumped from a machine you own.
+Nothing of this kind is in the repository, in the ISO or in the package repository. The
+`.gitignore` of the project excludes `*.rom` and `*.ssd`, so they are not committed by accident.
 
 ## What you need
 
@@ -80,6 +79,7 @@ The rest is positional: the PC key at the place of the BBC key.
 | `=` | `^` |
 | `'` | `:` |
 | `` ` `` | `@` |
+| Insert | the pound/underscore key |
 | Backspace, Delete | DELETE |
 | End | COPY |
 | Arrow keys | cursor keys |
@@ -89,9 +89,9 @@ The rest is positional: the PC key at the place of the BBC key.
 | F1 to F10 | f0 to f9 |
 
 Symbols you get with Shift are those of the BBC keyboard, not the PC one (Shift+2 is `"`).
-The BBC has no key for the PC `Alt`, `Home`, `Insert`, `PgUp`, `PgDn` or the keypad; they do nothing.
+The BBC has no key for the PC `Alt`, `Home`, `PgUp`, `PgDn` or the keypad, so those do nothing.
 
-Insert is the pound/underscore key. Keys used by Elite: S and X (pitch), `<` and `>` (roll; PC `,` and `.` with Shift), Space
+Elite uses these keys: S and X (pitch), `<` and `>` (roll; PC `,` and `.` with Shift), Space
 (speed up), `?` (slow down; PC `/` with Shift), A (fire), TAB (hyperspace), and the function
 keys f0 to f9 for the views and menus (PC F1 to F10).
 
@@ -108,14 +108,13 @@ keys f0 to f9 for the views and menus (PC F1 to F10).
 - Disc: `.ssd` images read through a high-level DFS: the kernel-side filing system calls
   (OSFILE, OSFIND, OSARGS, OSBGET, OSBPUT, OSGBPB, `*RUN`, `*LOAD`, `*EXEC`) are handled by the
   emulator, so no DFS ROM and no 8271 are needed. Files written by the program stay in memory
-  and are lost at exit; the image on disk is never changed.
-
+  and are lost at exit. The image on disk is never changed.
 - Sound: the SN76489 as wired in the Model B. Bytes written to System VIA port A are latched into
-  the chip when addressable latch bit 0 (sound write enable, active low) goes low. Three
-  square-wave tone channels (10-bit period, counters at 250 kHz), one noise channel (periodic or
-  white, 15-bit shift register, shift rate /512, /1024, /2048 or tone channel 3) and 2 dB
-  attenuation steps. The output is averaged over each output sample and passed through a
-  DC-blocking high-pass; the front end plays it as 48 kHz mono, about 960 samples per frame.
+  the chip when addressable latch bit 0 (sound write enable, active low) goes low. The chip has
+  three square-wave tone channels (10-bit period, counters at 250 kHz), one noise channel
+  (periodic or white, 15-bit shift register, shift rate /512, /1024, /2048 or tone channel 3) and
+  2 dB attenuation steps. The output is averaged over each output sample and passed through a
+  DC-blocking high-pass. The front end plays it as 48 kHz mono, about 960 samples per frame.
   If the machine has no sound card, or with `-nosound` (or `sound=0` in `/etc/beeb.conf`),
   `beeb` runs silently. It keeps 60 to 100 ms queued and drops a frame's audio if more is waiting.
 
@@ -127,10 +126,10 @@ joystick, tape, speech, the printer port.
 - With only the MOS ROM the machine starts and prints `BBC Computer 32K` and `Language?`: there is
   no language to run. Give it a BASIC ROM with `-basic` to get the `>` prompt and to start discs
   with a BASIC loader.
-- Speed depends on the host. In QEMU without KVM the emulator may fall behind 50 Hz; it then
+- Speed depends on the host. In QEMU without KVM the emulator may fall behind 50 Hz. It then
   drops time instead of trying to catch up.
-- Display mode changes made by changing the screen start address in the middle of a frame work;
-  interlaced video and the 6845 cursor are not drawn.
+- Changing the screen start address in the middle of a frame works. Interlaced video and the 6845
+  cursor are not drawn.
 
 ## Source
 

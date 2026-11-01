@@ -1,7 +1,7 @@
 # ospab.os documentation
 
-English is the primary language of the documentation; [Русская версия](../ru/README.md) is a
-translation and may lag behind.
+The documentation is written in English first. The [Russian version](../ru/README.md) is a
+translation and can lag behind.
 
 ## Using the system
 
@@ -15,6 +15,18 @@ translation and may lag behind.
 - [drift](drift.md): space trading and combat game with a story campaign.
 - [Hardware](hardware.md): supported devices and recommended VM settings.
 
+## Developing for ospab.os
+
+Start with the [developer guide](dev/README.md).
+
+- [Overview](dev/README.md): what you can write, where it lives, how much runs in ring 0.
+- [Your first program](dev/first-program.md): create a crate, build, package, install, debug.
+- [liboos reference](dev/liboos.md): the API of ring 3 programs, with examples and error codes.
+- [Writing a game](dev/games.md): screen, raw keyboard, sound, frame pacing, heap size.
+- [Kernel hacking](dev/kernel-hacking.md): code map; add a shell command, a system call, a driver.
+- [Testing](dev/testing.md): build targets, smoke test, QEMU command lines, host tests, tools.
+- [Contributing](../../CONTRIBUTIONS.md): workflow, commit style, license, bug reports, AI-agent rules.
+
 ## Developing the system
 
 - [Building](building.md): toolchain, build targets, ISO and disk images, the smoke test.
@@ -23,7 +35,8 @@ translation and may lag behind.
 - [GUI](gui.md): the UI toolkit and the plan for the compositor.
 
 Project-level documents stay in the repository root: [ROADMAP.md](../../ROADMAP.md) (plan, in
-Russian), [AUDIT.md](../../AUDIT.md) (honest state of the code), [CONTRIBUTIONS.md](../../CONTRIBUTIONS.md).
+Russian), [AUDIT.md](../../AUDIT.md) (state of the code, also in Russian),
+[CONTRIBUTIONS.md](../../CONTRIBUTIONS.md).
 
 ## Conventions
 

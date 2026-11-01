@@ -5,9 +5,10 @@ star systems of eight generated galaxies, trade, fight, and follow a seven-chapt
 ends. It is written for this system and is not a port of anything. Copyright (c) 2026 ospab,
 AGPL-3.0-only.
 
-The game draws everything itself with a software 3D renderer: z-buffered solid ships with flat
+The game draws everything with its own software 3D renderer: z-buffered solid ships with flat
 and Gouraud shading, procedural planets with a day/night terminator and atmosphere, stars, a
-nebula sky, particle explosions, glowing laser bolts and a cheap bloom pass. Sound is generated, see below.
+nebula sky, particle explosions, glowing laser bolts and a cheap bloom pass. Sound is generated
+at run time, see below.
 
 ## Install and run
 
@@ -19,7 +20,7 @@ nebula sky, particle explosions, glowing laser bolts and a cheap bloom pass. Sou
 
 Needs: the framebuffer and raw keyboard calls (see [System call ABI](syscall-abi.md), "Screen,
 keyboard, clock"), a user heap of about 32 MiB for the 1080p default (`HEAP_SIZE` in
-`user/liboos/src/heap.rs`; the program prints a clear message and exits if the heap is too small),
+`user/liboos/src/heap.rs`; the program prints a message and exits if the heap is too small),
 and under 1 MB of disk for the package. Run it from the console, not over ssh or serial: it takes
 over the screen and the keyboard until you quit it. Ctrl+C always kills it.
 
@@ -118,10 +119,11 @@ the compass above it points to the station (ST) or planet (PL), a filled dot mea
 
 ## Settings
 
-Language (English or Russian, saved with the settings), invert pitch, bloom on/off, retro wireframe mode (flat green wireframes instead of solid
-shading), and the 3D resolution (low, medium, high; the scene is rendered at 0.34, 0.5 or 0.75 of
-the interface size and scaled up, the HUD is always drawn at full size). If the average frame
-takes longer than 38 ms the program lowers the 3D resolution on its own for that run.
+Settings hold the language (English or Russian), invert pitch, bloom on or off, retro wireframe
+mode (flat green wireframes instead of solid shading), and the 3D resolution (low, medium, high).
+The scene is rendered at 0.34, 0.5 or 0.75 of the interface size and scaled up, while the HUD is
+always drawn at full size. If the average frame takes longer than 38 ms, the program lowers the
+3D resolution on its own for that run.
 
 ## Universe and markets
 

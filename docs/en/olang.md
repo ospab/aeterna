@@ -1,8 +1,8 @@
 # olang on ospab.os
 
-`ol` is the interpreter of the olang language (the owner's own language) as a ring-3 program.
-It is a no_std + alloc port of the olang lexer, parser and tree-walking evaluator; the source is in
-`apps/olang/` (each copied file names its origin in the olang project in a header comment).
+`ol` is an interpreter for olang, the project owner's own language, running as a ring-3 program.
+It is a no_std + alloc port of the olang lexer, parser and tree-walking evaluator. The source is
+in `apps/olang/`, and each copied file names its origin in the olang project in a header comment.
 
 ## Install and run
 
@@ -14,8 +14,8 @@ It is a no_std + alloc port of the olang lexer, parser and tree-walking evaluato
 ```
 
 Errors print the line and column (syntax errors) or the line of the failing top-level statement
-(runtime errors), and the exit status is 1. `$?` in plum is the exit status; a script can set it
-with `exit(n)`. Example scripts are in `/usr/share/olang/examples/` (`hello`, `fib`, `structs`,
+(runtime errors), and the exit status is 1. `$?` in plum holds the exit status, and a script can
+set it with `exit(n)`. Example scripts are in `/usr/share/olang/examples/` (`hello`, `fib`, `structs`,
 `strings`, `modules`, `readfile`, `depth`, `net`).
 
 ## Language
